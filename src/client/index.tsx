@@ -112,7 +112,7 @@ const styles = {
     fontSize: 13, lineHeight: 1.5, color: 'var(--dsw-alias-label-primary)',
   },
   hint: { margin: 0, fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
-  feature: { display: 'grid', gap: 6 },
+  feature: { display: 'grid', gap: 6, padding: '4px 0' },
 } satisfies Record<string, CSSProperties>
 
 /** Required services (cordis fiber inject). */

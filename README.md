@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Drive DeepSeek Harness from a Telegram bot: prompt the Agent, stop work, switch working directories and Sessions, and answer tool approvals with inline buttons.
+Drive DeepSeek Harness from a Telegram bot: prompt the Agent with text, photos, and files, receive the files it presents, stop work, switch working directories and Sessions, and answer tool approvals with inline buttons.
 
 The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Sessions started in Telegram show up in the Web sidebar and Web Sessions can be taken over with `/use`.
 
@@ -36,6 +36,12 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 | other `/xxx` | Passed to the Agent verbatim (e.g. `/plan …`, skills) |
 
 Assistant text, tool-call lines (optional), and failure/stop notices are posted back to the bound chat, with a typing indicator while the Agent runs.
+
+## Photos and files
+
+Photos, documents, videos, audio, voice notes, video notes, and static stickers sent to the bot are downloaded and staged into the Session through `ctx.fileUploads`, the Web composer's attachment path. Images (detected by their bytes) go through the image channel so the model sees them; everything else arrives as a file. Captions become the prompt text, and an album becomes one prompt. The public Bot API serves files up to 20 MB; use a self-hosted Bot API server for larger ones.
+
+Files the Agent hands over with the `present` tool are sent back: common images inline, everything else as a document (up to Telegram's 50 MB).
 
 ## Approvals
 

@@ -276,11 +276,21 @@ describe('media', () => {
   })
 
   it('stages the largest photo as a prompt image with its caption', async () => {
-    telegram.files.set('big', new Uint8Array([1, 2, 3]))
+    telegram.files.set('big', new Uint8Array([0xff, 0xd8, 0xff]))
     telegram.push(photo('big', { caption: 'what is this?' }))
     await until(() => harness.prompts.length === 1)
     expect(harness.staged).toEqual([{ sessionId: 's1', bytes: 3, name: 'photo_5.jpg', imageType: 'image/jpeg' }])
     expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: 'what is this?' }, { type: 'file', receiptId: 'r1' }])
+  })
+
+  it('trusts image bytes over the declared type', async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0])
+    telegram.files.set('png', png)
+    telegram.files.set('fake', new Uint8Array([1, 2, 3]))
+    telegram.push({ message: { message_id: 8, from: USER, chat: CHAT, date: 0, document: { file_id: 'png', file_unique_id: 'p', file_name: 'a.jpg', mime_type: 'image/jpeg' } } })
+    telegram.push({ message: { message_id: 9, from: USER, chat: CHAT, date: 0, document: { file_id: 'fake', file_unique_id: 'f', file_name: 'b.png', mime_type: 'image/png' } } })
+    await until(() => harness.prompts.length === 2)
+    expect(harness.staged.map(f => f.imageType)).toEqual(['image/png', undefined])
   })
 
   it('stages documents as plain files under a sanitized name', async () => {

@@ -62,12 +62,30 @@ export function incomingAttachments(message: TgMessage): IncomingAttachment[] {
 }
 
 /**
- * Whether an attachment should go through the Host's image channel, where the
- * model sees the picture itself rather than a file path.
+ * The image type to stage an attachment under, so the model sees the picture
+ * itself rather than a file path; undefined sends it as a plain file.
+ * Only attachments that claim to be images are considered, and the bytes decide the type.
  * @param attachment - incoming attachment.
+ * @param data - its downloaded bytes.
  */
-export function isPromptImage(attachment: IncomingAttachment): boolean {
-  return attachment.mediaType !== undefined && IMAGE_TYPES.has(attachment.mediaType)
+export function promptImageType(attachment: IncomingAttachment, data: Uint8Array): string | undefined {
+  if (attachment.mediaType === undefined || !IMAGE_TYPES.has(attachment.mediaType)) return undefined
+  return sniffImageType(data)
+}
+
+/**
+ * Identify an image by its leading bytes; declared MIME types from senders
+ * are not reliable enough for the Host's image validation.
+ * @param data - file bytes.
+ * @returns the image MIME type, or undefined for anything else.
+ */
+export function sniffImageType(data: Uint8Array): string | undefined {
+  const at = (offset: number, ...bytes: number[]) => bytes.every((byte, i) => data[offset + i] === byte)
+  if (at(0, 0xff, 0xd8, 0xff)) return 'image/jpeg'
+  if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return 'image/png'
+  if (at(0, 0x47, 0x49, 0x46, 0x38)) return 'image/gif'
+  if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return 'image/webp'
+  return undefined
 }
 
 /** Telegram's photo upload ceiling; larger images go as documents. */

@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-用 Telegram 机器人遥控 DeepSeek Harness：发消息给 Agent、中止任务、切换工作目录与会话，并直接在 Telegram 里点按钮审批工具调用。
+用 Telegram 机器人遥控 DeepSeek Harness：发消息、图片和文件给 Agent，接收 Agent 交付的文件，中止任务、切换工作目录与会话，并直接在 Telegram 里点按钮审批工具调用。
 
 机器人是 Web Host 的另一个客户端：它通过 `ctx.sessionController`（与 Web 界面走同一条路径）创建会话和发送提示，所以 Telegram 里开的会话会出现在 Web 侧栏中，Web 端的会话也可以用 `/use` 接管。
 
@@ -28,6 +28,7 @@
 | 命令 | 作用 |
 | --- | --- |
 | 直接发文字 | 发给当前会话；没有会话时自动在默认工作目录新建 |
+| 发图片 / 文件 | 作为附件交给当前会话，图片说明作为文字（见下文） |
 | `/new [目录]` | 新建会话 |
 | `/cwd <目录>` | 设置本聊天新会话的工作目录 |
 | `/use <会话ID>` | 切换到已有会话（含 Web 端会话） |
@@ -39,6 +40,17 @@
 | 其他 `/xxx` | 原样交给 Agent（例如 `/plan …`、skill 命令） |
 
 Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示会推送回绑定的聊天；运行时显示「正在输入」。
+
+## 图片与文件
+
+**发给 Agent**：照片、文件（document）、视频、音频、语音、视频消息、静态贴纸都可以直接发给机器人。
+
+- 机器人通过 Bot API 下载后，用 `ctx.fileUploads` 暂存进当前会话——与 Web 输入框添加附件是同一条路径，受部署的附件限制约束。
+- 图片（JPEG / PNG / GIF / WebP，按文件头字节识别，不信任发送方声明的类型）走图片通道，模型直接看图；部署不接受的图片以及其他类型作为文件交给 Agent。
+- 图片说明（caption）作为同一条 prompt 的文字。相册（一次发送多张）合并成一条 prompt。
+- 超过 **接收文件大小上限** 的文件不会下载，机器人会说明原因。官方 Bot API 最多只能下载 20 MB；要接收更大的文件，需要自建 [Bot API 服务器](https://github.com/tdlib/telegram-bot-api) 并修改 **Bot API 地址**。
+
+**发回 Telegram**：Agent 用 `present` 工具交付文件时（Web 端「产出物」显示的同一事件），机器人把文件发到绑定的聊天：常见图片直接显示（≤10 MB，GIF 除外），其他作为文件发送，附带文件名和说明。超过 Telegram 50 MB 上限的文件只发一条提示。可用 **回传交付文件** 关闭。
 
 ## 工具审批
 
@@ -61,6 +73,8 @@ Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示�
 | `notifyToolCalls` | `true` | 推送工具调用 |
 | `language` | `zh` | 机器人提示语言（`zh` / `en`） |
 | `apiBaseUrl` | `https://api.telegram.org` | Bot API 地址（自建服务器或反代） |
+| `maxDownloadMb` | `20` | 接收文件大小上限（1–2000 MB） |
+| `sendDeliverables` | `true` | 把 `present` 交付的文件发回聊天 |
 | `pollTimeoutSec` | `30` | 长轮询等待秒数 |
 | `stateFile` | `$DSH_HOME/telegram-bridge/state.json` | 聊天↔会话绑定与轮询进度 |
 
@@ -77,13 +91,14 @@ Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示�
 ```
 src/index.ts      宿主半侧：Config schema、接入 sessionController / agents / approval
 src/bridge.ts     桥接核心：长轮询、命令、输出镜像、审批（经 HarnessPort 解耦，可单测）
-src/telegram.ts   精简 Bot API 客户端（Node fetch）
+src/telegram.ts   精简 Bot API 客户端（Node fetch，含文件下载与 multipart 上传）
+src/media.ts      附件提取、图片类型识别、回传方式选择
 src/bindings.ts   聊天↔会话绑定与 update offset 的持久化
 src/client/       浏览器半侧：插件页中的配置表单（plugins.bundle.config slot）
 cordis.patch.yml  组合包层：插入 id 为 telegram-bridge 的插件行
 ```
 
-用到的扩展点：`session/event`（镜像助手输出、工具调用、轮次结束）、`agent/status`（输入中提示）、`approval/request`（prepend 应答者，超时 `next()` 交回）、`loader/volatile-update`（Token/开关变更时重连）。
+用到的扩展点与服务：`ctx.fileUploads`（暂存附件）、`session/event`（镜像助手输出、工具调用、`deliverables/presented`、轮次结束）、`agent/status`（输入中提示）、`approval/request`（prepend 应答者，超时 `next()` 交回）、`loader/volatile-update`（Token/开关变更时重连）。
 
 ## 开发
 

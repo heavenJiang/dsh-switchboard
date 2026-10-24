@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { basename, isAbsolute, resolve } from 'node:path'
 import type { BindingStore } from './bindings.ts'
-import { incomingAttachments, isPromptImage, outgoingKind, type IncomingAttachment } from './media.ts'
+import { incomingAttachments, outgoingKind, promptImageType, type IncomingAttachment } from './media.ts'
 import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
 import {
   FileTooLargeError, TelegramApiError, TelegramClient, type TgCallbackQuery, type TgMessage, type TgUpdate,
@@ -300,10 +300,11 @@ export class TelegramBridge {
     for (const attachment of messages.flatMap(incomingAttachments)) {
       try {
         const data = await this.download(client, attachment, limit)
+        const imageType = promptImageType(attachment, data)
         const receiptId = await this.harness.stageFile(sessionId, {
           data,
           name: attachment.name,
-          ...(isPromptImage(attachment) && attachment.mediaType !== undefined ? { imageType: attachment.mediaType } : {}),
+          ...(imageType === undefined ? {} : { imageType }),
         })
         parts.push({ type: 'file', receiptId })
       } catch (error: unknown) {
