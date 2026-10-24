@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Telegram 遥控",
+    "description": "通过 Telegram 机器人与 Harness 对话、中止任务、切换会话并审批工具调用。",
+    "detail": "README.zh.md"
+  }
+}

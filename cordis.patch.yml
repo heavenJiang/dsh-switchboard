@@ -1,0 +1,9 @@
+# Layer applied when a profile lists this bundle. The row id is also the
+# settings namespace the Plugins page form edits; keep it stable.
+- insert:
+    - id: telegram-bridge
+      name: dsh-telegram-bridge
+      config:
+        enabled: true
+        agentPreset: standard
+        permissionPreset: workspace-write

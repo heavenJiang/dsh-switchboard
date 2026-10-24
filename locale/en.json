@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Telegram Remote",
+    "description": "Chat with Harness from a Telegram bot: prompt, stop, switch Sessions, and approve tool calls.",
+    "detail": "README.md"
+  }
+}
