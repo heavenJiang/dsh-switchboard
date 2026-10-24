@@ -1,8 +1,13 @@
 {
   "name": "dsh-telegram-bridge",
   "description": "Drive DeepSeek Harness sessions from a Telegram bot: chat, stop, switch workspaces, and answer tool approvals.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heavenJiang/dsh-telegram-bridge.git"
+  },
+  "homepage": "https://github.com/heavenJiang/dsh-telegram-bridge#readme",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -37,6 +42,7 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-plugin-manager",

@@ -33,6 +33,7 @@ import { BindingStore, defaultStateFile } from './bindings.ts'
 import { TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { registerHistoryRoutes } from './routes.ts'
+import { UpdateChecker } from './updates.ts'
 import type { BotLanguage } from './messages.ts'
 
 export { TelegramBridge } from './bridge.ts'
@@ -252,10 +253,11 @@ export function apply(ctx: Context, config: Config): void {
   const store = new BindingStore(stateFile)
   const chatLog = new ChatLog(join(dirname(stateFile), 'chats'), () => config.historyLimit.get())
   const bridge = new TelegramBridge(settings, harness, store, logger, undefined, chatLog)
+  const updates = new UpdateChecker()
 
   // The Web viewer reads history through owner-only routes on the shared API channel.
   ctx.inject(['connection'], (scope) => {
-    registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog())
+    registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog(), updates)
   })
 
   ctx.on('session/event', (session, event) => {

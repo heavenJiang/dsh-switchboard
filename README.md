@@ -38,6 +38,10 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 
 Assistant text, tool-call lines (optional), and failure/stop notices are posted back to the bound chat, with a typing indicator while the Agent runs.
 
+## Version and updates
+
+The plugin's detail page has a **Version** section above the settings: installed version and source, **Check for updates** (GitHub default-branch `package.json` version, or npm), and **Update to vX.Y.Z** when a newer release exists. GitHub installs reinstall in place at the newest commit through the plugin manager (the new commit's `prepare` build is shown for approval first); npm installs use the plugin manager's own `updateBundle`; local links are never updated. The Telegram panel has a **Plugin settings** button and a **New** badge when an update exists. Bump `version` in `package.json` with every release, since the check compares versions.
+
 ## Photos and files
 
 Photos, documents, videos, audio, voice notes, video notes, and static stickers sent to the bot are downloaded and staged into the Session through `ctx.fileUploads`, the Web composer's attachment path. Images (detected by their bytes) go through the image channel so the model sees them; everything else arrives as a file. Captions become the prompt text, and an album becomes one prompt. The public Bot API serves files up to 20 MB; use a self-hosted Bot API server for larger ones.

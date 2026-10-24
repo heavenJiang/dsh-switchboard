@@ -7,6 +7,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ChatAttachment, ChatEntry, ChatPage, ChatSummary } from '../history-types.ts'
 import type { TelegramBridgeLocaleKey } from './locales.ts'
+import type { UpdateCheck } from './update.ts'
 
 /** Connection state as the Host reports it. */
 type BridgeState =
@@ -18,6 +19,8 @@ export interface PanelActions {
   openSession(sessionId: string): boolean
   /** Open the bundle's page on the Plugins panel. */
   openSettings(): void
+  /** Hook: the shared update check (installed version, source, newer release). */
+  useUpdate(): UpdateCheck | undefined
 }
 
 type T = (key: TelegramBridgeLocaleKey) => string
@@ -75,6 +78,7 @@ export function createTelegramPanel(actions: PanelActions) {
     const [failed, setFailed] = useState(false)
     const [selected, setSelected] = useState<number | undefined>(undefined)
     const [query, setQuery] = useState('')
+    const update = actions.useUpdate()
 
     usePolling(async () => {
       try {
@@ -102,8 +106,18 @@ export function createTelegramPanel(actions: PanelActions) {
             <div className="tgb-list-head">
               <div className="tgb-title-row">
                 <h1 className="tgb-title">{t('panel')}</h1>
-                <StateBadge state={state} t={t} />
+                <div className="tgb-head-actions">
+                  {update?.newer === true && update.latest !== undefined && (
+                    <button type="button" className="tgb-new-badge" title={`${t('newVersion')} v${update.latest.version}`} onClick={actions.openSettings}>
+                      {t('newBadge')} ↑ v{update.latest.version}
+                    </button>
+                  )}
+                  <button type="button" className="tgb-button" title={t('pluginSettings')} aria-label={t('pluginSettings')} onClick={actions.openSettings}>
+                    <GearIcon /> {t('pluginSettings')}
+                  </button>
+                </div>
               </div>
+              <StateBadge state={state} t={t} />
               <p className="tgb-subtitle">{t('panelSubtitle')}</p>
               {chats !== undefined && chats.length > 0 && (
                 <input className="tgb-search" type="search" placeholder={t('search')} value={query}
@@ -131,6 +145,13 @@ export function createTelegramPanel(actions: PanelActions) {
                   </button>
                 ))}
             </div>
+            <footer className="tgb-info">
+              <span>{t('pluginInfo')}: dsh-telegram-bridge{update === undefined ? '' : ` v${update.installed}`}</span>
+              {update?.source.kind === 'github' && (
+                <>· <a href={`https://github.com/${update.source.owner}/${update.source.repo}`} target="_blank" rel="noreferrer">GitHub</a></>
+              )}
+              · <button type="button" onClick={actions.openSettings}>{t('pluginSettings')}</button>
+            </footer>
           </aside>
           <section className="tgb-thread">
             {chats !== undefined && chats.length === 0
@@ -143,6 +164,15 @@ export function createTelegramPanel(actions: PanelActions) {
       </div>
     )
   }
+}
+
+function GearIcon(): ReactNode {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  )
 }
 
 function StateBadge({ state, t }: { state: BridgeState; t: T }): ReactNode {

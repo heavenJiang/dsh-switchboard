@@ -8,6 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import { modelLabel, type TelegramBridge } from './bridge.ts'
 import type { ChatLog } from './chatlog.ts'
+import type { UpdateChecker } from './updates.ts'
 
 /** Route prefix; the browser half calls these relative to the page. */
 export const API_PREFIX = '/api/telegram-bridge'
@@ -35,8 +36,11 @@ async function body(request: Request): Promise<Record<string, unknown>> {
  * @param log - the chat history.
  * @param bridge - the running bridge, for its connection state and Session models.
  * @param models - the Host's model catalog, for the settings page's model picker.
+ * @param updates - the update checker for the settings page's version section.
  */
-export function registerHistoryRoutes(ctx: Context, log: ChatLog, bridge: TelegramBridge, models: () => Promise<unknown>): void {
+export function registerHistoryRoutes(
+  ctx: Context, log: ChatLog, bridge: TelegramBridge, models: () => Promise<unknown>, updates: UpdateChecker,
+): void {
   const fetchRoutes = ctx.connection.fetch
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/overview`,
@@ -63,6 +67,16 @@ export function registerHistoryRoutes(ctx: Context, log: ChatLog, bridge: Telegr
       }
     },
   }), 'telegram-bridge: models route')
+
+  ctx.effect(() => fetchRoutes.register({
+    path: `${API_PREFIX}/update-check`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const { source, force } = await body(request)
+      return json(await updates.check(typeof source === 'string' ? source : undefined, force === true))
+    },
+  }), 'telegram-bridge: update check route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/history`,

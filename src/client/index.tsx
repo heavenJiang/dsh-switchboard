@@ -32,6 +32,8 @@ import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'r
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
 import panelCss from './panel.css'
 import { PlaneIcon, createTelegramPanel } from './TelegramPanel.tsx'
+import { trackPluginManager, useUpdateCheck } from './update.ts'
+import { VersionSection } from './VersionSection.tsx'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -159,10 +161,12 @@ export function apply(ctx: ClientContext): void {
   }, 'telegram-bridge: dictionaries')
   const form = ctx.configForms.get<BridgeValues>(ENTRY)
   const describe = ctx.configForms.describe()
-  const Page = createPage(form, describe)
+  const Page = createPage(form, describe, ctx)
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
     name: 'plugins.bundle.config', key: PACKAGE, locale: NS,
   }, Page))), 'telegram-bridge: page')
+
+  trackPluginManager(ctx)
 
   ctx.effect(() => {
     const style = document.createElement('style')
@@ -184,6 +188,7 @@ export function apply(ctx: ClientContext): void {
       const navigation = ctx.get('pluginNavigation') as { openBundle(name: string): void } | undefined
       navigation?.openBundle(PACKAGE)
     },
+    useUpdate: () => useUpdateCheck(ctx, PACKAGE),
   })
   // The panel appears only while the Host serves the bridge, like the settings page.
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => {
@@ -261,7 +266,7 @@ function userHas(user: unknown, field: string): boolean {
  * @param describe - the settings mirror, read for the token's configured state.
  * @returns the slot component.
  */
-function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFace) {
+function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFace, ctx: ClientContext) {
   return function TelegramBridgePage(props: { t: (key: TelegramBridgeLocaleKey) => string; view: 'summary' | 'page' }) {
     const { t } = props
     const snapshot = useSyncExternalStore(form.subscribe.bind(form), form.getSnapshot.bind(form))
@@ -376,6 +381,8 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     )
 
     return (
+      <>
+      <VersionSection ctx={ctx} name={PACKAGE} t={t} />
       <SettingsForm
         labels={{ unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') }}
         state={{ available: snapshot.status !== 'unavailable', writable: snapshot.writable, dirty, invalid, saving, failed }}
@@ -408,6 +415,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         {toggle('englishReplies')}
         {valueField('apiBaseUrl', 'api-base-url')}
       </SettingsForm>
+      </>
     )
   }
 }

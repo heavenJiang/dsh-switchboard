@@ -42,6 +42,25 @@
 
 Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示会推送回绑定的聊天；运行时显示「正在输入」。
 
+## 版本与更新
+
+插件详情页（配置表单上方）有一个 **版本** 区块：
+
+- 显示当前版本和安装来源（GitHub / npm / 本地链接）。
+- **检查更新**：从 GitHub 默认分支（读取最新提交的 `package.json` 版本号）或 npm 查询最新版本；打开页面时自动检查，结果缓存一小时，点按钮强制重新检查。
+- 有新版本时显示版本号、提交说明和日期，并提供 **更新到 vX.Y.Z** 和 **更新内容** 链接。
+- **一键更新**：
+  - GitHub 安装：通过插件管理器以 `github:用户/仓库#<最新提交>` 就地重装。新提交第一次安装需要运行构建脚本（`prepare`），页面会列出需要授权的条目，确认 **允许并更新** 后继续；授权写入 profile 的 `pnpm-workspace.yaml`。
+  - npm 安装：调用插件管理器原生的 `updateBundle`（与插件页「版本」区块同一路径）。
+  - 本地链接或无法识别的来源：只显示版本，不检查也不更新。
+- 更新完成后插件热重载，页面自动刷新。若部署没有热重载，会提示重启 dsh。
+
+Telegram 面板右上角有 **插件设置** 按钮，发现新版本时旁边会出现 **新版本** 徽章；面板底部显示插件版本、GitHub 链接和设置入口。
+
+> 发布新版本：修改代码后**提升 `package.json` 的 `version`** 再推送，版本检查以版本号判断是否有更新。
+>
+> 注意：npm 上已有另一位作者发布的同名包 `dsh-telegram-bridge`。若以后要发布到 npm，需要换成带作用域的名字（如 `@heavenjiang/dsh-telegram-bridge`）。
+
 ## 图片与文件
 
 **发给 Agent**：照片、文件（document）、视频、音频、语音、视频消息、静态贴纸都可以直接发给机器人。
@@ -119,7 +138,9 @@ src/telegram.ts   精简 Bot API 客户端（Node fetch，含文件下载与 mul
 src/media.ts      附件提取、图片类型识别、回传方式选择
 src/bindings.ts   聊天↔会话绑定与 update offset 的持久化
 src/chatlog.ts    Web 查看器用的聊天记录（JSONL + 索引 + 图片副本，按条数清理）
-src/routes.ts     查看器的 owner-only 查询路由（ctx.connection.fetch）
+src/routes.ts     查看器与设置页的 owner-only 路由（ctx.connection.fetch）
+src/updates.ts    版本检查（GitHub / npm，经宿主代理）
+src/version.ts    安装来源解析与版本比较（宿主与浏览器共用）
 src/client/       浏览器半侧：侧栏 Telegram 聊天记录面板（sidebar.panellist + main）与配置表单（plugins.bundle.config）
 cordis.patch.yml  组合包层：插入 id 为 telegram-bridge 的插件行
 ```
