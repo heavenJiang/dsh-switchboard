@@ -5,7 +5,7 @@
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import type { ChatAttachment, ChatEntry, ChatPage, ChatSummary } from '../history-types.ts'
+import type { ChatAttachment, ChatEntry, ChatPage, ChatStats, ChatSummary } from '../history-types.ts'
 import type { TelegramBridgeLocaleKey } from './locales.ts'
 import type { UpdateCheck } from './update.ts'
 
@@ -78,12 +78,14 @@ export function createTelegramPanel(actions: PanelActions) {
     const [failed, setFailed] = useState(false)
     const [selected, setSelected] = useState<number | undefined>(undefined)
     const [query, setQuery] = useState('')
+    const [stats, setStats] = useState<ChatStats | undefined>(undefined)
     const update = actions.useUpdate()
 
     usePolling(async () => {
       try {
-        const overview = await post<{ state: BridgeState; chats: ChatSummary[] }>('overview')
+        const overview = await post<{ state: BridgeState; chats: ChatSummary[]; stats?: ChatStats }>('overview')
         setState(overview.state)
+        setStats(overview.stats)
         setChats(overview.chats)
         setFailed(false)
       } catch {
@@ -157,7 +159,7 @@ export function createTelegramPanel(actions: PanelActions) {
             {chats !== undefined && chats.length === 0
               ? <EmptyState t={t} onSettings={actions.openSettings} />
               : current === undefined
-                ? <div className="tgb-empty"><span className="tgb-empty-icon"><PlaneIcon size={40} /></span><p>{t('pickChat')}</p></div>
+                ? <Dashboard stats={stats} t={t} />
                 : <Thread key={current.chatId} chat={current} t={t} actions={actions} onBack={() => { setSelected(undefined) }} />}
           </section>
         </div>
@@ -198,6 +200,7 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
   const [entries, setEntries] = useState<ChatEntry[] | undefined>(undefined)
   const [more, setMore] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
+  const [sender, setSender] = useState<number | undefined>(undefined)
   const scroller = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true)
 
@@ -276,14 +279,83 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
             {loadingOlder ? t('loading') : t('loadOlder')}
           </button>
         )}
-        {entries?.map((entry, index) => (
+        {chat.type !== 'private' && entries !== undefined && (
+          <SenderChips entries={entries} selected={sender} onSelect={setSender} t={t} />
+        )}
+        {(sender === undefined ? entries : entries?.filter(entry => entry.from?.id === sender))?.map((entry, index, shown) => (
           <Fragment key={entry.id}>
-            {(index === 0 || !sameDay(entries[index - 1]!.at, entry.at)) && <div className="tgb-day">{dayLabel(entry.at, t)}</div>}
+            {(index === 0 || !sameDay(shown[index - 1]!.at, entry.at)) && <div className="tgb-day">{dayLabel(entry.at, t)}</div>}
             <Entry entry={entry} chat={chat} t={t} />
           </Fragment>
         ))}
       </div>
     </>
+  )
+}
+
+/** Per-member filter for group chats: who sent how much. */
+function SenderChips({ entries, selected, onSelect, t }: {
+  entries: ChatEntry[]; selected: number | undefined; onSelect: (id: number | undefined) => void; t: T
+}): ReactNode {
+  const counts = new Map<number, { name: string; count: number }>()
+  for (const entry of entries) {
+    if (entry.dir !== 'in' || entry.from === undefined) continue
+    const row = counts.get(entry.from.id) ?? { name: entry.from.name, count: 0 }
+    row.count++
+    counts.set(entry.from.id, row)
+  }
+  if (counts.size < 2) return null
+  return (
+    <div className="tgb-chips" role="group">
+      <button type="button" className="tgb-chip" aria-pressed={selected === undefined} onClick={() => { onSelect(undefined) }}>{t('allSenders')}</button>
+      {[...counts].sort((a, b) => b[1].count - a[1].count).map(([id, row]) => (
+        <button key={id} type="button" className="tgb-chip" aria-pressed={selected === id} onClick={() => { onSelect(selected === id ? undefined : id) }}>
+          <Avatar id={id} name={row.name} size="xs" /> {row.name} · {row.count}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** The panel's landing view: activity figures and a 14-day chart. */
+function Dashboard({ stats, t }: { stats: ChatStats | undefined; t: T }): ReactNode {
+  if (stats === undefined) {
+    return <div className="tgb-empty"><span className="tgb-empty-icon"><PlaneIcon size={40} /></span><p>{t('pickChat')}</p></div>
+  }
+  const peak = Math.max(1, ...stats.series.map(day => day.in + day.out))
+  const tiles: [string, string][] = [
+    [t('dashToday'), `${stats.today.in + stats.today.out}`],
+    [t('dashChats'), `${stats.week.activeChats}`],
+    [t('dashApprovals'), `${stats.week.allowed} / ${stats.week.rejected}`],
+    [t('dashDenied'), `${stats.week.denied}`],
+  ]
+  return (
+    <div className="tgb-dash">
+      <h2 className="tgb-dash-title">{t('dashTitle')}</h2>
+      <div className="tgb-tiles">
+        {tiles.map(([label, value]) => (
+          <div key={label} className="tgb-tile"><span className="tgb-tile-value">{value}</span><span className="tgb-tile-label">{label}</span></div>
+        ))}
+      </div>
+      <div className="tgb-chart">
+        <div className="tgb-chart-head">
+          <span>{t('dashSeries')}</span>
+          <span className="tgb-legend"><i data-k="in" />{t('dashIn')} <i data-k="out" />{t('dashOut')}</span>
+        </div>
+        <div className="tgb-bars" role="img" aria-label={t('dashSeries')}>
+          {stats.series.map(day => (
+            <div key={day.day} className="tgb-bar" title={`${day.day} · ${t('dashIn')} ${day.in} · ${t('dashOut')} ${day.out}`}>
+              <div className="tgb-bar-stack" style={{ height: `${((day.in + day.out) / peak) * 100}%` }}>
+                <span data-k="out" style={{ flexGrow: day.out }} />
+                <span data-k="in" style={{ flexGrow: day.in }} />
+              </div>
+              <span className="tgb-bar-label">{day.day.slice(8)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <p className="tgb-dash-hint">{t('pickChat')}</p>
+    </div>
   )
 }
 
@@ -341,7 +413,7 @@ function Entry({ entry, chat, t }: { entry: ChatEntry; chat: ChatSummary; t: T }
             {files.map(file => <FileChip key={`${file.name}-${file.path ?? ''}`} file={file} />)}
             {entry.text !== undefined && entry.text !== '' && <div className="tgb-text" data-kind={entry.kind}>{entry.text}</div>}
             <div className="tgb-foot">
-              {!incoming && <span>{entry.kind === 'assistant' ? t('agent') : entry.kind === 'file' ? t('sentFile') : t('bot')}</span>}
+              {!incoming && <span>{entry.kind === 'assistant' ? t('agent') : entry.kind === 'file' ? t('sentFile') : entry.kind === 'web' ? t('webSent') : t('bot')}</span>}
               <span>{time}</span>
             </div>
           </div>
@@ -367,7 +439,7 @@ function FileChip({ file }: { file: ChatAttachment }): ReactNode {
 
 const AVATAR_COLORS = ['#e17076', '#faa774', '#a695e7', '#7bc862', '#6ec9cb', '#65aadd', '#ee7aae']
 
-function Avatar({ id, name, size }: { id: number; name: string; size?: 'sm' }): ReactNode {
+function Avatar({ id, name, size }: { id: number; name: string; size?: 'sm' | 'xs' }): ReactNode {
   const color = AVATAR_COLORS[Math.abs(id) % AVATAR_COLORS.length]
   const initial = [...name.trim()][0]?.toUpperCase() ?? '?'
   return <span className="tgb-avatar" data-size={size} style={{ background: color }} aria-hidden="true">{initial}</span>

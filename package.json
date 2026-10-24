@@ -1,7 +1,7 @@
 {
   "name": "dsh-telegram-bridge",
   "description": "Drive DeepSeek Harness sessions from a Telegram bot: chat, stop, switch workspaces, and answer tool approvals.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",
@@ -29,7 +29,8 @@
     "README.md",
     "README.zh.md",
     "lib/index.js",
-    "lib/client.js"
+    "lib/client.js",
+    "CHANGELOG.md"
   ],
   "license": "MIT",
   "engines": {
@@ -47,7 +48,8 @@
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-plugin-manager",
         "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar"
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
   },
@@ -64,9 +66,15 @@
     "@deepseek-ai/dsh-api-session-controller": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-client-connection": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-client-file-upload": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-commands": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-experimental-speech-to-text": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-permission-presets": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-session": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-user-approval": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-user-questions": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-workspace-changes": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/schemastery": ">=3.18.0"
   },
   "devDependencies": {
@@ -74,5 +82,22 @@
     "esbuild": "^0.25.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-commands": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-credentials": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-experimental-speech-to-text": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-workspace-changes": {
+      "optional": true
+    }
   }
 }

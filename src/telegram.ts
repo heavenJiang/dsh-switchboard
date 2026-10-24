@@ -49,6 +49,11 @@ export interface TgMessage {
   readonly caption?: string
   /** Shared by the messages of one album. */
   readonly media_group_id?: string
+  /** The message this one replies to. */
+  readonly reply_to_message?: TgMessage
+  /** Mentions, commands, and other marked spans in `text`. */
+  readonly entities?: readonly TgEntity[]
+  readonly caption_entities?: readonly TgEntity[]
   readonly photo?: readonly TgPhotoSize[]
   readonly document?: TgMediaFile
   readonly video?: TgMediaFile
@@ -57,6 +62,14 @@ export interface TgMessage {
   readonly animation?: TgMediaFile
   readonly video_note?: TgMediaFile
   readonly sticker?: TgFileBase & { readonly is_animated?: boolean; readonly is_video?: boolean }
+}
+
+/** One marked span of message text (UTF-16 offsets). */
+export interface TgEntity {
+  readonly type: string
+  readonly offset: number
+  readonly length: number
+  readonly user?: TgUser
 }
 
 /** getFile result. */
@@ -92,6 +105,8 @@ export class TelegramApiError extends Error {
     readonly method: string,
     readonly code: number,
     readonly description: string,
+    /** Seconds Telegram asked to wait (429). */
+    readonly retryAfter?: number,
   ) {
     super(`telegram ${method} failed (${code}): ${description}`)
     this.name = 'TelegramApiError'
@@ -114,6 +129,19 @@ export interface TelegramClientOptions {
   readonly apiBaseUrl: string
   /** Fetch implementation; tests substitute it. */
   readonly fetch?: typeof fetch
+  /** Waits between 429 retries; tests substitute it. */
+  readonly sleep?: (ms: number) => Promise<void>
+}
+
+/** Rate-limit retries per call; Telegram's flood control asks for seconds at most in practice. */
+const MAX_RATE_RETRIES = 3
+const MAX_RETRY_AFTER_S = 60
+
+/** Formatting for outgoing text. */
+export interface SendOptions {
+  /** `HTML` for text produced by markdownToTelegramHtml. */
+  readonly parseMode?: 'HTML'
+  readonly buttons?: readonly (readonly TgInlineButton[])[]
 }
 
 /** Thin, typed wrapper over the Bot API's JSON methods. */
@@ -128,7 +156,10 @@ export class TelegramClient {
     this.root = `${base}/bot${options.token}`
     this.fileRoot = `${base}/file/bot${options.token}`
     this.fetchImpl = options.fetch ?? fetch
+    this.sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
   }
+
+  private readonly sleep: (ms: number) => Promise<void>
 
   /**
    * Call one Bot API method.
@@ -139,20 +170,32 @@ export class TelegramClient {
    * @throws TelegramApiError when Telegram answers `ok: false`.
    */
   async call<T>(method: string, params: object | FormData = {}, signal?: AbortSignal): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.callOnce<T>(method, params, signal)
+      } catch (error: unknown) {
+        // Flood control: wait as asked, then retry. Long polls never hit it.
+        if (!(error instanceof TelegramApiError) || error.code !== 429 || attempt >= MAX_RATE_RETRIES || signal?.aborted === true) throw error
+        await this.sleep(Math.min(error.retryAfter ?? 1, MAX_RETRY_AFTER_S) * 1000)
+      }
+    }
+  }
+
+  private async callOnce<T>(method: string, params: object | FormData, signal?: AbortSignal): Promise<T> {
     const isForm = params instanceof FormData
     const response = await this.fetchImpl(`${this.root}/${method}`, {
       method: 'POST',
       ...(isForm ? { body: params } : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) }),
       ...(signal === undefined ? {} : { signal }),
     })
-    let body: { ok?: boolean; result?: T; error_code?: number; description?: string }
+    let body: { ok?: boolean; result?: T; error_code?: number; description?: string; parameters?: { retry_after?: number } }
     try {
       body = await response.json() as typeof body
     } catch {
       throw new TelegramApiError(method, response.status, `non-JSON response (HTTP ${response.status})`)
     }
     if (body.ok !== true) {
-      throw new TelegramApiError(method, body.error_code ?? response.status, body.description ?? 'unknown error')
+      throw new TelegramApiError(method, body.error_code ?? response.status, body.description ?? 'unknown error', body.parameters?.retry_after)
     }
     return body.result as T
   }
@@ -183,11 +226,13 @@ export class TelegramClient {
    * @param buttons - optional inline keyboard rows.
    * @returns the sent message.
    */
-  sendMessage(chatId: number, text: string, buttons?: readonly (readonly TgInlineButton[])[]): Promise<TgMessage> {
+  sendMessage(chatId: number, text: string, options: SendOptions | readonly (readonly TgInlineButton[])[] = {}): Promise<TgMessage> {
+    const { parseMode, buttons }: SendOptions = Array.isArray(options) ? { buttons: options as SendOptions['buttons'] & object } : options as SendOptions
     return this.call('sendMessage', {
       chat_id: chatId,
       text,
       link_preview_options: { is_disabled: true },
+      ...(parseMode === undefined ? {} : { parse_mode: parseMode }),
       ...(buttons === undefined ? {} : { reply_markup: { inline_keyboard: buttons } }),
     })
   }
@@ -246,8 +291,17 @@ export class TelegramClient {
   }
 
   /** Replace a sent message's text and drop its inline keyboard. */
-  editMessageText(chatId: number, messageId: number, text: string): Promise<unknown> {
-    return this.call('editMessageText', { chat_id: chatId, message_id: messageId, text })
+  editMessageText(chatId: number, messageId: number, text: string, parseMode?: 'HTML'): Promise<unknown> {
+    return this.call('editMessageText', {
+      chat_id: chatId, message_id: messageId, text,
+      link_preview_options: { is_disabled: true },
+      ...(parseMode === undefined ? {} : { parse_mode: parseMode }),
+    })
+  }
+
+  /** Delete a message the bot sent. */
+  deleteMessage(chatId: number, messageId: number): Promise<unknown> {
+    return this.call('deleteMessage', { chat_id: chatId, message_id: messageId })
   }
 
   /** Acknowledge an inline keyboard press so the client stops its spinner. */

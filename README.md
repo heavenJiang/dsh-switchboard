@@ -2,78 +2,84 @@
 
 English | [中文](README.zh.md)
 
-Drive DeepSeek Harness from a Telegram bot: prompt the Agent with text, photos, and files, receive the files it presents, stop work, switch working directories and Sessions, and answer tool approvals with inline buttons.
+Drive DeepSeek Harness from a Telegram bot: send the Agent text, photos, files, and voice notes from your phone, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to Telegram.
 
-The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Sessions started in Telegram show up in the Web sidebar and Web Sessions can be taken over with `/use`.
+The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed.
+
+![Telegram panel overview](docs/images/panel-dashboard.png)
 
 ## Quick start
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy its token.
-2. Install into a Web profile:
+2. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-telegram-bridge`, or
 
    ```sh
-   dsh plugin --profile web add /path/to/dsh-telegram-bridge
-   dsh web
+   dsh plugin --profile web add github:heavenJiang/dsh-telegram-bridge
    ```
 
-   Or use **Plugins → Add plugin** in the Web sidebar with a local path or Git URL.
-3. Open **Plugins** in the Web sidebar, click the **Telegram Remote** card under "Installed plugins" (below the official and experimental groups), and fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot to get your id), and **Default working directory**.
-4. **Save**. Changes apply live; no restart.
+3. Open **Plugins → Installed → Telegram Remote** (or **Plugin settings** on the sidebar's **Telegram** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
 
-## Commands
+## In Telegram
 
 | Command | Effect |
 | --- | --- |
-| plain text | Prompt the current Session; starts one in the default directory if none |
+| text, photo, file, voice | Goes to the current Session; one is started in the default directory if needed |
 | `/new [dir]` | New Session |
 | `/cwd <dir>` | Working directory for this chat's new Sessions |
-| `/use <sessionId>` | Switch to an existing Session (Web ones too) |
-| `/sessions` | Recent Sessions |
+| `/sessions` | Recent Sessions, numbered |
+| `/use <n\|sessionId>` | Switch to an existing Session (Web ones too) |
+| `/watch [n\|sessionId]` | Follow a Session's completions and approvals; no argument lists them |
+| `/unwatch <n\|sessionId\|all>` | Stop following |
 | `/stop` | Stop current work |
 | `/steer <text>` | Steer the running turn |
-| `/model [name]` | List models as buttons, or switch the current Session's model |
-| `/status` | Session, directory, and run state |
-| `/whoami` | Your user and chat id (available to anyone) |
-| other `/xxx` | Passed to the Agent verbatim (e.g. `/plan …`, skills) |
+| `/queue`, `/cancel <n\|all>` | Show or drop queued messages |
+| `/model [name]` | Show or switch the Session's model (buttons, fuzzy match; the Web default is untouched) |
+| `/mode [mode]` | Show or switch the Session's permission mode |
+| `/get <path>` | Fetch a file or list a directory inside the working directory (symlinks cannot escape it) |
+| `/status` | Session, model, directory, and run state |
+| `/whoami` | Your user and chat id (anyone) |
+| other `/xxx` | Passed to the Agent verbatim |
 
-Assistant text, tool-call lines (optional), and failure/stop notices are posted back to the bound chat, with a typing indicator while the Agent runs.
+- **Rendering**: Markdown replies become Telegram HTML (bold, italics, code, fenced code with language, links, headings, quotes, lists; tables as monospace blocks), split safely, with a plain-text fallback.
+- **Streaming**: a draft message is edited every couple of seconds and then replaced by the formatted reply.
+- **Tool activity**: all tool calls between two replies share one "🛠 Tool calls · N" message edited in place, so long runs do not flood the chat.
+- **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
+- **Approvals and questions**: tool approvals get **Allow once / Reject** buttons; the Agent's questions (ask_user_question) get option buttons, multi-select with **Done**, and any plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
+- **Media**: photos and files are staged through `ctx.fileUploads`; images (detected by their bytes) reach the model as images. Voice notes are converted with ffmpeg and transcribed by the Harness speech service; without it they go as files. Files the Agent presents are sent back.
+- **Groups**: by default the bot answers only commands, @mentions, and replies to it. Authorize individual users or whole chats.
+- **Security**: only allowed users (or members of allowed chats) can use the bot; strangers are told at most once an hour. The token lives in the Harness credentials store (`TELEGRAM_BOT_TOKEN`, or an environment variable of that name), never in the profile file or the browser; a legacy literal token migrates on the next save.
 
-## Version and updates
+## In the Web UI
 
-The plugin's detail page has a **Version** section above the settings: installed version and source, **Check for updates** (GitHub default-branch `package.json` version, or npm), and **Update to vX.Y.Z** when a newer release exists. GitHub installs reinstall in place at the newest commit through the plugin manager (the new commit's `prepare` build is shown for approval first); npm installs use the plugin manager's own `updateBundle`; local links are never updated. The Telegram panel has a **Plugin settings** button and a **New** badge when an update exists. Bump `version` in `package.json` with every release, since the check compares versions.
+- **Telegram panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
+- **Telegram tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
+- **`/telegram` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session; runs on the Host, never reaches the model.
+- **Channel note**: Sessions bound to a chat get a short `ctx.systemPrompt.context()` note asking for phone-friendly replies.
 
-## Photos and files
-
-Photos, documents, videos, audio, voice notes, video notes, and static stickers sent to the bot are downloaded and staged into the Session through `ctx.fileUploads`, the Web composer's attachment path. Images (detected by their bytes) go through the image channel so the model sees them; everything else arrives as a file. Captions become the prompt text, and an album becomes one prompt. The public Bot API serves files up to 20 MB; use a self-hosted Bot API server for larger ones.
-
-Files the Agent hands over with the `present` tool are sent back: common images inline, everything else as a document (up to Telegram's 50 MB).
+![Chat thread](docs/images/panel-thread.png)
 
 ## Models
 
-Precedence: a `/model` choice for the chat's Session (buttons, or `/model <name>` with fuzzy matching; applied when a cold Session next loads) > the plugin page's **Bot default model** for Sessions the bot creates (optionally with a reasoning effort) > the Web default model. Neither bot setting changes the Web default; the plugin records the choice on the Session itself. `/status` and the history panel header show the Session's model.
+A `/model` choice for the Session > the plugin page's **Bot default model** for Sessions the bot creates > the Web default. Neither changes the Web default; choices for cold Sessions persist and apply when the Session next loads.
 
-## Chat history in the Web UI
+## Scheduled tasks
 
-The **Telegram** sidebar entry opens a history viewer while the plugin runs: chats on the left (searchable, with unauthorized-only chats tagged), the selected chat's messages on the right — people on the left, the bot on the right, photos inline, files as cards, tool calls and notices as compact lines, approvals as cards with outcome and who answered — plus an **Open Session** button that jumps to the bound Web Session. It refreshes every 3 seconds and loads older messages on demand.
+Chats listed in **Scheduled task chats** receive the replies and summaries of Harness scheduled tasks.
 
-History lives in `$DSH_HOME/telegram-bridge/chats/` (one JSONL file per chat plus copies of received images), never enters a Session, and is trimmed to `historyLimit` entries per chat. The `/api/telegram-bridge/*` routes are owner-only.
+## Version and updates
 
-## Approvals
-
-With **Answer tool approvals in Telegram** on, an approval for a chat-bound Session is sent there with **Allow once / Reject** buttons and an argument preview. Only allowed users can press them. After the timeout the question goes to the Web UI unchanged.
+The plugin page's **Version** section checks GitHub (the default branch's `package.json` version) or npm, and **Update to vX.Y.Z** reinstalls in place through the plugin manager. Bump `version` with every release.
 
 ## Configuration
 
-See [README.zh.md](README.zh.md#配置项) for the full table. Every user-facing field is volatile and editable on the Plugins page; `pollTimeoutSec` and `stateFile` live in the profile's `cordis.patch.yml`. Set `HTTPS_PROXY` before launching `dsh` if Telegram is not directly reachable.
-
-## Security
-
-The bot lets an Agent run tools on this machine. Allow only your own user id; an empty list admits no one. Keep the default `workspace-write` preset with Telegram approvals unless you know what `danger-full-access` implies. The token is a `role('secret')` field and never reaches the browser.
+See the full table in [README.zh.md](README.zh.md#配置项). Every user-facing field is live-editable; `pollTimeoutSec` and `stateFile` live in the profile's `cordis.patch.yml`. Set `HTTPS_PROXY` before launching `dsh` if Telegram is not directly reachable.
 
 ## Development
 
-Type-checking uses a built sibling checkout at `../deepseek-harness`.
+Type-checking and the Loader composition test use a built sibling checkout at `../deepseek-harness`.
 
 ```sh
 pnpm install && pnpm typecheck && pnpm test && pnpm build
 ```
+
+See [docs/PUBLISHING.md](docs/PUBLISHING.md) for npm publishing and [CHANGELOG.md](CHANGELOG.md) for changes.

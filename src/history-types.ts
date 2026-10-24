@@ -28,10 +28,10 @@ export interface ChatEntry {
   readonly dir: 'in' | 'out'
   /**
    * `text`/`command`/`media` come from people; `assistant`, `tool`, `notice`,
-   * `file`, and `approval` are what the bot sent; `denied` is a message from
+   * `file`, and `approval` are what the bot sent; `web` was typed in the Web UI and sent as the bot; `denied` is a message from
    * a user outside the allow-list.
    */
-  readonly kind: 'text' | 'command' | 'media' | 'assistant' | 'tool' | 'notice' | 'file' | 'approval' | 'denied'
+  readonly kind: 'text' | 'command' | 'media' | 'assistant' | 'tool' | 'notice' | 'file' | 'approval' | 'denied' | 'web'
   readonly from?: ChatSender
   readonly text?: string
   readonly attachments?: readonly ChatAttachment[]
@@ -73,4 +73,18 @@ export interface ChatPage {
   readonly entries: ChatEntry[]
   /** Whether older entries exist before the first returned one. */
   readonly more: boolean
+}
+
+/** Dashboard figures for the Telegram panel. */
+export interface ChatStats {
+  readonly today: { readonly in: number; readonly out: number }
+  readonly week: {
+    readonly messages: number
+    readonly activeChats: number
+    readonly allowed: number
+    readonly rejected: number
+    readonly denied: number
+  }
+  /** The last 14 days, oldest first. */
+  readonly series: readonly { readonly day: string; readonly in: number; readonly out: number }[]
 }

@@ -1,4 +1,4 @@
-Drive Harness from a Telegram bot: send text, photos, and files to the Agent, receive presented files, and answer tool approvals in the chat.
+Drive Harness from a Telegram bot: send text, photos, files, and voice notes, watch replies stream, answer approvals and the Agent's questions, and follow long tasks. The sidebar **Telegram** panel shows chat history; each Session's **Telegram** tab links chats.
 
 **Setup**: fill in the **Bot token** below (create a bot with [@BotFather](https://t.me/BotFather)), **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
 

@@ -13,6 +13,14 @@ export interface ChatBinding {
   sessionId?: string
   /** Workspace directory for the next new Session; overrides the configured default. */
   workspacePath?: string
+  /** Sessions this chat follows for completion and approval notices without talking to them. */
+  watch?: string[]
+}
+
+/** A choice made in Telegram for a Session that was not loaded at the time. */
+export interface PendingChoice {
+  model?: { provider: string; model: string; reasoningEffort?: string }
+  preset?: string
 }
 
 /** File format version 1. */
@@ -21,6 +29,8 @@ interface BindingsFile {
   /** Last processed update id + 1, so a restart does not replay messages. */
   offset: number
   chats: Record<string, ChatBinding>
+  /** Choices applied when their Session next loads, by Session id. */
+  pending?: Record<string, PendingChoice>
 }
 
 /**
@@ -52,7 +62,10 @@ export class BindingStore {
     if (parsed.version !== 1 || typeof parsed.chats !== 'object' || parsed.chats === null) {
       throw new Error(`telegram-bridge: unrecognized state file ${this.path}`)
     }
-    this.data = { version: 1, offset: Number(parsed.offset) || 0, chats: parsed.chats }
+    this.data = {
+      version: 1, offset: Number(parsed.offset) || 0, chats: parsed.chats,
+      ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
+    }
   }
 
   /** @returns the next getUpdates offset. */
@@ -63,6 +76,48 @@ export class BindingStore {
   /** @returns the chat's binding; an empty object when none is stored. */
   get(chatId: number): Readonly<ChatBinding> {
     return this.data.chats[String(chatId)] ?? {}
+  }
+
+  /** @returns every chat that follows a Session without being bound to it. */
+  watchersOf(sessionId: string): number[] {
+    return Object.entries(this.data.chats)
+      .filter(([, binding]) => binding.sessionId !== sessionId && binding.watch?.includes(sessionId) === true)
+      .map(([chatId]) => Number(chatId))
+  }
+
+  /** Start or stop following a Session from a chat. */
+  setWatch(chatId: number, sessionId: string, on: boolean): Promise<void> {
+    const key = String(chatId)
+    const binding: ChatBinding = { ...this.data.chats[key] }
+    const list = new Set(binding.watch ?? [])
+    if (on) list.add(sessionId)
+    else list.delete(sessionId)
+    if (list.size === 0) delete binding.watch
+    else binding.watch = [...list]
+    this.data.chats[key] = binding
+    return this.flush()
+  }
+
+  /** @returns the pending choice for a Session, if any. */
+  pending(sessionId: string): Readonly<PendingChoice> | undefined {
+    return this.data.pending?.[sessionId]
+  }
+
+  /**
+   * Merge or clear a pending choice.
+   * @param patch - fields to set; `undefined` clears that field; an empty result removes the entry.
+   */
+  setPending(sessionId: string, patch: Partial<Record<keyof PendingChoice, unknown>>): Promise<void> {
+    const pending = { ...this.data.pending }
+    const next: Record<string, unknown> = { ...pending[sessionId] }
+    for (const [field, value] of Object.entries(patch)) {
+      if (value === undefined) delete next[field]
+      else next[field] = value
+    }
+    if (Object.keys(next).length === 0) delete pending[sessionId]
+    else pending[sessionId] = next as PendingChoice
+    this.data.pending = pending
+    return this.flush()
   }
 
   /** @returns every chat bound to a Session id. */
@@ -77,10 +132,10 @@ export class BindingStore {
    * @param chatId - Telegram chat id.
    * @param patch - fields to set; `undefined` removes a field.
    */
-  update(chatId: number, patch: Partial<Record<keyof ChatBinding, string | undefined>>): Promise<void> {
+  update(chatId: number, patch: Partial<Record<'sessionId' | 'workspacePath', string | undefined>>): Promise<void> {
     const key = String(chatId)
     const next: ChatBinding = { ...this.data.chats[key] }
-    for (const [field, value] of Object.entries(patch) as [keyof ChatBinding, string | undefined][]) {
+    for (const [field, value] of Object.entries(patch) as ['sessionId' | 'workspacePath', string | undefined][]) {
       if (value === undefined) delete next[field]
       else next[field] = value
     }

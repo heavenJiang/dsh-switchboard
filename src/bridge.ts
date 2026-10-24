@@ -1,25 +1,32 @@
 /**
  * Telegram ⇄ Harness bridge core: long-polls the Bot API, turns messages and
- * commands into Session operations, mirrors committed assistant output back
- * to the bound chats, and asks tool approvals with inline buttons. Photos and
- * files sent to the bot are staged into the Session as prompt attachments;
- * files the Agent presents are sent back.
+ * commands into Session operations, mirrors assistant output back to the bound
+ * chats (rendered from Markdown, streamed as a draft while it is written), and
+ * asks tool approvals with inline buttons. Photos, files, and voice notes are
+ * staged into the Session; files the Agent presents are sent back. Chats can
+ * follow Sessions they do not drive for completion and approval notices, and
+ * scheduled runs can report to chosen chats.
  *
  * Harness access goes through {@link HarnessPort}, so this module does not
  * touch Cordis and can be exercised with a fake.
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
-import { basename, isAbsolute, resolve } from 'node:path'
-import type { BindingStore } from './bindings.ts'
+import { readdir, readFile, realpath, stat } from 'node:fs/promises'
+import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
+import type { BindingStore, PendingChoice } from './bindings.ts'
 import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
+import { chunkMarkdown, markdownToTelegramHtml } from './markdown.ts'
 import { incomingAttachments, outgoingKind, promptImageType, sniffImageType, type IncomingAttachment } from './media.ts'
 import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
 import {
-  FileTooLargeError, TelegramApiError, TelegramClient, type TgCallbackQuery, type TgChat, type TgMessage, type TgUpdate, type TgUser,
+  FileTooLargeError, TelegramApiError, TelegramClient,
+  type TgCallbackQuery, type TgChat, type TgInlineButton, type TgMessage, type TgUpdate, type TgUser,
 } from './telegram.ts'
-import { chunkText, isAllowed, parseInput, previewArguments } from './text.ts'
+import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
+
+/** When to post a summary at the end of a bound Session's turn. */
+export type TurnSummaryMode = 'off' | 'long' | 'always'
 
 /** Live settings the bridge reads at the start of each operation. */
 export interface BridgeSettings {
@@ -27,12 +34,27 @@ export interface BridgeSettings {
   readonly botToken: string | undefined
   readonly apiBaseUrl: string
   readonly allowedUsers: readonly string[]
+  /** Chat ids whose every member may drive the Harness (groups shared with a team). */
+  readonly allowedChats: readonly string[]
+  /** In groups, answer only commands, @mentions, and replies to the bot. */
+  readonly groupMentionOnly: boolean
   readonly workspacePath: string
   readonly agentPreset: string
   readonly permissionPreset: string
   readonly approvalViaTelegram: boolean
+  /** Ask the Agent's questions (ask_user_question) in Telegram too. */
+  readonly questionsViaTelegram: boolean
   readonly approvalTimeoutSec: number
   readonly notifyToolCalls: boolean
+  /** Edit a draft message while the reply is written instead of waiting for the whole reply. */
+  readonly streamReplies: boolean
+  readonly turnSummary: TurnSummaryMode
+  /** Minimum turn length for `long` summaries. */
+  readonly turnSummaryMinSec: number
+  /** Transcribe voice notes into prompts when the host can. */
+  readonly transcribeVoice: boolean
+  /** Chats that receive scheduled-run results. */
+  readonly scheduleChats: readonly string[]
   readonly language: BotLanguage
   readonly pollTimeoutSec: number
   /** Largest file accepted from Telegram, in MB (the public Bot API serves at most 20). */
@@ -55,6 +77,19 @@ export interface ModelGroup {
   readonly provider: string
   readonly name: string
   readonly models: readonly { readonly id: string; readonly name: string }[]
+}
+
+/** One permission preset the deployment offers. */
+export interface PresetOption {
+  readonly value: string
+  readonly name: string
+  readonly description?: string
+}
+
+/** One queued prompt of a live Session. */
+export interface QueuedItem {
+  readonly id: string
+  readonly text: string
 }
 
 /** One part of a prompt: text, or an attachment staged with {@link HarnessPort.stageFile}. */
@@ -92,6 +127,15 @@ export interface HarnessPort {
    * @throws when the route cannot serve the model.
    */
   selectModel(sessionId: string, choice: ModelChoice): Promise<boolean>
+  /** Permission presets the deployment offers. */
+  listPresets(): PresetOption[]
+  /** A live Session's permission preset, or undefined when it is not loaded. */
+  currentPreset(sessionId: string): string | undefined
+  /**
+   * Validate and switch a live Session's permission preset.
+   * @returns false when the Session is not loaded.
+   */
+  selectPreset(sessionId: string, preset: string): boolean
   /** Queue (or steer) one prompt into a Session, resuming it when cold. */
   prompt(sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void>
   /**
@@ -105,6 +149,17 @@ export interface HarnessPort {
   live(sessionId: string): { running: boolean; cwd?: string } | undefined
   /** Recent root Sessions, newest first. */
   listSessions(): Promise<SessionRow[]>
+  /** Prompts waiting in a live Session's inbox; undefined when it is not loaded. */
+  queued(sessionId: string): QueuedItem[] | undefined
+  /** Drop queued prompts by id, or all; returns how many were dropped. */
+  dropQueued(sessionId: string, ids: readonly string[] | 'all'): number
+  /** Files a finished turn changed, from the workspace-changes summary at `seq`; undefined when unknown. */
+  changedFiles(sessionId: string, seq: number): string[] | undefined
+  /**
+   * Transcribe a voice note.
+   * @throws with a short reason when transcription is unavailable.
+   */
+  transcribe(audio: Uint8Array, signal: AbortSignal): Promise<string>
 }
 
 /** Minimal logger face. */
@@ -124,18 +179,72 @@ interface PendingApproval {
   settle(outcome: TelegramApprovalOutcome, note: string, by?: string): void
 }
 
+/** One question the Agent asked, as Telegram shows it. */
+export interface QuestionItem {
+  readonly id: string
+  readonly question: string
+  readonly header?: string
+  readonly detail?: string
+  readonly options?: readonly { readonly label: string }[]
+  readonly multiSelect?: boolean
+}
+
+/** The answer batch for one question request. */
+export interface QuestionAnswer {
+  readonly answers: { id: string; selected: string[]; custom?: string }[]
+}
+
+/** A question request waiting on Telegram. */
+interface PendingQuestions {
+  readonly sessionId: string
+  readonly chats: number[]
+  readonly items: {
+    readonly item: QuestionItem
+    readonly messages: Map<number, number>
+    readonly selected: Set<string>
+    custom?: string
+    done: boolean
+  }[]
+  settle(outcome: QuestionAnswer | 'delegate' | 'cancelled', note?: string): void
+}
+
+/** A list of buttons sent with /model or /mode, kept so a press fits Telegram's 64-byte callback data. */
+type Picker =
+  | { kind: 'model'; sessionId: string; choices: { choice: ModelChoice; name: string }[]; at: number }
+  | { kind: 'mode'; sessionId: string; choices: PresetOption[]; at: number }
+
 /** How a bot message is labelled in the chat history. */
 type OutKind = 'assistant' | 'tool' | 'notice'
 
-/** Images up to this size are copied into the history for the viewer. */
-const VIEWER_IMAGE_LIMIT = 5 * 1024 * 1024
-const IMAGE_EXTENSIONS: Record<string, string> = {
-  'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
+/** A reply being written, shown as one edited message per chat. */
+interface Draft {
+  text: string
+  /** Draft message per chat, once sent. */
+  readonly messages: Map<number, number>
+  lastFlush: number
+  timer: ReturnType<typeof setTimeout> | undefined
+  /** The send or edit in flight; finalization waits for it. */
+  pending: Promise<void>
 }
 
-/** Per-chat output state for one Session's current activity. */
-interface ChatActivity {
-  typing?: ReturnType<typeof setInterval>
+/** Tool calls between two replies, shown as one message edited in place. */
+interface ToolActivity {
+  readonly lines: string[]
+  count: number
+  readonly messages: Map<number, number>
+  timer: ReturnType<typeof setTimeout> | undefined
+  lastFlush: number
+  pending: Promise<void>
+}
+
+/** What the bridge tracks about a Session's running turn. */
+interface TurnState {
+  startedAt: number
+  tools: number
+  files?: string[]
+  /** Started by the schedule subsystem: results also go to the schedule chats. */
+  scheduled: boolean
+  lastText?: string
 }
 
 /** Observable connection state for `/status` and logs. */
@@ -145,16 +254,33 @@ export type BridgeState =
   | { readonly kind: 'running'; readonly username: string }
   | { readonly kind: 'error'; readonly message: string }
 
+/** Images up to this size are copied into the history for the viewer. */
+const VIEWER_IMAGE_LIMIT = 5 * 1024 * 1024
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
+}
 const TYPING_INTERVAL_MS = 4500
 const MAX_BACKOFF_MS = 60_000
-const TOOL_PREVIEW_LENGTH = 300
+const TOOL_PREVIEW_LENGTH = 200
+/** Tool lines arriving within this window go out as one message (Telegram allows about one message per second per chat). */
+const TOOL_BATCH_MS = 1500
+/** Lines an activity message shows; older calls fold into its count. */
+const TOOL_LINES_SHOWN = 12
+/** Draft edits are at least this far apart. */
+const DRAFT_INTERVAL_MS = 1500
+/** A draft appears once the reply has this much text. */
+const DRAFT_MIN_CHARS = 40
 /** How long to wait for the rest of an album before prompting with it. */
 const MEDIA_GROUP_WAIT_MS = 1500
 /** Telegram's document upload ceiling for bots. */
 const SEND_LIMIT_BYTES = 50 * 1024 * 1024
 /** Buttons in one /model picker; longer catalogs are reached by name. */
-const MODEL_BUTTONS = 30
+const PICKER_BUTTONS = 30
 const PICKER_TTL_MS = 10 * 60 * 1000
+/** A stranger hears the "not authorized" reply at most this often. */
+const DENIED_REPLY_INTERVAL_MS = 60 * 60 * 1000
+const DIRECTORY_LIST_LIMIT = 50
+const EXCERPT_LENGTH = 400
 
 /** The bridge core. One instance lives for the plugin's lifetime; polling restarts on token changes. */
 export class TelegramBridge {
@@ -163,14 +289,20 @@ export class TelegramBridge {
   private poll: { controller: AbortController; done: Promise<void>; key: string } | undefined
   private botUsername: string | undefined
   private readonly sendTails = new Map<number, Promise<void>>()
-  private readonly activity = new Map<string, ChatActivity>()
+  private readonly typing = new Map<string, ReturnType<typeof setInterval>>()
   private readonly approvals = new Map<string, PendingApproval>()
+  private readonly questions = new Map<string, PendingQuestions>()
   private readonly toolCalls = new Map<string, { name: string; arguments: string }>()
-  /** Choices made with /model for Sessions that were not loaded at the time. */
-  private readonly pendingModels = new Map<string, ModelChoice>()
-  /** Model pickers sent with /model, by short id, so a button press fits Telegram's 64-byte callback data. */
-  private readonly pickers = new Map<string, { sessionId: string; choices: ModelChoice[]; at: number }>()
+  /** One edited "tool activity" message per Session and chat, until the next reply. */
+  private readonly toolBatches = new Map<string, ToolActivity>()
+  private readonly drafts = new Map<string, Draft>()
+  private readonly turns = new Map<string, TurnState>()
+  private readonly pickers = new Map<string, Picker>()
   private readonly albums = new Map<string, { chatId: number; messages: TgMessage[]; timer: ReturnType<typeof setTimeout> }>()
+  /** The last /sessions listing per chat, so `/use 2` and `/watch 2` work. */
+  private readonly listings = new Map<number, string[]>()
+  private readonly deniedReplies = new Map<number, number>()
+  private readonly lifetime = new AbortController()
 
   constructor(
     private readonly settings: () => BridgeSettings,
@@ -186,17 +318,17 @@ export class TelegramBridge {
     return this.state.kind === 'running' ? this.state.username : undefined
   }
 
-  /** Append to the Web viewer's history; failures are logged, never surfaced to Telegram. */
-  private log(chat: ChatInfo, entry: Omit<ChatEntry, 'id' | 'at' | 'sessionId'>): void {
-    if (this.chatLog === undefined) return
-    const sessionId = this.store.get(chat.chatId).sessionId
-    void this.chatLog.record(chat, { ...entry, ...(sessionId === undefined ? {} : { sessionId }) }).catch((error: unknown) => {
-      this.logger.warn(`telegram-bridge: chat history write failed: ${describe(error)}`)
-    })
-  }
-
   private get t(): Messages {
     return MESSAGES[this.settings().language]
+  }
+
+  /** Append to the Web viewer's history; failures are logged, never surfaced to Telegram. */
+  private log(chat: ChatInfo, entry: Omit<ChatEntry, 'id' | 'at' | 'sessionId'>, sessionId?: string): void {
+    if (this.chatLog === undefined) return
+    const session = sessionId ?? this.store.get(chat.chatId).sessionId
+    void this.chatLog.record(chat, { ...entry, ...(session === undefined ? {} : { sessionId: session }) }).catch((error: unknown) => {
+      this.logger.warn(`telegram-bridge: chat history write failed: ${describe(error)}`)
+    })
   }
 
   // ─── lifecycle ──────────────────────────────────────────────────────────
@@ -231,13 +363,23 @@ export class TelegramBridge {
       await poll.done
     }
     for (const approval of this.approvals.values()) approval.settle('delegate', this.t.approvalCancelled)
+    for (const pending of this.questions.values()) pending.settle('delegate', this.t.questionTimedOut)
     for (const album of this.albums.values()) clearTimeout(album.timer)
     this.albums.clear()
-    for (const activity of this.activity.values()) clearInterval(activity.typing)
-    this.activity.clear()
+    for (const timer of this.typing.values()) clearInterval(timer)
+    this.typing.clear()
+    for (const sessionId of [...this.toolBatches.keys()]) this.flushTools(sessionId)
+    for (const draft of this.drafts.values()) clearTimeout(draft.timer)
+    this.drafts.clear()
     await Promise.allSettled([...this.sendTails.values()])
     this.client = undefined
     this.state = { kind: 'stopped' }
+  }
+
+  /** Stop for good: also abort in-flight transcriptions. */
+  async dispose(): Promise<void> {
+    this.lifetime.abort()
+    await this.stop()
   }
 
   /** The long-poll loop; returns once `signal` aborts or the token is rejected. */
@@ -284,6 +426,9 @@ export class TelegramBridge {
       { command: 'new', description: t.cmdNew },
       { command: 'stop', description: t.cmdStop },
       { command: 'model', description: t.cmdModel },
+      { command: 'mode', description: t.cmdMode },
+      { command: 'watch', description: t.cmdWatch },
+      { command: 'get', description: t.cmdGet },
       { command: 'status', description: t.cmdStatus },
       { command: 'help', description: t.cmdHelp },
     ]).catch((error: unknown) => {
@@ -299,14 +444,38 @@ export class TelegramBridge {
     if (update.message !== undefined) return this.handleMessage(update.message)
   }
 
+  /** Whether a user (or the whole chat) may drive the Harness. */
+  private allowed(user: TgUser, chat: TgChat): boolean {
+    const s = this.settings()
+    return isAllowed(s.allowedUsers, user.id, user.username) || s.allowedChats.some(id => id.trim() === String(chat.id))
+  }
+
+  /**
+   * In groups the bot answers only what is addressed to it.
+   * @returns the message text with the bot's @mention removed, or undefined to ignore the message.
+   */
+  private addressed(message: TgMessage, text: string | undefined): { text: string | undefined } | undefined {
+    const group = message.chat.type === 'group' || message.chat.type === 'supergroup'
+    if (!group || !this.settings().groupMentionOnly) return { text }
+    const bot = this.botUsername?.toLowerCase()
+    const mention = bot === undefined ? undefined : new RegExp(`@${bot}\\b`, 'iu')
+    if (text !== undefined && text.trimStart().startsWith('/')) return { text }
+    if (text !== undefined && mention?.test(text) === true) return { text: text.replace(mention, '').trim() }
+    const repliedTo = message.reply_to_message?.from
+    if (repliedTo?.is_bot === true && repliedTo.username?.toLowerCase() === bot) return { text }
+    return undefined
+  }
+
   private async handleMessage(message: TgMessage): Promise<void> {
     const from = message.from
     if (from === undefined || from.is_bot) return
     const chatId = message.chat.id
     const t = this.t
-    const text = message.text ?? message.caption
+    const addressed = this.addressed(message, message.text ?? message.caption)
+    if (addressed === undefined) return
+    const text = addressed.text
     const parsed = text === undefined ? undefined : parseInput(text, this.botUsername)
-    const allowed = isAllowed(this.settings().allowedUsers, from.id, from.username)
+    const allowed = this.allowed(from, message.chat)
     const attachments = incomingAttachments(message)
     const chat = chatInfo(message.chat, from)
     if (!allowed) {
@@ -322,15 +491,21 @@ export class TelegramBridge {
       return this.reply(chatId, t.whoami(from.id, chatId))
     }
     if (!allowed) {
-      // Answer strangers only in private chats so a group does not get spammed.
-      if (message.chat.type === 'private') await this.reply(chatId, t.unauthorized(from.id))
+      // Answer strangers only in private chats, and only now and then, so nobody can make the bot spam.
+      const last = this.deniedReplies.get(from.id) ?? 0
+      if (message.chat.type === 'private' && Date.now() - last > DENIED_REPLY_INTERVAL_MS) {
+        this.deniedReplies.set(from.id, Date.now())
+        await this.reply(chatId, t.unauthorized(from.id))
+      }
       return
     }
     if (message.media_group_id !== undefined) return this.collectAlbum(chatId, message)
     try {
+      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(chatId, message)
       if (attachments.length > 0) return await this.promptWithMedia(chatId, [message])
       if (text === undefined) return await this.reply(chatId, t.unsupported)
       if (parsed === undefined) return
+      if (parsed.kind === 'text' && this.answerByText(chatId, parsed.text)) return
       if (parsed.kind === 'text') return await this.promptFromChat(chatId, [{ type: 'text', text: parsed.text }], 'queue')
       return await this.runCommand(chatId, parsed.name, parsed.args)
     } catch (error: unknown) {
@@ -357,7 +532,7 @@ export class TelegramBridge {
    * Download every attachment of one message or album, stage it into the
    * chat's Session, and prompt with the captions plus the receipts.
    */
-  private async promptWithMedia(chatId: number, messages: readonly TgMessage[]): Promise<void> {
+  private async promptWithMedia(chatId: number, messages: readonly TgMessage[], note?: string): Promise<void> {
     const client = this.client
     if (client === undefined) return
     const t = this.t
@@ -391,12 +566,38 @@ export class TelegramBridge {
         ...(captions.length === 0 ? {} : { text: captions.join('\n\n') }),
       })
     }
+    if (note !== undefined) await this.reply(chatId, note)
     if (parts.length === 0) {
       this.stopTyping(sessionId)
       return
     }
     if (captions.length > 0) parts.unshift({ type: 'text', text: captions.join('\n\n') })
     await this.harness.prompt(sessionId, parts, 'queue')
+  }
+
+  /**
+   * Transcribe a voice note and prompt with the text; when the host cannot
+   * transcribe, the note goes to the Agent as an audio file instead.
+   */
+  private async promptWithVoice(chatId: number, message: TgMessage): Promise<void> {
+    const client = this.client
+    const voice = message.voice
+    if (client === undefined || voice === undefined || message.from === undefined) return
+    const t = this.t
+    let transcript: string
+    try {
+      const limit = this.settings().maxDownloadMb * 1024 * 1024
+      const audio = await this.download(client, { fileId: voice.file_id, name: `voice_${message.message_id}.ogg`, ...(voice.file_size === undefined ? {} : { size: voice.file_size }) }, limit)
+      transcript = (await this.harness.transcribe(audio, this.lifetime.signal)).trim()
+    } catch (error: unknown) {
+      return this.promptWithMedia(chatId, [message], t.voiceUnavailable(describe(error)))
+    }
+    if (transcript === '') return this.reply(chatId, t.voiceEmpty)
+    const caption = (message.caption ?? '').trim()
+    const text = caption === '' ? transcript : `${caption}\n\n${transcript}`
+    this.log(chatInfo(message.chat, message.from), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
+    await this.reply(chatId, t.voiceHeard(transcript))
+    await this.promptFromChat(chatId, [{ type: 'text', text }], 'queue')
   }
 
   /** Describe an attachment for the history, keeping a copy of images the viewer can show. */
@@ -414,6 +615,8 @@ export class TelegramBridge {
     if (file.file_path === undefined) throw new FileTooLargeError(file.file_size ?? limit + 1, limit)
     return client.downloadFile(file.file_path, limit)
   }
+
+  // ─── commands ───────────────────────────────────────────────────────────
 
   private async runCommand(chatId: number, name: string, args: string): Promise<void> {
     const t = this.t
@@ -436,14 +639,33 @@ export class TelegramBridge {
       }
       case 'use': {
         if (args === '') return this.reply(chatId, t.useUsage)
-        await this.store.update(chatId, { sessionId: args })
-        await this.chatLog?.bind(chatId, args).catch(() => {})
-        return this.reply(chatId, t.bound(args))
+        const sessionId = this.sessionRef(chatId, args)
+        await this.store.update(chatId, { sessionId })
+        await this.chatLog?.bind(chatId, sessionId).catch(() => {})
+        return this.reply(chatId, t.bound(sessionId))
       }
       case 'sessions': {
         const rows = (await this.harness.listSessions()).slice(0, 10)
-        const lines = rows.map(row => `${row.running ? '▶' : '·'} ${row.sessionId}${row.cwd === undefined ? '' : `  ${row.cwd}`}`)
+        this.listings.set(chatId, rows.map(row => row.sessionId))
+        const lines = rows.map((row, index) =>
+          `${index + 1}. ${row.running ? '▶' : '·'} ${row.sessionId}${row.cwd === undefined ? '' : `  ${row.cwd}`}${row.sessionId === binding.sessionId ? ' ✓' : ''}`)
         return this.reply(chatId, t.sessions(lines))
+      }
+      case 'watch': {
+        if (args === '') return this.reply(chatId, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
+        const sessionId = this.sessionRef(chatId, args)
+        await this.store.setWatch(chatId, sessionId, true)
+        return this.reply(chatId, t.watchOn(sessionId))
+      }
+      case 'unwatch': {
+        if (args.trim().toLowerCase() === 'all') {
+          for (const id of binding.watch ?? []) await this.store.setWatch(chatId, id, false)
+          return this.reply(chatId, t.watchOffAll)
+        }
+        if (args === '') return this.reply(chatId, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
+        const sessionId = this.sessionRef(chatId, args)
+        await this.store.setWatch(chatId, sessionId, false)
+        return this.reply(chatId, t.watchOff(sessionId))
       }
       case 'stop': {
         if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
@@ -454,6 +676,21 @@ export class TelegramBridge {
       case 'steer': {
         if (args === '') return this.reply(chatId, t.steerUsage)
         return this.promptFromChat(chatId, [{ type: 'text', text: args }], 'steer')
+      }
+      case 'queue': {
+        if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
+        const items = this.harness.queued(binding.sessionId)
+        if (items === undefined) return this.reply(chatId, t.queueNotLive)
+        return this.reply(chatId, t.queueList(items.map((item, index) => `${index + 1}. ${truncate(item.text.replace(/\s+/gu, ' '), 80)}`)))
+      }
+      case 'cancel': {
+        if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
+        const items = this.harness.queued(binding.sessionId)
+        if (items === undefined) return this.reply(chatId, t.queueNotLive)
+        if (args.trim().toLowerCase() === 'all') return this.reply(chatId, t.queueCancelled(this.harness.dropQueued(binding.sessionId, 'all')))
+        const picked = args.split(/[\s,]+/u).map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= items.length)
+        if (picked.length === 0) return this.reply(chatId, t.cancelUsage)
+        return this.reply(chatId, t.queueCancelled(this.harness.dropQueued(binding.sessionId, picked.map(n => items[n - 1]!.id))))
       }
       case 'status': {
         const live = binding.sessionId === undefined ? undefined : this.harness.live(binding.sessionId)
@@ -468,10 +705,25 @@ export class TelegramBridge {
       }
       case 'model':
         return this.modelCommand(chatId, binding.sessionId, args)
+      case 'mode':
+        return this.modeCommand(chatId, binding.sessionId, args)
+      case 'get':
+        return this.getCommand(chatId, binding.sessionId, args)
       default:
         // Unknown slash commands go to the Agent verbatim (skills such as /plan are commands there too).
         return this.promptFromChat(chatId, [{ type: 'text', text: `/${name}${args === '' ? '' : ` ${args}`}` }], 'queue')
     }
+  }
+
+  /** Resolve `/use 2` against the chat's last /sessions listing; anything else is a Session id. */
+  private sessionRef(chatId: number, arg: string): string {
+    const value = arg.trim()
+    if (/^\d{1,2}$/u.test(value)) {
+      const listed = this.listings.get(chatId)?.[Number(value) - 1]
+      if (listed === undefined) throw new Error(this.t.sessionNotFound(value))
+      return listed
+    }
+    return value
   }
 
   /**
@@ -479,18 +731,18 @@ export class TelegramBridge {
    * Session's selection; undefined for a cold Session with no pending choice.
    */
   modelOf(sessionId: string): ModelChoice | undefined {
-    return this.pendingModels.get(sessionId) ?? this.harness.currentModel(sessionId)
+    return this.store.pending(sessionId)?.model ?? this.harness.currentModel(sessionId)
   }
 
   /**
-   * Hand over a /model choice made while the Session was not loaded. The host
-   * calls this when the Session's Agent is created, before it handles input.
-   * @returns the choice to select, once.
+   * Hand over /model and /mode choices made while the Session was not loaded.
+   * The host calls this when the Session's Agent is created, before it handles input.
+   * @returns the choices to apply, once.
    */
-  takePendingModel(sessionId: string): ModelChoice | undefined {
-    const choice = this.pendingModels.get(sessionId)
-    this.pendingModels.delete(sessionId)
-    return choice
+  takePending(sessionId: string): Readonly<PendingChoice> | undefined {
+    const pending = this.store.pending(sessionId)
+    if (pending !== undefined) void this.store.setPending(sessionId, { model: undefined, preset: undefined })
+    return pending
   }
 
   /** `/model` lists models as buttons; `/model <name>` switches the chat's Session directly. */
@@ -501,20 +753,11 @@ export class TelegramBridge {
     const all = groups.flatMap(group => group.models.map(model => ({ group, model })))
     if (args === '') {
       const current = this.modelOf(sessionId)
-      const choices = all.slice(0, MODEL_BUTTONS).map(({ group, model }) => ({ provider: group.provider, model: model.id }))
-      const id = randomUUID().slice(0, 8)
-      this.prunePickers()
-      this.pickers.set(id, { sessionId, choices, at: Date.now() })
-      const buttons = all.slice(0, MODEL_BUTTONS).map(({ group, model }, index) => [{
-        text: `${current?.provider === group.provider && current.model === model.id ? '✓ ' : ''}${model.name} · ${group.name}`.slice(0, 60),
-        callback_data: `md:${id}:${index}`,
-      }])
-      const client = this.client
-      if (client === undefined) return
-      const text = t.modelList(current === undefined ? undefined : modelLabel(current), all.length)
-      await this.enqueue(chatId, async (c) => { await c.sendMessage(chatId, text, buttons) })
-      this.log({ chatId }, { dir: 'out', kind: 'notice', text })
-      return
+      const choices = all.slice(0, PICKER_BUTTONS).map(({ group, model }) => ({ choice: { provider: group.provider, model: model.id }, name: model.name }))
+      const buttons = all.slice(0, PICKER_BUTTONS).map(({ group, model }) =>
+        `${current?.provider === group.provider && current.model === model.id ? '✓ ' : ''}${model.name} · ${group.name}`)
+      return this.sendPicker(chatId, { kind: 'model', sessionId, choices, at: Date.now() }, buttons,
+        t.modelList(current === undefined ? undefined : modelLabel(current), all.length))
     }
     const needle = args.trim().toLowerCase()
     const exact = all.filter(({ group, model }) =>
@@ -533,18 +776,78 @@ export class TelegramBridge {
     const t = this.t
     try {
       const applied = await this.harness.selectModel(sessionId, choice)
-      if (applied) this.pendingModels.delete(sessionId)
-      else this.pendingModels.set(sessionId, choice)
+      await this.store.setPending(sessionId, { model: applied ? undefined : { ...choice } })
       await this.reply(chatId, applied ? t.modelSwitched(name, modelLabel(choice)) : t.modelPending(name, modelLabel(choice)))
     } catch (error: unknown) {
       await this.reply(chatId, t.failed(describe(error)))
     }
   }
 
-  private prunePickers(): void {
+  /** `/mode` lists permission presets as buttons; `/mode <name>` switches directly. */
+  private async modeCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+    const t = this.t
+    if (sessionId === undefined) return this.reply(chatId, t.noSession)
+    const options = this.harness.listPresets()
+    if (args === '') {
+      const current = this.store.pending(sessionId)?.preset ?? this.harness.currentPreset(sessionId)
+      const currentName = options.find(option => option.value === current)?.name ?? current
+      const buttons = options.map(option => `${option.value === current ? '✓ ' : ''}${option.name}${option.description === undefined ? '' : ` — ${option.description}`}`)
+      return this.sendPicker(chatId, { kind: 'mode', sessionId, choices: options.slice(0, PICKER_BUTTONS), at: Date.now() }, buttons, t.modeList(currentName))
+    }
+    const needle = args.trim().toLowerCase()
+    const match = options.find(option => option.value.toLowerCase() === needle || option.name.toLowerCase() === needle)
+      ?? options.filter(option => option.value.toLowerCase().includes(needle) || option.name.toLowerCase().includes(needle)).at(0)
+    if (match === undefined) return this.reply(chatId, t.modeNotFound(args))
+    return this.switchMode(chatId, sessionId, match)
+  }
+
+  private async switchMode(chatId: number, sessionId: string, option: PresetOption): Promise<void> {
+    const t = this.t
+    try {
+      const applied = this.harness.selectPreset(sessionId, option.value)
+      await this.store.setPending(sessionId, { preset: applied ? undefined : option.value })
+      await this.reply(chatId, applied ? t.modeSwitched(option.name) : t.modePending(option.name))
+    } catch (error: unknown) {
+      await this.reply(chatId, t.failed(describe(error)))
+    }
+  }
+
+  private async sendPicker(chatId: number, picker: Picker, labels: string[], text: string): Promise<void> {
+    const id = randomUUID().slice(0, 8)
     const cutoff = Date.now() - PICKER_TTL_MS
-    for (const [id, picker] of this.pickers) if (picker.at < cutoff) this.pickers.delete(id)
+    for (const [key, old] of this.pickers) if (old.at < cutoff) this.pickers.delete(key)
     while (this.pickers.size >= 32) this.pickers.delete(this.pickers.keys().next().value as string)
+    this.pickers.set(id, picker)
+    const buttons: TgInlineButton[][] = labels.slice(0, PICKER_BUTTONS).map((label, index) => [{ text: label.slice(0, 60), callback_data: `pk:${id}:${index}` }])
+    await this.enqueue(chatId, async (client) => { await client.sendMessage(chatId, text, { buttons }) })
+    this.log({ chatId }, { dir: 'out', kind: 'notice', text })
+  }
+
+  /** `/get <path>`: send a file from the working directory, or list a directory. */
+  private async getCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+    const t = this.t
+    if (args.trim() === '') return this.reply(chatId, t.getUsage)
+    const base = (sessionId === undefined ? undefined : this.harness.live(sessionId)?.cwd) ?? this.defaultWorkspace(chatId)
+    if (base === undefined) return this.reply(chatId, t.noWorkspace)
+    const target = resolve(base, args.trim())
+    let real: string
+    let root: string
+    try {
+      root = await realpath(base)
+      real = await realpath(target)
+    } catch {
+      return this.reply(chatId, t.getMissing(args.trim()))
+    }
+    // Symlinks resolve before the check, so a link cannot reach outside the directory.
+    if (real !== root && !real.startsWith(root + sep)) return this.reply(chatId, t.getOutside)
+    const info = await stat(real)
+    if (info.isDirectory()) {
+      const entries = (await readdir(real, { withFileTypes: true }))
+        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+      const lines = entries.slice(0, DIRECTORY_LIST_LIMIT).map(entry => `${entry.isDirectory() ? '📁' : '📄'} ${entry.name}`)
+      return this.reply(chatId, t.getDir(relative(root, real) || '.', lines, entries.length - lines.length))
+    }
+    return this.sendLocalFile(chatId, real)
   }
 
   private defaultWorkspace(chatId: number): string | undefined {
@@ -582,28 +885,93 @@ export class TelegramBridge {
     await this.harness.prompt(sessionId, parts, mode)
   }
 
-  // ─── outbound: Session events ───────────────────────────────────────────
+  // ─── Web-side operations ────────────────────────────────────────────────
 
   /**
-   * Mirror one committed Session event to the chats bound to it.
+   * Bind a chat to a Session from the Web UI, or make it follow the Session.
+   * @param mode - `active` makes the chat talk to the Session; `watch` follows it; `none` removes both.
+   */
+  async linkChat(chatId: number, sessionId: string, mode: 'active' | 'watch' | 'none'): Promise<void> {
+    const t = this.t
+    const binding = this.store.get(chatId)
+    if (mode === 'active') {
+      await this.store.update(chatId, { sessionId })
+      await this.store.setWatch(chatId, sessionId, false)
+      await this.chatLog?.bind(chatId, sessionId).catch(() => {})
+      await this.reply(chatId, t.boundFromWeb(sessionId))
+    } else if (mode === 'watch') {
+      if (binding.sessionId === sessionId) await this.store.update(chatId, { sessionId: undefined })
+      await this.store.setWatch(chatId, sessionId, true)
+      await this.reply(chatId, t.watchFromWeb(sessionId))
+    } else {
+      if (binding.sessionId === sessionId) await this.store.update(chatId, { sessionId: undefined })
+      await this.store.setWatch(chatId, sessionId, false)
+    }
+  }
+
+  /** How each known chat relates to a Session. */
+  linksOf(sessionId: string): { chatId: number; mode: 'active' | 'watch' }[] {
+    return [
+      ...this.store.chatsFor(sessionId).map(chatId => ({ chatId, mode: 'active' as const })),
+      ...this.store.watchersOf(sessionId).map(chatId => ({ chatId, mode: 'watch' as const })),
+    ]
+  }
+
+  /** Send a message to a chat as the bot, typed in the Web UI. */
+  async sendFromWeb(chatId: number, text: string): Promise<void> {
+    if (this.client === undefined) throw new Error('the bot is not connected')
+    await this.deliverMarkdown(chatId, text)
+    this.log({ chatId }, { dir: 'out', kind: 'web', text })
+  }
+
+  // ─── outbound: Session events ───────────────────────────────────────────
+
+  /** Chats that see a Session's output: bound chats, plus the schedule chats during a scheduled run. */
+  private outputChats(sessionId: string): number[] {
+    const chats = new Set(this.store.chatsFor(sessionId))
+    if (this.turns.get(sessionId)?.scheduled === true) {
+      for (const id of this.settings().scheduleChats) if (Number.isSafeInteger(Number(id))) chats.add(Number(id))
+    }
+    return [...chats]
+  }
+
+  /**
+   * Mirror one committed Session event to the chats bound to or following it.
    * @param sessionId - the event's Session.
-   * @param event - committed durable event (`type` + `data`).
+   * @param event - committed durable event (`type`, `data`, and its log `seq` and `time`).
    * @param cwd - the Session's working directory, which relative presented paths resolve against.
    */
-  onSessionEvent(sessionId: string, event: { type: string; data?: unknown }, cwd?: string): void {
+  onSessionEvent(sessionId: string, event: { type: string; data?: unknown; seq?: number; time?: number }, cwd?: string): void {
     if (this.client === undefined) return
-    const chats = this.store.chatsFor(sessionId)
-    if (chats.length === 0) return
+    if (event.type === 'turn/start') {
+      this.turns.set(sessionId, { startedAt: event.time ?? Date.now(), tools: 0, scheduled: false })
+      return
+    }
+    if (event.type === 'user/message') {
+      const source = (event.data as { message?: { source?: { kind?: string } } }).message?.source?.kind
+      const turn = this.turns.get(sessionId)
+      if (source === 'schedule' && turn !== undefined) turn.scheduled = true
+      return
+    }
+    const turn = this.turns.get(sessionId)
+    if (event.type === 'workspace/changes' && event.seq !== undefined) {
+      const files = this.harness.changedFiles(sessionId, event.seq)
+      if (files !== undefined && turn !== undefined) turn.files = files
+      return
+    }
+    const chats = this.outputChats(sessionId)
+    const watchers = this.store.watchersOf(sessionId)
     if (event.type === 'assistant/message') {
       const text = assistantText(event.data)
-      if (text !== '') for (const chatId of chats) void this.reply(chatId, text, 'assistant')
+      if (text === '') return
+      if (turn !== undefined) turn.lastText = text
+      this.flushTools(sessionId)
+      void this.finishDraft(sessionId, chats, text)
     } else if (event.type === 'tool/call') {
       const data = event.data as { callId: string; name: string; arguments: string }
       this.rememberToolCall(data.callId, data.name, data.arguments)
-      if (this.settings().notifyToolCalls) {
-        const message = this.t.toolCall(data.name, previewArguments(data.arguments, TOOL_PREVIEW_LENGTH))
-        for (const chatId of chats) void this.reply(chatId, message, 'tool')
-      }
+      if (turn !== undefined) turn.tools++
+      if (this.settings().notifyToolCalls && chats.length > 0) this.queueToolLine(sessionId, data.name, data.arguments)
     } else if (event.type === 'deliverables/presented') {
       if (!this.settings().sendDeliverables) return
       const files = (event.data as { files?: readonly { path: string; description?: string }[] }).files ?? []
@@ -612,13 +980,182 @@ export class TelegramBridge {
         for (const chatId of chats) void this.sendLocalFile(chatId, path, file.description)
       }
     } else if (event.type === 'turn/end') {
+      this.flushTools(sessionId)
+      this.turns.delete(sessionId)
       const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } }).reason
       const kind = reason?.kind ?? 'completed'
-      if (kind !== 'completed') {
-        const message = this.t.turnEnded(kind, reason?.error?.message)
-        for (const chatId of chats) void this.reply(chatId, message)
+      this.endTurn(sessionId, kind, reason?.error?.message, turn, chats, watchers, event.time ?? Date.now())
+    }
+  }
+
+  /** Turn-end notices: failures to everyone, summaries by setting, and always to followers. */
+  private endTurn(
+    sessionId: string, kind: string, error: string | undefined, turn: TurnState | undefined,
+    chats: number[], watchers: number[], endedAt: number,
+  ): void {
+    const t = this.t
+    const title = shortId(sessionId)
+    if (kind !== 'completed') {
+      const message = t.turnEnded(kind, error)
+      for (const chatId of chats) void this.reply(chatId, message)
+      const watchMessage = kind === 'aborted' ? t.watchAborted(title) : t.watchFailed(title, error ?? kind)
+      for (const chatId of watchers) void this.reply(chatId, watchMessage)
+      return
+    }
+    if (turn === undefined) return
+    const seconds = (endedAt - turn.startedAt) / 1000
+    const s = this.settings()
+    const summary = { seconds, tools: turn.tools, files: turn.files ?? [] }
+    const wanted = s.turnSummary === 'always' || (s.turnSummary === 'long' && seconds >= s.turnSummaryMinSec)
+    if (wanted) for (const chatId of chats) void this.reply(chatId, t.turnDone(summary))
+    if (watchers.length > 0) {
+      const excerpt = turn.lastText === undefined ? undefined : truncate(turn.lastText, EXCERPT_LENGTH)
+      const message = t.turnDone({ ...summary, title, ...(excerpt === undefined ? {} : { excerpt }) })
+      for (const chatId of watchers) void this.reply(chatId, message)
+    }
+  }
+
+  /**
+   * Add a tool call to the Session's activity message. Calls between two
+   * replies share one message that is edited in place (edits do not notify),
+   * so a long run of commands does not flood the chat.
+   */
+  private queueToolLine(sessionId: string, name: string, args: string): void {
+    const preview = previewArguments(args, TOOL_PREVIEW_LENGTH)
+    const line = `🔧 ${name}${preview === '' ? '' : ` · ${preview}`}`
+    // The history viewer keeps every call.
+    for (const chatId of this.outputChats(sessionId)) this.log({ chatId }, { dir: 'out', kind: 'tool', text: line }, sessionId)
+    let activity = this.toolBatches.get(sessionId)
+    if (activity === undefined) {
+      activity = { lines: [], count: 0, messages: new Map(), timer: undefined, lastFlush: 0, pending: Promise.resolve() }
+      this.toolBatches.set(sessionId, activity)
+    }
+    activity.lines.push(line)
+    if (activity.lines.length > TOOL_LINES_SHOWN) activity.lines.shift()
+    activity.count++
+    if (activity.timer !== undefined) return
+    const current = activity
+    current.timer = setTimeout(() => {
+      current.timer = undefined
+      this.renderTools(sessionId, current)
+    }, Math.max(0, current.lastFlush + TOOL_BATCH_MS - Date.now()))
+  }
+
+  /** Send or edit the activity message in every output chat. */
+  private renderTools(sessionId: string, activity: ToolActivity): Promise<void> {
+    activity.lastFlush = Date.now()
+    const hidden = activity.count - activity.lines.length
+    const text = [this.t.toolActivity(activity.count), ...(hidden > 0 ? ['…'] : []), ...activity.lines].join('\n')
+    // Each chat's send queue is serial, so an edit runs after the send that
+    // created its message; the id is read when the operation runs.
+    const sends = this.outputChats(sessionId).map(chatId => this.enqueue(chatId, async (client) => {
+      const messageId = activity.messages.get(chatId)
+      if (messageId === undefined) activity.messages.set(chatId, (await client.sendMessage(chatId, text)).message_id)
+      else await client.editMessageText(chatId, messageId, text).catch(() => {})
+    }))
+    activity.pending = Promise.all(sends).then(() => {})
+    return activity.pending
+  }
+
+  /** Close the activity message: show its last state, and start a new one after the next reply. */
+  private flushTools(sessionId: string): void {
+    const activity = this.toolBatches.get(sessionId)
+    if (activity === undefined) return
+    this.toolBatches.delete(sessionId)
+    if (activity.timer !== undefined) {
+      clearTimeout(activity.timer)
+      activity.timer = undefined
+      void this.renderTools(sessionId, activity)
+    }
+  }
+
+  /**
+   * Follow the live reply as it is written: a draft message per chat, edited
+   * at most every {@link DRAFT_INTERVAL_MS}, finalized when the reply commits.
+   * @param sessionId - the Agent's Session (top-level Agents only).
+   * @param frame - one assistant stream frame.
+   */
+  onAssistantStream(sessionId: string, frame: { type: string; chunk?: { type: string; text?: string }; outcome?: { kind: string } }): void {
+    if (this.client === undefined || !this.settings().streamReplies) return
+    if (frame.type === 'start') {
+      const old = this.drafts.get(sessionId)
+      if (old !== undefined) clearTimeout(old.timer)
+      // A new attempt replaces an abandoned one's draft text; its messages are reused.
+      this.drafts.set(sessionId, { text: '', messages: old?.messages ?? new Map(), lastFlush: 0, timer: undefined, pending: old?.pending ?? Promise.resolve() })
+      return
+    }
+    const draft = this.drafts.get(sessionId)
+    if (draft === undefined) return
+    if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta' && typeof frame.chunk.text === 'string') {
+      draft.text += frame.chunk.text
+      this.scheduleDraft(sessionId, draft)
+    }
+  }
+
+  private scheduleDraft(sessionId: string, draft: Draft): void {
+    if (draft.timer !== undefined || draft.text.trim().length < DRAFT_MIN_CHARS) return
+    const wait = Math.max(0, draft.lastFlush + DRAFT_INTERVAL_MS - Date.now())
+    draft.timer = setTimeout(() => {
+      draft.timer = undefined
+      draft.lastFlush = Date.now()
+      const text = draftPreview(draft.text)
+      draft.pending = draft.pending.then(() => this.showDraft(sessionId, draft, text)).catch(() => {})
+    }, wait)
+  }
+
+  private async showDraft(sessionId: string, draft: Draft, text: string): Promise<void> {
+    for (const chatId of this.store.chatsFor(sessionId)) {
+      const messageId = draft.messages.get(chatId)
+      if (messageId === undefined) {
+        await this.enqueue(chatId, async (client) => {
+          const sent = await client.sendMessage(chatId, text)
+          draft.messages.set(chatId, sent.message_id)
+        })
+      } else {
+        await this.client?.editMessageText(chatId, messageId, text).catch(() => {})
       }
     }
+  }
+
+  /** Deliver a committed reply: replace the draft when there is one, else send it. */
+  private async finishDraft(sessionId: string, chats: number[], text: string): Promise<void> {
+    const draft = this.drafts.get(sessionId)
+    this.drafts.delete(sessionId)
+    if (draft !== undefined) {
+      clearTimeout(draft.timer)
+      await draft.pending
+    }
+    for (const chatId of chats) {
+      void this.deliverMarkdown(chatId, text, draft?.messages.get(chatId)).then(() => {
+        this.log({ chatId }, { dir: 'out', kind: 'assistant', text }, sessionId)
+      })
+    }
+  }
+
+  /**
+   * Send Markdown as Telegram HTML, split to size; falls back to plain text when Telegram rejects the markup.
+   * @param replaceId - a draft message to turn into the first piece.
+   */
+  private deliverMarkdown(chatId: number, markdown: string, replaceId?: number): Promise<void> {
+    return this.enqueue(chatId, async (client) => {
+      let first = true
+      for (const piece of chunkMarkdown(markdown)) {
+        const html = markdownToTelegramHtml(piece)
+        const target = first ? replaceId : undefined
+        first = false
+        try {
+          if (target === undefined) await client.sendMessage(chatId, html, { parseMode: 'HTML' })
+          else await client.editMessageText(chatId, target, html, 'HTML')
+        } catch (error: unknown) {
+          if (!(error instanceof TelegramApiError) || error.code !== 400) throw error
+          if (/not modified/iu.test(error.description)) continue
+          for (const plain of chunkText(piece)) {
+            if (target === undefined) await client.sendMessage(chatId, plain)
+            else await client.editMessageText(chatId, target, plain).catch(() => client.sendMessage(chatId, plain))
+          }
+        }
+      }
+    })
   }
 
   /**
@@ -633,19 +1170,18 @@ export class TelegramBridge {
 
   private startTyping(sessionId: string): void {
     const client = this.client
-    if (client === undefined || this.activity.get(sessionId)?.typing !== undefined) return
-    const chats = this.store.chatsFor(sessionId)
-    if (chats.length === 0) return
+    if (client === undefined || this.typing.has(sessionId)) return
+    if (this.store.chatsFor(sessionId).length === 0) return
     const tick = (): void => {
       for (const chatId of this.store.chatsFor(sessionId)) void client.sendTyping(chatId).catch(() => {})
     }
     tick()
-    this.activity.set(sessionId, { typing: setInterval(tick, TYPING_INTERVAL_MS) })
+    this.typing.set(sessionId, setInterval(tick, TYPING_INTERVAL_MS))
   }
 
   private stopTyping(sessionId: string): void {
-    clearInterval(this.activity.get(sessionId)?.typing)
-    this.activity.delete(sessionId)
+    clearInterval(this.typing.get(sessionId))
+    this.typing.delete(sessionId)
   }
 
   private rememberToolCall(callId: string, name: string, args: string): void {
@@ -677,7 +1213,7 @@ export class TelegramBridge {
     })
   }
 
-  /** Send text to a chat in order, split to Telegram's size limit. */
+  /** Send plain text to a chat in order, split to Telegram's size limit. */
   private reply(chatId: number, text: string, kind: OutKind = 'notice'): Promise<void> {
     return this.enqueue(chatId, async (client) => {
       for (const chunk of chunkText(text)) await client.sendMessage(chatId, chunk)
@@ -700,12 +1236,12 @@ export class TelegramBridge {
     return next
   }
 
-  // ─── approvals ──────────────────────────────────────────────────────────
+  // ─── approvals and pickers ──────────────────────────────────────────────
 
   /**
-   * Ask the chats bound to a Session to approve one tool call.
+   * Ask the chats bound to or following a Session to approve one tool call.
    * @param request - the Session, tool, optional call id and reason, and withdrawal signal.
-   * @returns the Telegram answer, or `delegate` when no chat is bound, approvals are off, or the wait timed out.
+   * @returns the Telegram answer, or `delegate` when no chat is linked, approvals are off, or the wait timed out.
    */
   async requestApproval(request: {
     sessionId: string
@@ -717,9 +1253,11 @@ export class TelegramBridge {
     const s = this.settings()
     const client = this.client
     if (!s.approvalViaTelegram || client === undefined || this.state.kind !== 'running') return 'delegate'
-    const chats = this.store.chatsFor(request.sessionId)
+    const chats = [...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])]
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
+    // The question should follow the reply that led to it.
+    this.flushTools(request.sessionId)
     const t = this.t
     const id = randomUUID().slice(0, 12)
     const call = request.callId === undefined ? undefined : this.toolCalls.get(request.callId)
@@ -749,7 +1287,7 @@ export class TelegramBridge {
               outcome: outcome === 'delegate' ? 'timeout' : outcome,
               ...(by === undefined ? {} : { by }),
             },
-          })
+          }, request.sessionId)
         }
         answer.resolve(outcome)
       },
@@ -759,26 +1297,142 @@ export class TelegramBridge {
     request.signal?.addEventListener('abort', onAbort, { once: true })
     this.approvals.set(id, pending)
 
-    const sent = await Promise.allSettled(chats.map(chatId => client.sendMessage(chatId, text, buttons)))
-    for (const result of sent) {
-      if (result.status === 'fulfilled') pending.prompts.push({ chatId: result.value.chat.id, messageId: result.value.message_id })
-    }
+    // Through each chat's queue, so the question follows the messages that led to it.
+    await Promise.all(chats.map(chatId => this.enqueue(chatId, async (c) => {
+      const sent = await c.sendMessage(chatId, text, { buttons })
+      pending.prompts.push({ chatId, messageId: sent.message_id })
+    })))
     if (pending.prompts.length === 0) pending.settle('delegate', '')
     return answer.promise
+  }
+
+  /**
+   * Ask the Agent's questions in the chats bound to or following a Session.
+   * @returns the answers, `delegate` when no chat is linked, the feature is off, or nobody answered in time.
+   */
+  async requestAnswers(request: { sessionId: string; questions: readonly QuestionItem[]; signal?: AbortSignal }): Promise<QuestionAnswer | 'delegate' | 'cancelled'> {
+    const s = this.settings()
+    const client = this.client
+    if (!s.questionsViaTelegram || client === undefined || this.state.kind !== 'running' || request.questions.length === 0) return 'delegate'
+    const chats = [...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])]
+    if (chats.length === 0) return 'delegate'
+    if (request.signal?.aborted === true) return 'cancelled'
+    this.flushTools(request.sessionId)
+    const t = this.t
+    const id = randomUUID().slice(0, 8)
+    const answer = Promise.withResolvers<QuestionAnswer | 'delegate' | 'cancelled'>()
+    const pending: PendingQuestions = {
+      sessionId: request.sessionId,
+      chats,
+      items: request.questions.map(item => ({ item, messages: new Map(), selected: new Set(), done: false })),
+      settle: (outcome, note) => {
+        if (!this.questions.delete(id)) return
+        clearTimeout(timer)
+        request.signal?.removeEventListener('abort', onAbort)
+        for (const entry of pending.items) {
+          const summary = note ?? (entry.custom !== undefined
+            ? t.questionAnswered([...entry.selected, entry.custom].join(', '))
+            : entry.selected.size > 0 ? t.questionAnswered([...entry.selected].join(', ')) : t.questionSkipped)
+          for (const [chatId, messageId] of entry.messages) {
+            void client.editMessageText(chatId, messageId, `${questionText(t, entry.item)}\n\n${summary}`).catch(() => {})
+          }
+        }
+        answer.resolve(outcome)
+      },
+    }
+    const onAbort = (): void => { pending.settle('cancelled', t.questionWithdrawn) }
+    const timer = setTimeout(() => { pending.settle('delegate', t.questionTimedOut) }, s.approvalTimeoutSec * 1000)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+    this.questions.set(id, pending)
+    for (const [index, entry] of pending.items.entries()) {
+      const text = questionText(t, entry.item)
+      for (const chatId of chats) {
+        await this.enqueue(chatId, async (c) => {
+          const sent = await c.sendMessage(chatId, text, { buttons: questionButtons(t, id, index, entry) })
+          entry.messages.set(chatId, sent.message_id)
+        })
+        this.log({ chatId }, { dir: 'out', kind: 'notice', text }, request.sessionId)
+      }
+    }
+    if (pending.items.every(entry => entry.messages.size === 0)) pending.settle('delegate', '')
+    return answer.promise
+  }
+
+  /** Take free text in a chat as the answer to its oldest unanswered question. */
+  private answerByText(chatId: number, text: string): boolean {
+    for (const pending of this.questions.values()) {
+      if (!pending.chats.includes(chatId)) continue
+      const entry = pending.items.find(candidate => !candidate.done)
+      if (entry === undefined) continue
+      entry.custom = text
+      entry.done = true
+      this.afterAnswer(pending)
+      return true
+    }
+    return false
+  }
+
+  /** Settle the request once every question has an answer. */
+  private afterAnswer(pending: PendingQuestions): void {
+    if (pending.items.every(entry => entry.done)) {
+      pending.settle({
+        answers: pending.items.map(entry => ({
+          id: entry.item.id,
+          selected: [...entry.selected],
+          ...(entry.custom === undefined ? {} : { custom: entry.custom }),
+        })),
+      })
+    }
+  }
+
+  private async handleQuestionPress(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
+    const [, id = '', index = '', action = ''] = (query.data ?? '').split(':')
+    const pending = this.questions.get(id)
+    const entry = pending?.items[Number(index)]
+    if (pending === undefined || entry === undefined || entry.done) {
+      await client.answerCallbackQuery(query.id, this.t.approvalGone)
+      return
+    }
+    await client.answerCallbackQuery(query.id)
+    const options = entry.item.options ?? []
+    if (action === 's') {
+      entry.selected.clear()
+      entry.done = true
+    } else if (action === 'd') {
+      entry.done = true
+    } else {
+      const label = options[Number(action)]?.label
+      if (label === undefined) return
+      if (entry.item.multiSelect === true) {
+        if (entry.selected.has(label)) entry.selected.delete(label)
+        else entry.selected.add(label)
+        for (const [chatId, messageId] of entry.messages) {
+          void client.call('editMessageReplyMarkup', {
+            chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: questionButtons(this.t, id, Number(index), entry) },
+          }).catch(() => {})
+        }
+        return
+      }
+      entry.selected.add(label)
+      entry.done = true
+    }
+    this.afterAnswer(pending)
   }
 
   private async handleCallback(query: TgCallbackQuery): Promise<void> {
     const client = this.client
     if (client === undefined) return
-    if (query.data?.startsWith('md:') === true) return this.handleModelPick(client, query)
+    const t = this.t
+    const chat = query.message?.chat ?? { id: 0, type: 'private' as const }
+    if (!this.allowed(query.from, chat)) {
+      await client.answerCallbackQuery(query.id, t.unauthorized(query.from.id))
+      return
+    }
+    if (query.data?.startsWith('pk:') === true) return this.handlePick(client, query)
+    if (query.data?.startsWith('qa:') === true) return this.handleQuestionPress(client, query)
     const match = /^ap:([\w-]+):([yn])$/u.exec(query.data ?? '')
     if (match === null) {
       await client.answerCallbackQuery(query.id)
-      return
-    }
-    const t = this.t
-    if (!isAllowed(this.settings().allowedUsers, query.from.id, query.from.username)) {
-      await client.answerCallbackQuery(query.id, t.unauthorized(query.from.id))
       return
     }
     const pending = this.approvals.get(match[1] ?? '')
@@ -791,31 +1445,60 @@ export class TelegramBridge {
     else pending.settle('rejected', t.approvalRejected(who), who)
     await client.answerCallbackQuery(query.id)
   }
-  private async handleModelPick(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
-    const t = this.t
-    if (!isAllowed(this.settings().allowedUsers, query.from.id, query.from.username)) {
-      await client.answerCallbackQuery(query.id, t.unauthorized(query.from.id))
-      return
-    }
+
+  private async handlePick(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
     const [, id = '', index = ''] = (query.data ?? '').split(':')
     const picker = this.pickers.get(id)
-    const choice = picker?.choices[Number(index)]
     const chatId = query.message?.chat.id
-    if (picker === undefined || choice === undefined || chatId === undefined) {
-      await client.answerCallbackQuery(query.id, t.modelPickerExpired)
+    if (picker === undefined || chatId === undefined) {
+      await client.answerCallbackQuery(query.id, this.t.modelPickerExpired)
       return
     }
     await client.answerCallbackQuery(query.id)
-    const { groups } = await this.harness.listModels()
-    const name = groups.find(g => g.provider === choice.provider)?.models.find(m => m.id === choice.model)?.name ?? choice.model
-    await this.switchModel(chatId, picker.sessionId, choice, name)
+    if (picker.kind === 'model') {
+      const picked = picker.choices[Number(index)]
+      if (picked !== undefined) await this.switchModel(chatId, picker.sessionId, picked.choice, picked.name)
+    } else {
+      const picked = picker.choices[Number(index)]
+      if (picked !== undefined) await this.switchMode(chatId, picker.sessionId, picked)
+    }
   }
+}
 
+/** The text of one question message. */
+function questionText(t: Messages, item: QuestionItem): string {
+  return t.question(item.header, item.question, item.detail, item.multiSelect === true)
+}
+
+/** Option buttons, ticked for a multi-select question, plus Done/Skip. */
+function questionButtons(t: Messages, id: string, index: number, entry: { item: QuestionItem; selected: Set<string> }): TgInlineButton[][] {
+  const rows: TgInlineButton[][] = (entry.item.options ?? []).slice(0, PICKER_BUTTONS).map((option, optionIndex) => [{
+    text: `${entry.item.multiSelect === true && entry.selected.has(option.label) ? '☑ ' : entry.item.multiSelect === true ? '☐ ' : ''}${option.label}`.slice(0, 60),
+    callback_data: `qa:${id}:${index}:${optionIndex}`,
+  }])
+  const tail: TgInlineButton[] = []
+  if (entry.item.multiSelect === true) tail.push({ text: t.questionDone, callback_data: `qa:${id}:${index}:d` })
+  tail.push({ text: t.questionSkip, callback_data: `qa:${id}:${index}:s` })
+  rows.push(tail)
+  return rows
 }
 
 /** `provider/model`, plus the effort when one is pinned. */
 export function modelLabel(choice: ModelChoice): string {
   return `${choice.provider}/${choice.model}${choice.reasoningEffort === undefined ? '' : ` (${choice.reasoningEffort})`}`
+}
+
+/** A Session id short enough for a notification line. */
+function shortId(sessionId: string): string {
+  const core = sessionId.replace(/^session-/u, '')
+  return core.length > 8 ? core.slice(0, 8) : core
+}
+
+/** The tail of a reply in progress, sized for one message. */
+function draftPreview(text: string): string {
+  const trimmed = text.trimEnd()
+  const body = trimmed.length > 3800 ? `…${trimmed.slice(-3800)}` : trimmed
+  return `${body} ▍`
 }
 
 /** What the history knows about a chat from one incoming message. */

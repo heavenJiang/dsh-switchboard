@@ -13,27 +13,9 @@
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { useEffect, useState } from 'react'
 import type { UpdateCheck } from '../version.ts'
+import { remotes, type ChangeResult, type PluginManagerRemote } from './remotes.ts'
 
 export type { UpdateCheck } from '../version.ts'
-
-/** Remote answers carry either a value or an error. */
-type RemoteResult<V> = { ok: true; value: V } | { ok: false; error: { message: string } }
-
-/** The parts of the plugin manager's change result the page reads. */
-interface ChangeResult {
-  application: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled'
-  error?: { code: string; diagnostic?: string }
-  pendingBuilds?: string[]
-  version?: string
-  packageResult?: { output?: string }
-}
-
-/** The plugin manager remote namespace, as far as this page uses it. */
-interface PluginManagerRemote {
-  listBundles(): Promise<RemoteResult<{ name: string; version?: string; source?: string; installed: boolean }[]>>
-  installBundle(spec: string, options: Record<string, unknown>): Promise<RemoteResult<ChangeResult>>
-  updateBundle(name: string, version: string, options: Record<string, unknown>): Promise<RemoteResult<{ result: ChangeResult }>>
-}
 
 /** How an update attempt ended. */
 export type UpdateOutcome =
@@ -46,23 +28,8 @@ const CHECK_TTL_MS = 60 * 60 * 1000
 let cached: { at: number; value: Promise<UpdateCheck | undefined> } | undefined
 const listeners = new Set<(value: UpdateCheck | undefined) => void>()
 
-/** The plugin manager remote while this client has access to it; set by {@link trackPluginManager}. */
-let manager: PluginManagerRemote | undefined
-
-/**
- * Follow the plugin manager remote's availability. It is injected only for
- * peers allowed to manage plugins, so the rest of the plugin never waits on it.
- * @param ctx - the browser plugin context.
- */
-export function trackPluginManager(ctx: ClientContext): void {
-  ctx.inject(['remote', 'remote.pluginManager'], (scope) => {
-    manager = (scope as unknown as { remote: { pluginManager: PluginManagerRemote } }).remote.pluginManager
-    scope.effect(() => () => { manager = undefined }, 'telegram-bridge: plugin manager remote')
-  })
-}
-
 function pluginManager(_ctx: ClientContext): PluginManagerRemote | undefined {
-  return manager
+  return remotes.pluginManager
 }
 
 /**

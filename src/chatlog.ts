@@ -7,11 +7,29 @@
 
 import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { ChatEntry, ChatInfo, ChatPage, ChatSummary } from './history-types.ts'
+import type { ChatEntry, ChatInfo, ChatPage, ChatStats, ChatSummary } from './history-types.ts'
 
 export type * from './history-types.ts'
 
 const MEDIA_NAME = /^[\w.-]+$/u
+/** Days of counters kept for the dashboard. */
+const STATS_DAYS = 30
+
+/** One day's counters. */
+interface DayCounters {
+  in: number
+  out: number
+  allowed: number
+  rejected: number
+  denied: number
+  chats: number[]
+}
+
+/** Local calendar day of a timestamp, `YYYY-MM-DD`. */
+function dayKey(at: number): string {
+  const d = new Date(at)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 
 /** Per-chat JSONL history with a summary index and bounded retention. */
 export class ChatLog {
@@ -21,6 +39,8 @@ export class ChatLog {
   private seq = 0
   private loaded: Promise<void> | undefined
   private readonly inflight = new Set<Promise<unknown>>()
+  private days: Record<string, DayCounters> = {}
+  private statsTail: Promise<void> = Promise.resolve()
 
   /**
    * @param dir - directory holding `index.json`, `<chatId>.jsonl`, and `<chatId>/` media.
@@ -36,6 +56,12 @@ export class ChatLog {
         for (const row of rows) this.summaries.set(row.chatId, row)
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      try {
+        this.days = JSON.parse(await readFile(join(this.dir, 'stats.json'), 'utf8')) as Record<string, DayCounters>
+      } catch {
+        // Counters are a convenience; a missing or damaged file starts them over.
+        this.days = {}
       }
     })()
     return this.loaded
@@ -82,8 +108,70 @@ export class ChatLog {
       await appendFile(this.file(chat.chatId), `${JSON.stringify(stored)}\n`, { mode: 0o600 })
       if (summary.count > this.limit() * 1.25) await this.compact(chat.chatId, summary)
     })
+    this.count(chat.chatId, stored)
     await this.saveIndex()
     return stored
+  }
+
+  /** Fold one entry into its day's counters and drop days past the window. */
+  private count(chatId: number, entry: ChatEntry): void {
+    const key = dayKey(entry.at)
+    const day = this.days[key] ??= { in: 0, out: 0, allowed: 0, rejected: 0, denied: 0, chats: [] }
+    if (entry.kind === 'denied') day.denied++
+    else if (entry.dir === 'in') day.in++
+    else day.out++
+    if (entry.approval?.outcome === 'allowed-once') day.allowed++
+    if (entry.approval?.outcome === 'rejected') day.rejected++
+    if (entry.kind !== 'denied' && !day.chats.includes(chatId)) day.chats.push(chatId)
+    const keys = Object.keys(this.days).sort()
+    for (const old of keys.slice(0, Math.max(0, keys.length - STATS_DAYS))) delete this.days[old]
+    const snapshot = JSON.stringify(this.days)
+    this.statsTail = this.statsTail.catch(() => {}).then(async () => {
+      await mkdir(this.dir, { recursive: true })
+      const temp = join(this.dir, `stats.json.${process.pid}.tmp`)
+      await writeFile(temp, snapshot, { mode: 0o600 })
+      await rename(temp, join(this.dir, 'stats.json'))
+    })
+  }
+
+  /** Dashboard figures: today, the last 7 days, and a 14-day series. */
+  async stats(now: number = Date.now()): Promise<ChatStats> {
+    await this.load()
+    const series: { day: string; in: number; out: number }[] = []
+    const week = { messages: 0, allowed: 0, rejected: 0, denied: 0, chats: new Set<number>() }
+    for (let i = 13; i >= 0; i--) {
+      const key = dayKey(now - i * 86_400_000)
+      const day = this.days[key]
+      series.push({ day: key, in: day?.in ?? 0, out: day?.out ?? 0 })
+      if (i < 7 && day !== undefined) {
+        week.messages += day.in + day.out
+        week.allowed += day.allowed
+        week.rejected += day.rejected
+        week.denied += day.denied
+        for (const chat of day.chats) week.chats.add(chat)
+      }
+    }
+    const today = this.days[dayKey(now)]
+    return {
+      today: { in: today?.in ?? 0, out: today?.out ?? 0 },
+      week: { messages: week.messages, activeChats: week.chats.size, allowed: week.allowed, rejected: week.rejected, denied: week.denied },
+      series,
+    }
+  }
+
+  /**
+   * Recent entries about one Session across the given chats, oldest first.
+   * @param sessionId - the Session.
+   * @param chatIds - chats to look in (those linked to it now or before).
+   * @param limit - most entries returned.
+   */
+  async sessionHistory(sessionId: string, chatIds: readonly number[], limit: number): Promise<(ChatEntry & { chatId: number })[]> {
+    const all: (ChatEntry & { chatId: number })[] = []
+    for (const chatId of new Set(chatIds)) {
+      await this.tails.get(chatId)
+      for (const entry of await this.readAll(chatId)) if (entry.sessionId === sessionId) all.push({ ...entry, chatId })
+    }
+    return all.sort((a, b) => a.at - b.at).slice(-limit)
   }
 
   /** Remember the Session a chat is bound to, without adding an entry. */
@@ -142,7 +230,7 @@ export class ChatLog {
   /** Wait for every write started so far, including ones still loading the index. */
   async settled(): Promise<void> {
     while (this.inflight.size > 0) await Promise.allSettled([...this.inflight])
-    await Promise.allSettled([...this.tails.values(), this.indexTail])
+    await Promise.allSettled([...this.tails.values(), this.indexTail, this.statsTail])
   }
 
   private track<V>(work: Promise<V>): Promise<V> {
