@@ -30,6 +30,7 @@
       "@deepseek-ai/schemastery": ["../deepseek-harness/vendor/schemastery"],
       "@deepseek-ai/dsh-api-session-controller": ["../deepseek-harness/packages/api/session-controller"],
       "@deepseek-ai/dsh-client-file-upload": ["../deepseek-harness/packages/client/file-upload"],
+      "@deepseek-ai/dsh-client-connection": ["../deepseek-harness/packages/client/connection"],
       "@deepseek-ai/dsh-agent": ["../deepseek-harness/packages/core/agent"],
       "@deepseek-ai/dsh-permission-presets": ["../deepseek-harness/packages/interaction/permission-presets"],
       "@deepseek-ai/dsh-session": ["../deepseek-harness/packages/core/session"],
@@ -39,6 +40,8 @@
       "@deepseek-ai/dsh-client-locale/client": ["../deepseek-harness/packages/client/locale/lib/types/client/index.d.ts"],
       "@deepseek-ai/dsh-client-ui-settings/client": ["../deepseek-harness/packages/client/ui-settings/lib/types/client/index.d.ts"],
       "@deepseek-ai/dsh-client-ui-renderer/client": ["../deepseek-harness/packages/client/ui-renderer/lib/types/client/index.d.ts"],
+      "@deepseek-ai/dsh-client-ui-sidebar/client": ["../deepseek-harness/packages/client/ui-sidebar/lib/types/client/index.d.ts"],
+      "@deepseek-ai/dsh-client-ui-layout/client": ["../deepseek-harness/packages/client/ui-layout/lib/types/client/index.d.ts"],
       "@deepseek-ai/dsh-client-ui-plugin-manager/client": ["../deepseek-harness/packages/client/ui-plugin-manager/lib/types/client/index.d.ts"],
       "react": ["../deepseek-harness/node_modules/@types/react"],
       "react/jsx-runtime": ["../deepseek-harness/node_modules/@types/react/jsx-runtime.d.ts"]

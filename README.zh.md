@@ -52,6 +52,17 @@ Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示�
 
 **发回 Telegram**：Agent 用 `present` 工具交付文件时（Web 端「产出物」显示的同一事件），机器人把文件发到绑定的聊天：常见图片直接显示（≤10 MB，GIF 除外），其他作为文件发送，附带文件名和说明。超过 Telegram 50 MB 上限的文件只发一条提示。可用 **回传交付文件** 关闭。
 
+## 在 Web 中查看聊天记录
+
+侧栏的 **Telegram** 入口打开聊天记录查看器（插件运行时才出现）：
+
+- **左栏**：所有与机器人对话过的聊天（私聊、群组），显示最后一条消息和时间，可搜索；只被拦截过的陌生人带「未授权」标签。顶部显示机器人连接状态。
+- **右栏**：选中聊天的完整记录，按天分隔。用户消息在左、机器人消息在右；照片直接显示（点击看原图），文件显示为文件卡片；工具调用、提示、被拦截的消息用紧凑的单行显示；工具审批显示为卡片，带参数、原因、结果和操作人。
+- **打开会话**：一键跳到该聊天绑定的 Web 会话。
+- 页面每 3 秒刷新一次，停留在底部时自动跟随新消息；向上可加载更早的记录。窄窗口下变为单栏，带返回按钮。
+
+记录保存在 `$DSH_HOME/telegram-bridge/chats/`（每个聊天一个 JSONL 文件，收到的图片另存一份供显示），不会进入会话上下文。每个聊天保留的条数由 **每个聊天保留的记录条数** 控制，超出后清理最早的记录和图片。查询接口 `/api/telegram-bridge/*` 只有已登录的 owner 能访问。
+
 ## 工具审批
 
 开启 **在 Telegram 中审批工具调用** 后，绑定到某个聊天的会话需要审批时，机器人会发送带 **允许一次 / 拒绝** 按钮的消息（附带命令或参数预览）。只有允许列表中的用户能按。超过 **审批超时** 未回答，问题交回 Web 界面；会话撤回请求时消息会标记为已撤回。
@@ -75,6 +86,7 @@ Agent 的文字回复、工具调用提示（可关闭）、出错/中止提示�
 | `apiBaseUrl` | `https://api.telegram.org` | Bot API 地址（自建服务器或反代） |
 | `maxDownloadMb` | `20` | 接收文件大小上限（1–2000 MB） |
 | `sendDeliverables` | `true` | 把 `present` 交付的文件发回聊天 |
+| `historyLimit` | `2000` | Web 聊天记录中每个聊天保留的条数（100–100000） |
 | `pollTimeoutSec` | `30` | 长轮询等待秒数 |
 | `stateFile` | `$DSH_HOME/telegram-bridge/state.json` | 聊天↔会话绑定与轮询进度 |
 
@@ -94,7 +106,9 @@ src/bridge.ts     桥接核心：长轮询、命令、输出镜像、审批（�
 src/telegram.ts   精简 Bot API 客户端（Node fetch，含文件下载与 multipart 上传）
 src/media.ts      附件提取、图片类型识别、回传方式选择
 src/bindings.ts   聊天↔会话绑定与 update offset 的持久化
-src/client/       浏览器半侧：插件页中的配置表单（plugins.bundle.config slot）
+src/chatlog.ts    Web 查看器用的聊天记录（JSONL + 索引 + 图片副本，按条数清理）
+src/routes.ts     查看器的 owner-only 查询路由（ctx.connection.fetch）
+src/client/       浏览器半侧：侧栏 Telegram 聊天记录面板（sidebar.panellist + main）与配置表单（plugins.bundle.config）
 cordis.patch.yml  组合包层：插入 id 为 telegram-bridge 的插件行
 ```
 

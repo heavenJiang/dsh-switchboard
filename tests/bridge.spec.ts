@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BindingStore } from '../src/bindings.ts'
+import { ChatLog } from '../src/chatlog.ts'
 import { TelegramBridge, type BridgeSettings, type HarnessPort, type PromptPart, type StagedFileInput } from '../src/bridge.ts'
 import type { TgUpdate } from '../src/telegram.ts'
 
@@ -108,6 +109,7 @@ let harness: FakeHarness
 let store: BindingStore
 let bridge: TelegramBridge
 let settings: BridgeSettings
+let chatLog: ChatLog
 
 function text(from: typeof USER | typeof STRANGER, body: string): Omit<TgUpdate, 'update_id'> {
   return { message: { message_id: 1, from, chat: CHAT, date: 0, text: body } }
@@ -140,13 +142,15 @@ beforeEach(async () => {
     maxDownloadMb: 1,
     sendDeliverables: true,
   }
-  bridge = new TelegramBridge(() => settings, harness, store, quiet, telegram.fetch)
+  chatLog = new ChatLog(join(dir, 'chats'), () => 2000)
+  bridge = new TelegramBridge(() => settings, harness, store, quiet, telegram.fetch, chatLog)
   await bridge.reconcile()
   await until(() => bridge.state.kind === 'running')
 })
 
 afterEach(async () => {
   await bridge.stop()
+  await chatLog.settled()
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -349,5 +353,59 @@ describe('media', () => {
       { method: 'sendPhoto', name: 'chart.png', bytes: 4, caption: 'chart.png\nQ3' },
       { method: 'sendDocument', name: 'report.csv', bytes: 4, caption: 'report.csv' },
     ])
+  })
+})
+
+describe('chat history', () => {
+  it('records prompts, Agent replies, tool lines, and bot notices with the bound Session', async () => {
+    telegram.push(text(USER, 'run the tests'))
+    await until(() => harness.prompts.length === 1)
+    settings = { ...settings, notifyToolCalls: true }
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c', name: 'bash', arguments: '{"command":"npm test"}' } })
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'All green.' }] } } })
+    await until(() => telegram.sent().includes('All green.'))
+    await chatLog.settled()
+    const { entries } = await chatLog.history(CHAT.id, undefined, 50)
+    expect(entries.map(e => [e.dir, e.kind])).toEqual([
+      ['in', 'text'], ['out', 'notice'], ['out', 'tool'], ['out', 'assistant'],
+    ])
+    expect(entries[0]?.from).toEqual({ id: 42, name: 'Ann', username: 'ann' })
+    expect(entries[3]?.sessionId).toBe('s1')
+    const [summary] = await chatLog.chats()
+    expect(summary).toMatchObject({ chatId: CHAT.id, title: 'Ann', username: 'ann', sessionId: 's1', count: 4 })
+  })
+
+  it('records blocked users without prompting', async () => {
+    telegram.push(text(STRANGER, 'let me in'))
+    await until(() => telegram.sent().length === 1)
+    await chatLog.settled()
+    const { entries } = await chatLog.history(CHAT.id, undefined, 10)
+    expect(entries[0]).toMatchObject({ dir: 'in', kind: 'denied', text: 'let me in', from: { id: 7, name: 'Eve' } })
+  })
+
+  it('keeps a viewable copy of received images', async () => {
+    telegram.files.set('jpg', new Uint8Array([0xff, 0xd8, 0xff, 0]))
+    telegram.push({ message: { message_id: 3, from: USER, chat: CHAT, date: 0, caption: 'look', photo: [{ file_id: 'jpg', file_unique_id: 'j', width: 1, height: 1 }] } })
+    await until(() => harness.prompts.length === 1)
+    await chatLog.settled()
+    const media = (await chatLog.history(CHAT.id, undefined, 10)).entries.find(e => e.kind === 'media')
+    expect(media?.text).toBe('look')
+    const image = media?.attachments?.[0]
+    expect(image).toMatchObject({ name: 'photo_3.jpg', kind: 'image', size: 4 })
+    expect(await chatLog.readMedia(CHAT.id, image!.media!)).toEqual(new Uint8Array([0xff, 0xd8, 0xff, 0]))
+  })
+
+  it('records approval outcomes with who answered', async () => {
+    await store.update(CHAT.id, { sessionId: 's5' })
+    const outcome = bridge.requestApproval({ sessionId: 's5', toolName: 'bash', reason: 'writes outside the workspace' })
+    await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
+    const markup = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!.params['reply_markup'] as {
+      inline_keyboard: { callback_data: string }[][]
+    }
+    telegram.push({ callback_query: { id: 'q', from: USER, data: markup.inline_keyboard[0]![1]!.callback_data } })
+    await expect(outcome).resolves.toBe('rejected')
+    await chatLog.settled()
+    const approval = (await chatLog.history(CHAT.id, undefined, 10)).entries.find(e => e.kind === 'approval')
+    expect(approval).toMatchObject({ text: 'writes outside the workspace', approval: { tool: 'bash', outcome: 'rejected', by: '@ann' } })
   })
 })

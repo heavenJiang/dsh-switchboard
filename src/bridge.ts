@@ -13,10 +13,11 @@ import { randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { basename, isAbsolute, resolve } from 'node:path'
 import type { BindingStore } from './bindings.ts'
-import { incomingAttachments, outgoingKind, promptImageType, type IncomingAttachment } from './media.ts'
+import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
+import { incomingAttachments, outgoingKind, promptImageType, sniffImageType, type IncomingAttachment } from './media.ts'
 import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
 import {
-  FileTooLargeError, TelegramApiError, TelegramClient, type TgCallbackQuery, type TgMessage, type TgUpdate,
+  FileTooLargeError, TelegramApiError, TelegramClient, type TgCallbackQuery, type TgChat, type TgMessage, type TgUpdate, type TgUser,
 } from './telegram.ts'
 import { chunkText, isAllowed, parseInput, previewArguments } from './text.ts'
 
@@ -94,7 +95,16 @@ export type TelegramApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' 
 interface PendingApproval {
   readonly sessionId: string
   readonly prompts: { chatId: number; messageId: number }[]
-  settle(outcome: TelegramApprovalOutcome, note: string): void
+  settle(outcome: TelegramApprovalOutcome, note: string, by?: string): void
+}
+
+/** How a bot message is labelled in the chat history. */
+type OutKind = 'assistant' | 'tool' | 'notice'
+
+/** Images up to this size are copied into the history for the viewer. */
+const VIEWER_IMAGE_LIMIT = 5 * 1024 * 1024
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
 }
 
 /** Per-chat output state for one Session's current activity. */
@@ -135,7 +145,22 @@ export class TelegramBridge {
     private readonly store: BindingStore,
     private readonly logger: BridgeLogger,
     private readonly fetchImpl?: typeof fetch,
+    private readonly chatLog?: ChatLog,
   ) {}
+
+  /** @returns the bot's username while connected. */
+  get username(): string | undefined {
+    return this.state.kind === 'running' ? this.state.username : undefined
+  }
+
+  /** Append to the Web viewer's history; failures are logged, never surfaced to Telegram. */
+  private log(chat: ChatInfo, entry: Omit<ChatEntry, 'id' | 'at' | 'sessionId'>): void {
+    if (this.chatLog === undefined) return
+    const sessionId = this.store.get(chat.chatId).sessionId
+    void this.chatLog.record(chat, { ...entry, ...(sessionId === undefined ? {} : { sessionId }) }).catch((error: unknown) => {
+      this.logger.warn(`telegram-bridge: chat history write failed: ${describe(error)}`)
+    })
+  }
 
   private get t(): Messages {
     return MESSAGES[this.settings().language]
@@ -247,16 +272,27 @@ export class TelegramBridge {
     const t = this.t
     const text = message.text ?? message.caption
     const parsed = text === undefined ? undefined : parseInput(text, this.botUsername)
+    const allowed = isAllowed(this.settings().allowedUsers, from.id, from.username)
+    const attachments = incomingAttachments(message)
+    const chat = chatInfo(message.chat, from)
+    if (!allowed) {
+      this.log(chat, {
+        dir: 'in', kind: 'denied', from: sender(from),
+        ...(text === undefined ? {} : { text }),
+        ...(attachments.length === 0 ? {} : { attachments: attachments.map(a => ({ name: a.name, kind: 'file' as const })) }),
+      })
+    } else if (attachments.length === 0 && text !== undefined) {
+      this.log(chat, { dir: 'in', kind: parsed?.kind === 'command' ? 'command' : 'text', from: sender(from), text })
+    }
     if (parsed?.kind === 'command' && parsed.name === 'whoami') {
       return this.reply(chatId, t.whoami(from.id, chatId))
     }
-    if (!isAllowed(this.settings().allowedUsers, from.id, from.username)) {
+    if (!allowed) {
       // Answer strangers only in private chats so a group does not get spammed.
       if (message.chat.type === 'private') await this.reply(chatId, t.unauthorized(from.id))
       return
     }
     if (message.media_group_id !== undefined) return this.collectAlbum(chatId, message)
-    const attachments = incomingAttachments(message)
     try {
       if (attachments.length > 0) return await this.promptWithMedia(chatId, [message])
       if (text === undefined) return await this.reply(chatId, t.unsupported)
@@ -296,6 +332,7 @@ export class TelegramBridge {
     const limit = this.settings().maxDownloadMb * 1024 * 1024
     const parts: PromptPart[] = []
     const captions = messages.map(m => (m.caption ?? m.text ?? '').trim()).filter(c => c !== '')
+    const logged: ChatAttachment[] = []
     this.startTyping(sessionId)
     for (const attachment of messages.flatMap(incomingAttachments)) {
       try {
@@ -307,9 +344,18 @@ export class TelegramBridge {
           ...(imageType === undefined ? {} : { imageType }),
         })
         parts.push({ type: 'file', receiptId })
+        logged.push(await this.viewerAttachment(chatId, attachment.name, data, imageType))
       } catch (error: unknown) {
+        logged.push({ name: attachment.name, kind: 'file', ...(attachment.size === undefined ? {} : { size: attachment.size }) })
         await this.reply(chatId, t.attachmentFailed(attachment.name, describe(error)))
       }
+    }
+    const first = messages[0]
+    if (first !== undefined && first.from !== undefined) {
+      this.log(chatInfo(first.chat, first.from), {
+        dir: 'in', kind: 'media', from: sender(first.from), attachments: logged,
+        ...(captions.length === 0 ? {} : { text: captions.join('\n\n') }),
+      })
     }
     if (parts.length === 0) {
       this.stopTyping(sessionId)
@@ -317,6 +363,14 @@ export class TelegramBridge {
     }
     if (captions.length > 0) parts.unshift({ type: 'text', text: captions.join('\n\n') })
     await this.harness.prompt(sessionId, parts, 'queue')
+  }
+
+  /** Describe an attachment for the history, keeping a copy of images the viewer can show. */
+  private async viewerAttachment(chatId: number, name: string, data: Uint8Array, imageType?: string): Promise<ChatAttachment> {
+    const base = { name, size: data.byteLength }
+    if (imageType === undefined || this.chatLog === undefined || data.byteLength > VIEWER_IMAGE_LIMIT) return { ...base, kind: imageType === undefined ? 'file' : 'image' }
+    const media = await this.chatLog.saveMedia(chatId, IMAGE_EXTENSIONS[imageType] ?? '', data).catch(() => undefined)
+    return { ...base, kind: 'image', ...(media === undefined ? {} : { media }) }
   }
 
   private async download(client: TelegramClient, attachment: IncomingAttachment, limit: number): Promise<Uint8Array> {
@@ -349,6 +403,7 @@ export class TelegramBridge {
       case 'use': {
         if (args === '') return this.reply(chatId, t.useUsage)
         await this.store.update(chatId, { sessionId: args })
+        await this.chatLog?.bind(chatId, args).catch(() => {})
         return this.reply(chatId, t.bound(args))
       }
       case 'sessions': {
@@ -391,6 +446,7 @@ export class TelegramBridge {
     const s = this.settings()
     const sessionId = await this.harness.createSession(cwd, s.agentPreset, s.permissionPreset)
     await this.store.update(chatId, { sessionId })
+    await this.chatLog?.bind(chatId, sessionId).catch(() => {})
     return sessionId
   }
 
@@ -429,13 +485,13 @@ export class TelegramBridge {
     if (chats.length === 0) return
     if (event.type === 'assistant/message') {
       const text = assistantText(event.data)
-      if (text !== '') for (const chatId of chats) void this.reply(chatId, text)
+      if (text !== '') for (const chatId of chats) void this.reply(chatId, text, 'assistant')
     } else if (event.type === 'tool/call') {
       const data = event.data as { callId: string; name: string; arguments: string }
       this.rememberToolCall(data.callId, data.name, data.arguments)
       if (this.settings().notifyToolCalls) {
         const message = this.t.toolCall(data.name, previewArguments(data.arguments, TOOL_PREVIEW_LENGTH))
-        for (const chatId of chats) void this.reply(chatId, message)
+        for (const chatId of chats) void this.reply(chatId, message, 'tool')
       }
     } else if (event.type === 'deliverables/presented') {
       if (!this.settings().sendDeliverables) return
@@ -493,19 +549,28 @@ export class TelegramBridge {
       const info = await stat(path)
       if (!info.isFile()) throw new Error(`${path} is not a file`)
       if (info.size > SEND_LIMIT_BYTES) {
-        await client.sendMessage(chatId, this.t.deliverableTooLarge(path))
+        const notice = this.t.deliverableTooLarge(path)
+        await client.sendMessage(chatId, notice)
+        this.log({ chatId }, { dir: 'out', kind: 'notice', text: notice })
         return
       }
       const data = new Uint8Array(await readFile(path))
       const caption = description === undefined ? basename(path) : `${basename(path)}\n${description}`.slice(0, 1024)
-      await client.sendFile(outgoingKind(path, info.size), chatId, { data, name: basename(path) }, caption)
+      const kind = outgoingKind(path, info.size)
+      await client.sendFile(kind, chatId, { data, name: basename(path) }, caption)
+      const attachment = await this.viewerAttachment(chatId, basename(path), data, kind === 'photo' ? sniffImageType(data) : undefined)
+      this.log({ chatId }, {
+        dir: 'out', kind: 'file', attachments: [{ ...attachment, path }],
+        ...(description === undefined ? {} : { text: description }),
+      })
     })
   }
 
   /** Send text to a chat in order, split to Telegram's size limit. */
-  private reply(chatId: number, text: string): Promise<void> {
+  private reply(chatId: number, text: string, kind: OutKind = 'notice'): Promise<void> {
     return this.enqueue(chatId, async (client) => {
       for (const chunk of chunkText(text)) await client.sendMessage(chatId, chunk)
+      this.log({ chatId }, { dir: 'out', kind, text })
     })
   }
 
@@ -558,12 +623,22 @@ export class TelegramBridge {
     const pending: PendingApproval = {
       sessionId: request.sessionId,
       prompts: [],
-      settle: (outcome, note) => {
+      settle: (outcome, note, by) => {
         if (!this.approvals.delete(id)) return
         clearTimeout(timer)
         request.signal?.removeEventListener('abort', onAbort)
         for (const prompt of pending.prompts) {
           void client.editMessageText(prompt.chatId, prompt.messageId, `${text}\n\n${note}`).catch(() => {})
+          this.log({ chatId: prompt.chatId }, {
+            dir: 'out', kind: 'approval',
+            ...(request.reason === undefined ? {} : { text: request.reason }),
+            approval: {
+              tool: request.toolName,
+              ...(detail === '' ? {} : { detail }),
+              outcome: outcome === 'delegate' ? 'timeout' : outcome,
+              ...(by === undefined ? {} : { by }),
+            },
+          })
         }
         answer.resolve(outcome)
       },
@@ -600,10 +675,29 @@ export class TelegramBridge {
       return
     }
     const who = query.from.username === undefined ? query.from.first_name : `@${query.from.username}`
-    if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who))
-    else pending.settle('rejected', t.approvalRejected(who))
+    if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who), who)
+    else pending.settle('rejected', t.approvalRejected(who), who)
     await client.answerCallbackQuery(query.id)
   }
+}
+
+/** What the history knows about a chat from one incoming message. */
+function chatInfo(chat: TgChat, from: TgUser): ChatInfo {
+  const username = chat.username ?? (chat.type === 'private' ? from.username : undefined)
+  return {
+    chatId: chat.id,
+    title: chat.title ?? displayName(from),
+    type: chat.type,
+    ...(username === undefined ? {} : { username }),
+  }
+}
+
+function sender(user: TgUser): { id: number; name: string; username?: string } {
+  return { id: user.id, name: displayName(user), ...(user.username === undefined ? {} : { username: user.username }) }
+}
+
+function displayName(user: TgUser): string {
+  return [user.first_name, user.last_name].filter(Boolean).join(' ') || (user.username ?? String(user.id))
 }
 
 /** Concatenate the visible text blocks of a committed assistant message. */

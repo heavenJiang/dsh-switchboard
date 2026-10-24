@@ -43,6 +43,12 @@ Photos, documents, videos, audio, voice notes, video notes, and static stickers 
 
 Files the Agent hands over with the `present` tool are sent back: common images inline, everything else as a document (up to Telegram's 50 MB).
 
+## Chat history in the Web UI
+
+The **Telegram** sidebar entry opens a history viewer while the plugin runs: chats on the left (searchable, with unauthorized-only chats tagged), the selected chat's messages on the right — people on the left, the bot on the right, photos inline, files as cards, tool calls and notices as compact lines, approvals as cards with outcome and who answered — plus an **Open Session** button that jumps to the bound Web Session. It refreshes every 3 seconds and loads older messages on demand.
+
+History lives in `$DSH_HOME/telegram-bridge/chats/` (one JSONL file per chat plus copies of received images), never enters a Session, and is trimmed to `historyLimit` entries per chat. The `/api/telegram-bridge/*` routes are owner-only.
+
 ## Approvals
 
 With **Answer tool approvals in Telegram** on, an approval for a chat-bound Session is sent there with **Allow once / Reject** buttons and an argument preview. Only allowed users can press them. After the timeout the question goes to the Web UI unchanged.

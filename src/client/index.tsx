@@ -1,5 +1,8 @@
 /**
- * Telegram bridge settings page, browser half. Registers the bundle's own
+ * Telegram bridge browser half: a "Telegram" sidebar panel showing chat
+ * history (see TelegramPanel.tsx), and the settings page.
+ *
+ * Settings page: Registers the bundle's own
  * configuration into the Plugins page's `plugins.bundle.config` slot while
  * the Host serves the `telegram-bridge` entry, and edits that entry's
  * volatile Config through the shared configuration form, so a save is one
@@ -19,11 +22,16 @@ import type { ConfigForm, SettingsDescribeFace } from '@deepseek-ai/dsh-client-u
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: the Plugins page's SlotMap entries.
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+// Type-only: the sidebar entry and main panel slots.
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import {
   SettingsForm, SettingsSecretField, SettingsValueField, Switch,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
+import panelCss from './panel.css'
+import { PlaneIcon, createTelegramPanel } from './TelegramPanel.tsx'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -38,6 +46,8 @@ const NS = 'telegramBridge'
 const PACKAGE = 'dsh-telegram-bridge'
 /** Profile entry id the bundle patch gives the bridge row: the settings namespace. */
 const ENTRY = 'telegram-bridge'
+/** Main panel id the sidebar entry selects. */
+const PANEL_ID = 'telegram-bridge' as MainPanelId
 
 /** The Config fields this page edits, as the Host resolves them (the token is redacted). */
 interface BridgeValues {
@@ -53,9 +63,10 @@ interface BridgeValues {
   apiBaseUrl?: string
   maxDownloadMb?: number
   sendDeliverables?: boolean
+  historyLimit?: number
 }
 
-type TextField = 'allowedUsers' | 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec' | 'maxDownloadMb' | 'apiBaseUrl'
+type TextField = 'allowedUsers' | 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec' | 'maxDownloadMb' | 'historyLimit' | 'apiBaseUrl'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
 
 /** How a text field renders and parses; `undefined` from parse marks the draft invalid. */
@@ -83,6 +94,13 @@ const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; pars
     parse: (text) => {
       const n = Number(text.trim())
       return Number.isInteger(n) && n >= 1 && n <= 2000 ? n : undefined
+    },
+  },
+  historyLimit: {
+    format: v => v.historyLimit === undefined ? '' : String(v.historyLimit),
+    parse: (text) => {
+      const n = Number(text.trim())
+      return Number.isInteger(n) && n >= 100 && n <= 100000 ? n : undefined
     },
   },
   apiBaseUrl: {
@@ -133,6 +151,39 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
     name: 'plugins.bundle.config', key: PACKAGE, locale: NS,
   }, Page))), 'telegram-bridge: page')
+
+  ctx.effect(() => {
+    const style = document.createElement('style')
+    style.dataset['pluginCss'] = 'dsh-telegram-bridge/panel.css'
+    style.textContent = panelCss
+    document.head.appendChild(style)
+    return () => { style.remove() }
+  }, 'telegram-bridge: panel styles')
+  // Navigation services belong to other plugins; read them when used so the
+  // panel still renders in a composition without them.
+  const Panel = createTelegramPanel({
+    openSession(sessionId) {
+      const workspace = ctx.get('uiWorkspace') as { openSession(id: string): void } | undefined
+      if (workspace === undefined) return false
+      workspace.openSession(sessionId)
+      return true
+    },
+    openSettings() {
+      const navigation = ctx.get('pluginNavigation') as { openBundle(name: string): void } | undefined
+      navigation?.openBundle(PACKAGE)
+    },
+  })
+  // The panel appears only while the Host serves the bridge, like the settings page.
+  ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => {
+    const offMain = ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS }, Panel))
+    const offEntry = ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+      name: 'sidebar.panellist', id: PANEL_ID, order: 15, label: () => ctx.locale.bind(NS)('panel'), locale: NS,
+    }, ({ size }: { size?: number }) => <PlaneIcon size={size ?? 16} />))
+    return () => {
+      offEntry()
+      offMain()
+    }
+  }), 'telegram-bridge: history panel')
 }
 
 /** Whether the Host reports a stored bot token. */
@@ -267,6 +318,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         {toggle('notifyToolCalls')}
         {valueField('maxDownloadMb', 'max-download', { numeric: true })}
         {toggle('sendDeliverables')}
+        {valueField('historyLimit', 'history-limit', { numeric: true })}
         {toggle('englishReplies')}
         {valueField('apiBaseUrl', 'api-base-url')}
       </SettingsForm>

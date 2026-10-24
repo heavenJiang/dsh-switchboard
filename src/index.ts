@@ -18,16 +18,21 @@ import type { Context, Volatile } from '@deepseek-ai/cordis'
 // Type-only: merges the `loader/volatile-update` event.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { randomUUID } from 'node:crypto'
+import { dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller'
 import type { FileUploadReceiptId } from '@deepseek-ai/dsh-client-file-upload'
+// Type-only: ctx.connection, for the history viewer's routes.
+import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { BindingStore, defaultStateFile } from './bindings.ts'
 import { TelegramBridge, type BridgeSettings, type HarnessPort, type SessionRow } from './bridge.ts'
+import { ChatLog } from './chatlog.ts'
+import { registerHistoryRoutes } from './routes.ts'
 import type { BotLanguage } from './messages.ts'
 
 export { TelegramBridge } from './bridge.ts'
@@ -65,6 +70,8 @@ export interface Config {
   maxDownloadMb: Volatile<number>
   /** Send files the Agent presents with the `present` tool back to the chat. */
   sendDeliverables: Volatile<boolean>
+  /** Entries kept per chat in the Web history viewer. */
+  historyLimit: Volatile<number>
   /** Long-poll wait in seconds. */
   pollTimeoutSec: number
   /** Chat-to-Session binding file; defaults to `$DSH_HOME/telegram-bridge/state.json`. */
@@ -85,6 +92,7 @@ export const Config: Schema<Config> = Schema.object({
   apiBaseUrl: Schema.string().pattern(/^https?:\/\/\S+$/u).default('https://api.telegram.org').volatile(),
   maxDownloadMb: Schema.natural().min(1).max(2000).default(20).volatile(),
   sendDeliverables: Schema.boolean().default(true).volatile(),
+  historyLimit: Schema.natural().min(100).max(100000).default(2000).volatile(),
   pollTimeoutSec: Schema.natural().min(1).max(50).default(30),
   stateFile: Schema.string(),
 }) as unknown as Schema<Config>
@@ -177,8 +185,15 @@ export function apply(ctx: Context, config: Config): void {
     },
   }
 
-  const store = new BindingStore(config.stateFile ?? defaultStateFile())
-  const bridge = new TelegramBridge(settings, harness, store, logger)
+  const stateFile = config.stateFile ?? defaultStateFile()
+  const store = new BindingStore(stateFile)
+  const chatLog = new ChatLog(join(dirname(stateFile), 'chats'), () => config.historyLimit.get())
+  const bridge = new TelegramBridge(settings, harness, store, logger, undefined, chatLog)
+
+  // The Web viewer reads history through owner-only routes on the shared API channel.
+  ctx.inject(['connection'], (scope) => {
+    registerHistoryRoutes(scope, chatLog, bridge)
+  })
 
   ctx.on('session/event', (session, event) => {
     bridge.onSessionEvent(session.header.id, event, agents.get(session.header.id)?.session.header.cwd ?? session.header.cwd)
@@ -216,6 +231,7 @@ export function apply(ctx: Context, config: Config): void {
       await started
       await bridge.stop()
       await store.settled()
+      await chatLog.settled()
     }
   }, 'telegram-bridge: polling')
 }
