@@ -1,6 +1,6 @@
 /**
- * Telegram bridge browser half: a "Telegram" sidebar panel showing chat
- * history (see TelegramPanel.tsx), and the settings page.
+ * Pocket Console browser half: the sidebar panel showing Telegram
+ * conversation history (see TelegramPanel.tsx), the Session tab, and the settings page.
  *
  * Settings page: Registers the bundle's own
  * configuration into the Plugins page's `plugins.bundle.config` slot while
@@ -35,7 +35,7 @@ import {
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
 import panelCss from './panel.css'
-import { PlaneIcon, createTelegramPanel } from './TelegramPanel.tsx'
+import { ConsoleIcon, createTelegramPanel } from './TelegramPanel.tsx'
 import { remotes, trackRemotes } from './remotes.ts'
 import { SessionTab } from './SessionTab.tsx'
 import { useUpdateCheck } from './update.ts'
@@ -250,7 +250,7 @@ export function apply(ctx: ClientContext): void {
     const offMain = ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS }, Panel))
     const offEntry = ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
       name: 'sidebar.panellist', id: PANEL_ID, order: 15, label: () => ctx.locale.bind(NS)('panel'), locale: NS,
-    }, ({ size }: { size?: number }) => <PlaneIcon size={size ?? 16} />))
+    }, ({ size }: { size?: number }) => <ConsoleIcon size={size ?? 16} />))
     return () => {
       offEntry()
       offMain()

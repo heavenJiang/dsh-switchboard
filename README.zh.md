@@ -1,12 +1,14 @@
-# dsh-telegram-bridge
+# 掌上指挥台（dsh-telegram-bridge）
 
 [English](README.md) | 中文
 
-用 Telegram 机器人遥控 DeepSeek Harness：在手机上给 Agent 发文字、图片、文件和语音，看它边写边回复，审批工具调用、回答它的提问，订阅长任务的完成通知；在 Web 端查看所有聊天记录，并把任意会话关联到 Telegram。
+<img src="icon.svg" width="72" alt="" align="right">
+
+在手机上通过 Telegram 机器人指挥 DeepSeek Harness 的 Agent：在手机上给 Agent 发文字、图片、文件和语音，看它边写边回复，审批工具调用、回答它的提问，订阅长任务的完成通知；在 Web 端查看所有聊天记录，并把任意会话关联到 Telegram。
 
 机器人是 Web Host 的另一个客户端：它通过 `ctx.sessionController`（与 Web 界面同一条路径）创建会话和发送消息，所以 Telegram 里开的会话会出现在 Web 侧栏中，Web 端的会话也可以接管或订阅。
 
-![Telegram 面板概览](docs/images/panel-dashboard.png)
+![掌上指挥台概览](docs/images/panel-dashboard.png)
 
 ## 快速开始
 
@@ -17,7 +19,7 @@
    dsh plugin --profile web add github:heavenJiang/dsh-telegram-bridge
    ```
 
-3. 打开侧栏 **插件 → 已安装插件 → Telegram 遥控**（也可以点侧栏 **Telegram** 面板右上角的 **插件设置**），填写 **Bot Token**、**允许的用户**（先给机器人发 `/whoami` 查看自己的 ID）和 **默认工作目录**，点 **保存**，即时生效。
+3. 打开侧栏 **插件 → 已安装插件 → 掌上指挥台**（也可以点侧栏 **掌上指挥台** 右上角的 **插件设置**），填写 **Bot Token**、**允许的用户**（先给机器人发 `/whoami` 查看自己的 ID）和 **默认工作目录**，点 **保存**，即时生效。
 
 ## 在 Telegram 里
 
@@ -76,7 +78,7 @@
 
 ## 在 Web 里
 
-**Telegram 面板**（侧栏入口）
+**掌上指挥台面板**（侧栏入口）
 
 - **左栏**：所有聊天，可搜索，显示机器人连接状态；只被拦截过的陌生人带「未授权」标签。
 - **右栏**：没选中聊天时显示概览，包括今日消息、7 天活跃聊天、审批和拦截次数，以及近 14 天的消息量图表。选中聊天后显示完整记录：气泡区分用户和机器人，图片直接显示，文件显示为卡片，工具调用和审批用紧凑样式，群聊可按成员筛选；**打开会话** 一键跳到绑定的会话。
@@ -84,9 +86,9 @@
 
 ![聊天记录](docs/images/panel-thread.png)
 
-**会话内的 Telegram 标签页**
+**会话内的掌上指挥台标签页**
 
-每个会话里都有 **Telegram** 标签页：
+每个会话里都有 **掌上指挥台** 标签页：
 - 查看关联的聊天，可以解除关联；
 - 从已知聊天里选一个 **绑定**（聊天里发的消息交给本会话，回复也发回去）或 **订阅**（只收完成和审批通知）；
 - 以机器人身份给绑定的聊天发消息，支持 Markdown；
@@ -158,7 +160,7 @@
 | 文件与语音 | `sendDeliverables` | `true` | 把 `present` 交付的文件发回聊天 |
 | | `maxDownloadMb` | `20` | 接收文件大小上限（1–2000 MB） |
 | | `transcribeVoice` / `ffmpegPath` | `true` / `ffmpeg` | 语音转文字 / ffmpeg 路径 |
-| 界面与记录 | `showPanel` / `showSessionTab` | `true` | 侧栏 Telegram 入口 / 会话内标签页 |
+| 界面与记录 | `showPanel` / `showSessionTab` | `true` | 侧栏掌上指挥台入口 / 会话内标签页 |
 | | `historyLimit` | `2000` | 每个聊天保留的记录条数 |
 | （文件） | `pollTimeoutSec` | `30` | 长轮询等待秒数 |
 | （文件） | `stateFile` | `$DSH_HOME/telegram-bridge/state.json` | 绑定、订阅、待生效选择与轮询进度 |
@@ -181,7 +183,7 @@ src/routes.ts      owner-only 路由（ctx.connection.fetch）
 src/command.ts     Web 输入框的 /telegram 命令（ctx.commands）
 src/updates.ts     版本检查（GitHub / npm，经宿主代理）
 src/version.ts     安装来源解析与版本比较（宿主与浏览器共用）
-src/client/        浏览器半侧：Telegram 面板、会话标签页、设置页（分组）、版本区块
+src/client/        浏览器半侧：掌上指挥台面板、会话标签页、设置页（分组）、版本区块
 cordis.patch.yml   组合包层：插入 id 为 telegram-bridge 的插件行
 ```
 

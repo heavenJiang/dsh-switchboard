@@ -1,12 +1,14 @@
-# dsh-telegram-bridge
+# Pocket Console (dsh-telegram-bridge)
 
 English | [中文](README.zh.md)
 
-Drive DeepSeek Harness from a Telegram bot: send the Agent text, photos, files, and voice notes from your phone, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to Telegram.
+<img src="icon.svg" width="72" alt="" align="right">
+
+Command DeepSeek Harness Agents from your phone through a Telegram bot: send the Agent text, photos, files, and voice notes from your phone, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to Telegram.
 
 The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed.
 
-![Telegram panel overview](docs/images/panel-dashboard.png)
+![Pocket Console overview](docs/images/panel-dashboard.png)
 
 ## Quick start
 
@@ -17,7 +19,7 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
    dsh plugin --profile web add github:heavenJiang/dsh-telegram-bridge
    ```
 
-3. Open **Plugins → Installed → Telegram Remote** (or **Plugin settings** on the sidebar's **Telegram** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
+3. Open **Plugins → Installed → Pocket Console** (or **Plugin settings** in the sidebar's **Pocket Console** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
 
 ## In Telegram
 
@@ -51,8 +53,8 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 
 ## In the Web UI
 
-- **Telegram panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
-- **Telegram tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
+- **Pocket Console panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
+- **Pocket Console tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
 - **`/telegram` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session; runs on the Host, never reaches the model.
 - **Channel note**: Sessions bound to a chat get a short `ctx.systemPrompt.context()` note asking for phone-friendly replies.
 

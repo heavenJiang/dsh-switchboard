@@ -5,7 +5,7 @@ export type BotLanguage = 'zh' | 'en'
 
 const zh = {
   help: [
-    'DeepSeek Harness 遥控',
+    '掌上指挥台 · DeepSeek Harness',
     '',
     '直接发送文字、图片或文件：交给当前会话的 Agent 执行',
     '/new [目录] — 新建会话（可指定工作目录）',
@@ -123,7 +123,7 @@ const zh = {
 
 const en: typeof zh = {
   help: [
-    'DeepSeek Harness remote',
+    'Pocket Console · DeepSeek Harness',
     '',
     'Send text, photos, or files: the current Session\'s Agent gets them',
     '/new [dir] — start a new Session (optionally in a directory)',

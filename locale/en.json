@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Telegram Remote",
-    "description": "Chat with Harness from a Telegram bot: prompt, send and receive photos and files, stop, switch Sessions, and approve tool calls.",
+    "title": "Pocket Console",
+    "description": "Command Harness Agents from your phone through Telegram: give tasks, watch replies stream, approve tools and answer questions, follow long tasks, and send photos, files, and voice notes.",
     "detail": "docs/DETAIL.md"
   }
 }

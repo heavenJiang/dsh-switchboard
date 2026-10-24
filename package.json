@@ -1,7 +1,7 @@
 {
   "name": "dsh-telegram-bridge",
-  "description": "Drive DeepSeek Harness sessions from a Telegram bot: chat, stop, switch workspaces, and answer tool approvals.",
-  "version": "0.5.0",
+  "description": "Pocket Console for DeepSeek Harness: command Agents from your phone through a Telegram bot — tasks, streamed replies, approvals, questions, notices, files, and voice.",
+  "version": "0.5.1",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",

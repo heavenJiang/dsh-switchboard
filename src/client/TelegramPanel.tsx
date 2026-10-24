@@ -187,7 +187,7 @@ function StateBadge({ state, t }: { state: BridgeState; t: T }): ReactNode {
 function EmptyState({ t, onSettings }: { t: T; onSettings: () => void }): ReactNode {
   return (
     <div className="tgb-empty">
-      <span className="tgb-empty-icon"><PlaneIcon size={48} /></span>
+      <span className="tgb-empty-icon"><ConsoleIcon size={48} /></span>
       <strong>{t('noChats')}</strong>
       <p>{t('noChatsHint')}</p>
       <button type="button" className="tgb-button" onClick={onSettings}>{t('openSettings')}</button>
@@ -320,7 +320,7 @@ function SenderChips({ entries, selected, onSelect, t }: {
 /** The panel's landing view: activity figures and a 14-day chart. */
 function Dashboard({ stats, t }: { stats: ChatStats | undefined; t: T }): ReactNode {
   if (stats === undefined) {
-    return <div className="tgb-empty"><span className="tgb-empty-icon"><PlaneIcon size={40} /></span><p>{t('pickChat')}</p></div>
+    return <div className="tgb-empty"><span className="tgb-empty-icon"><ConsoleIcon size={40} /></span><p>{t('pickChat')}</p></div>
   }
   const peak = Math.max(1, ...stats.series.map(day => day.in + day.out))
   const tiles: [string, string][] = [
@@ -446,15 +446,17 @@ function Avatar({ id, name, size }: { id: number; name: string; size?: 'sm' | 'x
 }
 
 /**
- * Telegram-style paper plane for the sidebar entry and empty states.
+ * Pocket Console mark: a chat bubble holding a command prompt, drawn in the
+ * current text color for the sidebar entry, the Session tab, and empty states.
  * @param props.size - icon edge in pixels.
  */
-export function PlaneIcon({ size }: { size: number }): ReactNode {
+export function ConsoleIcon({ size }: { size: number }): ReactNode {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M21.4 4.2 2.9 11.3c-1 .4-1 1.3-.2 1.6l4.7 1.5 1.8 5.6c.2.6.4.8.9.8.4 0 .6-.2.9-.5l2.3-2.2 4.9 3.6c.9.5 1.5.2 1.8-.8l3.2-15.1c.3-1.3-.5-1.9-1.8-1.6Z"
+      <path d="M4.5 7.2A3.2 3.2 0 0 1 7.7 4h8.6a3.2 3.2 0 0 1 3.2 3.2v6.1a3.2 3.2 0 0 1-3.2 3.2h-4.6l-3.6 3.1c-.4.3-.9 0-.9-.4v-2.7h0a2.7 2.7 0 0 1-2.7-2.7V7.2Z"
         stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="m8 14.2 9.3-6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="m8.6 8.4 2.3 1.9-2.3 1.9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M12.6 12.4h2.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   )
 }
