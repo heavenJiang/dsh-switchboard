@@ -149,6 +149,12 @@ export interface HarnessPort {
   live(sessionId: string): { running: boolean; cwd?: string } | undefined
   /** Recent root Sessions, newest first. */
   listSessions(): Promise<SessionRow[]>
+  /**
+   * Make a Session a member of the Web Workspace for its working directory,
+   * creating the Workspace when none owns that directory yet, so it lists in
+   * the sidebar with the user's other Sessions. Archived Sessions are left alone.
+   */
+  ensureWorkspace(sessionId: string): Promise<void>
   /** Prompts waiting in a live Session's inbox; undefined when it is not loaded. */
   queued(sessionId: string): QueuedItem[] | undefined
   /** Drop queued prompts by id, or all; returns how many were dropped. */
@@ -642,6 +648,7 @@ export class TelegramBridge {
         const sessionId = this.sessionRef(chatId, args)
         await this.store.update(chatId, { sessionId })
         await this.chatLog?.bind(chatId, sessionId).catch(() => {})
+        this.attachToWorkspace(sessionId)
         return this.reply(chatId, t.bound(sessionId))
       }
       case 'sessions': {
@@ -655,6 +662,7 @@ export class TelegramBridge {
         if (args === '') return this.reply(chatId, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
         const sessionId = this.sessionRef(chatId, args)
         await this.store.setWatch(chatId, sessionId, true)
+        this.attachToWorkspace(sessionId)
         return this.reply(chatId, t.watchOn(sessionId))
       }
       case 'unwatch': {
@@ -712,6 +720,22 @@ export class TelegramBridge {
       default:
         // Unknown slash commands go to the Agent verbatim (skills such as /plan are commands there too).
         return this.promptFromChat(chatId, [{ type: 'text', text: `/${name}${args === '' ? '' : ` ${args}`}` }], 'queue')
+    }
+  }
+
+  /** Put a linked Session into its directory's Web Workspace; a failure is logged, never shown in Telegram. */
+  private attachToWorkspace(sessionId: string): void {
+    void this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
+      this.logger.warn(`telegram-bridge: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
+    })
+  }
+
+  /** Put every linked Session into its directory's Web Workspace (startup backfill). */
+  async attachLinkedSessions(): Promise<void> {
+    for (const sessionId of this.store.linkedSessions()) {
+      await this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
+        this.logger.warn(`telegram-bridge: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
+      })
     }
   }
 
@@ -893,6 +917,7 @@ export class TelegramBridge {
    */
   async linkChat(chatId: number, sessionId: string, mode: 'active' | 'watch' | 'none'): Promise<void> {
     const t = this.t
+    if (mode !== 'none') this.attachToWorkspace(sessionId)
     const binding = this.store.get(chatId)
     if (mode === 'active') {
       await this.store.update(chatId, { sessionId })

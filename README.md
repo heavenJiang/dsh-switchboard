@@ -6,7 +6,7 @@ English | [中文](README.zh.md)
 
 Command DeepSeek Harness Agents from your phone through a Telegram bot: send the Agent text, photos, files, and voice notes from your phone, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to Telegram.
 
-The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed.
+The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed. Sessions the bot creates go into the Web Workspace for their working directory (created on first use), listed with your other Sessions.
 
 ![Pocket Console overview](docs/images/panel-dashboard.png)
 

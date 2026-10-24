@@ -42,6 +42,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 // Side-effect type import: declaration-merges the question waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-questions'
 import type {} from '@deepseek-ai/dsh-workspace-changes'
+import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { BindingStore, defaultStateFile } from './bindings.ts'
 import {
   TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
@@ -210,7 +211,12 @@ export function apply(ctx: Context, config: Config): void {
     credentials?: Context['credentials']
     speech?: Context['speechToText']
     changes?: Context['workspaceChanges']
+    workspaces?: Context['workspaceRegistry']
   } = {}
+  ctx.inject(['workspaceRegistry'], (scope) => {
+    optional.workspaces = scope.workspaceRegistry
+    scope.effect(() => () => { delete optional.workspaces }, 'telegram-bridge: workspace registry')
+  })
   ctx.inject(['speechToText'], (scope) => {
     optional.speech = scope.speechToText
     scope.effect(() => () => { delete optional.speech }, 'telegram-bridge: speech service')
@@ -294,7 +300,16 @@ export function apply(ctx: Context, config: Config): void {
   const harness: HarnessPort = {
     async createSession(cwd, agentPreset, permissionPreset, model) {
       if (model !== undefined) await validateModel(model)
-      const { sessionId } = await sessionController.create({ cwd, ...(agentPreset === '' ? {} : { agentPreset }) })
+      // Create inside the directory's Web Workspace (made on first use), the
+      // way the Web composer does, so the Session lists in the sidebar.
+      const workspace = await optional.workspaces?.create(cwd).catch((error: unknown) => {
+        logger.warn(`telegram-bridge: no Web workspace for ${cwd}: ${String(error)}`)
+        return undefined
+      })
+      const { sessionId } = await sessionController.create({
+        ...(workspace === undefined ? { cwd } : { workspaceId: workspace.id as WorkspaceId }),
+        ...(agentPreset === '' ? {} : { agentPreset }),
+      })
       if (model !== undefined) pinModel(sessionId, model)
       if (permissionPreset !== '') {
         permissionPresets.resolve(permissionPreset)
@@ -409,6 +424,18 @@ export function apply(ctx: Context, config: Config): void {
         return count
       }
       return ids.filter(id => inbox.remove(id as Parameters<typeof inbox.remove>[0])).length
+    },
+    async ensureWorkspace(sessionId) {
+      const registry = optional.workspaces
+      if (registry === undefined) return
+      if (registry.archivedSessionIds.includes(sessionId as SessionId)) return
+      if (registry.list().some(workspace => workspace.sessionIds.includes(sessionId as SessionId))) return
+      const cwd = agents.get(sessionId as SessionId)?.session.header.cwd
+        ?? (await sessionController.list({}, new AbortController().signal)).items.find(item => item.sessionId === sessionId)?.cwd
+      if (cwd === undefined) return
+      const workspace = await registry.create(cwd)
+      await workspace.attachSession(sessionId as SessionId)
+      logger.info(`telegram-bridge: added ${sessionId} to Web workspace ${workspace.path}`)
     },
     changedFiles(sessionId, seq) {
       const summary = optional.changes?.summary(sessionId as SessionId, seq as never)
@@ -529,7 +556,10 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('loader/volatile-update', restart)
 
   ctx.effect(() => {
-    const started = store.load().then(() => refreshToken()).then(() => bridge.reconcile()).catch((error: unknown) => {
+    const started = store.load().then(() => refreshToken()).then(() => bridge.reconcile()).then(async () => {
+      // Sessions linked before workspaces were attached join theirs now.
+      await bridge.attachLinkedSessions()
+    }).catch((error: unknown) => {
       logger.warn(`telegram-bridge: failed to start: ${String(error)}`)
     })
     return async () => {

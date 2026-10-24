@@ -133,6 +133,10 @@ class FakeHarness implements HarnessPort {
     this.inbox.set(sessionId, keep)
     return items.length - keep.length
   }
+  readonly workspaced: string[] = []
+  async ensureWorkspace(sessionId: string): Promise<void> {
+    if (!this.workspaced.includes(sessionId)) this.workspaced.push(sessionId)
+  }
   changedFiles(): string[] | undefined {
     return ['src/a.ts', 'README.md']
   }
@@ -823,5 +827,23 @@ describe('agent questions', () => {
 
   it('hands unlinked Sessions to the next answerer', async () => {
     await expect(bridge.requestAnswers({ sessionId: 'nobody', questions: [{ id: 'q', question: '?' }] })).resolves.toBe('delegate')
+  })
+})
+
+describe('web workspaces', () => {
+  it('adds Sessions to their Web workspace when a chat switches to or follows them', async () => {
+    telegram.push(text(USER, '/use session-abc'))
+    telegram.push(text(USER, '/watch session-def'))
+    await until(() => harness.workspaced.length === 2)
+    expect(harness.workspaced).toEqual(['session-abc', 'session-def'])
+    await bridge.linkChat(CHAT.id, 'session-ghi', 'active')
+    await until(() => harness.workspaced.includes('session-ghi'))
+  })
+
+  it('backfills every bound or followed Session at startup', async () => {
+    await store.update(CHAT.id, { sessionId: 's-bound' })
+    await store.setWatch(CHAT.id, 's-watched', true)
+    await bridge.attachLinkedSessions()
+    expect(harness.workspaced.sort()).toEqual(['s-bound', 's-watched'])
   })
 })

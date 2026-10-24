@@ -120,6 +120,16 @@ export class BindingStore {
     return this.flush()
   }
 
+  /** @returns every Session some chat is bound to or follows. */
+  linkedSessions(): string[] {
+    const ids = new Set<string>()
+    for (const binding of Object.values(this.data.chats)) {
+      if (binding.sessionId !== undefined) ids.add(binding.sessionId)
+      for (const id of binding.watch ?? []) ids.add(id)
+    }
+    return [...ids]
+  }
+
   /** @returns every chat bound to a Session id. */
   chatsFor(sessionId: string): number[] {
     return Object.entries(this.data.chats)

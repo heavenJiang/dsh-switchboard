@@ -6,7 +6,7 @@
 
 在手机上通过 Telegram 机器人指挥 DeepSeek Harness 的 Agent：在手机上给 Agent 发文字、图片、文件和语音，看它边写边回复，审批工具调用、回答它的提问，订阅长任务的完成通知；在 Web 端查看所有聊天记录，并把任意会话关联到 Telegram。
 
-机器人是 Web Host 的另一个客户端：它通过 `ctx.sessionController`（与 Web 界面同一条路径）创建会话和发送消息，所以 Telegram 里开的会话会出现在 Web 侧栏中，Web 端的会话也可以接管或订阅。
+机器人是 Web Host 的另一个客户端：它通过 `ctx.sessionController`（与 Web 界面同一条路径）创建会话和发送消息，所以 Telegram 里开的会话会出现在 Web 侧栏中，Web 端的会话也可以接管或订阅。机器人新建的会话会放进工作目录对应的 Web 工作区（没有就自动创建），和其他会话一起显示在侧栏里。
 
 ![掌上指挥台概览](docs/images/panel-dashboard.png)
 

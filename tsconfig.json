@@ -37,6 +37,7 @@
       "@deepseek-ai/dsh-system-prompt": ["../deepseek-harness/packages/core/system-prompt"],
       "@deepseek-ai/dsh-workspace-changes": ["../deepseek-harness/packages/deliverables/workspace-changes"],
       "@deepseek-ai/dsh-user-questions": ["../deepseek-harness/packages/interaction/user-questions"],
+      "@deepseek-ai/dsh-workspace": ["../deepseek-harness/packages/workspace/workspace"],
       "@deepseek-ai/dsh-agent": ["../deepseek-harness/packages/core/agent"],
       "@deepseek-ai/dsh-permission-presets": ["../deepseek-harness/packages/interaction/permission-presets"],
       "@deepseek-ai/dsh-session": ["../deepseek-harness/packages/core/session"],

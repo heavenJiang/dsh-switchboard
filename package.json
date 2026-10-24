@@ -1,7 +1,7 @@
 {
   "name": "dsh-telegram-bridge",
   "description": "Pocket Console for DeepSeek Harness: command Agents from your phone through a Telegram bot — tasks, streamed replies, approvals, questions, notices, files, and voice.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",
@@ -74,6 +74,7 @@
     "@deepseek-ai/dsh-system-prompt": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-user-approval": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-user-questions": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-workspace": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/dsh-workspace-changes": ">=0.2.0-0 <0.3.0",
     "@deepseek-ai/schemastery": ">=3.18.0"
   },
@@ -97,6 +98,9 @@
       "optional": true
     },
     "@deepseek-ai/dsh-workspace-changes": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-workspace": {
       "optional": true
     }
   }
