@@ -2,6 +2,6 @@
   "meta": {
     "title": "Telegram Remote",
     "description": "Chat with Harness from a Telegram bot: prompt, send and receive photos and files, stop, switch Sessions, and approve tool calls.",
-    "detail": "README.md"
+    "detail": "docs/DETAIL.md"
   }
 }

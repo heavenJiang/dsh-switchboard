@@ -17,7 +17,7 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
    ```
 
    Or use **Plugins → Add plugin** in the Web sidebar with a local path or Git URL.
-3. On **Plugins → Telegram Remote**, fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot to get your id), and **Default working directory**.
+3. Open **Plugins** in the Web sidebar, click the **Telegram Remote** card under "Installed plugins" (below the official and experimental groups), and fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot to get your id), and **Default working directory**.
 4. **Save**. Changes apply live; no restart.
 
 ## Commands
