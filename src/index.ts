@@ -30,7 +30,7 @@ import type {} from '@deepseek-ai/dsh-permission-presets'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { BindingStore, defaultStateFile } from './bindings.ts'
-import { TelegramBridge, type BridgeSettings, type HarnessPort, type SessionRow } from './bridge.ts'
+import { TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { registerHistoryRoutes } from './routes.ts'
 import type { BotLanguage } from './messages.ts'
@@ -40,7 +40,7 @@ export type { BridgeSettings, HarnessPort } from './bridge.ts'
 
 export const name = 'telegram-bridge'
 /** The Web host's Session controller drives Sessions exactly as the Web UI does. */
-export const inject = ['agents', 'sessionController', 'permissionPresets', 'fileUploads']
+export const inject = ['agents', 'sessionController', 'permissionPresets', 'fileUploads', 'llm']
 
 /** Plugin configuration. Volatile fields are live-editable from the Plugins page. */
 export interface Config {
@@ -70,6 +70,12 @@ export interface Config {
   maxDownloadMb: Volatile<number>
   /** Send files the Agent presents with the `present` tool back to the chat. */
   sendDeliverables: Volatile<boolean>
+  /** Provider route of the model for Sessions the bot creates; empty follows the Web default model. */
+  modelProvider: Volatile<string>
+  /** Model id on that route; empty follows the Web default model. */
+  model: Volatile<string>
+  /** Reasoning effort for that model; empty uses the model's own default. */
+  reasoningEffort: Volatile<string>
   /** Entries kept per chat in the Web history viewer. */
   historyLimit: Volatile<number>
   /** Long-poll wait in seconds. */
@@ -92,6 +98,9 @@ export const Config: Schema<Config> = Schema.object({
   apiBaseUrl: Schema.string().pattern(/^https?:\/\/\S+$/u).default('https://api.telegram.org').volatile(),
   maxDownloadMb: Schema.natural().min(1).max(2000).default(20).volatile(),
   sendDeliverables: Schema.boolean().default(true).volatile(),
+  modelProvider: Schema.string().default('').volatile(),
+  model: Schema.string().default('').volatile(),
+  reasoningEffort: Schema.string().default('').volatile(),
   historyLimit: Schema.natural().min(100).max(100000).default(2000).volatile(),
   pollTimeoutSec: Schema.natural().min(1).max(50).default(30),
   stateFile: Schema.string(),
@@ -104,7 +113,35 @@ export const Config: Schema<Config> = Schema.object({
  */
 export function apply(ctx: Context, config: Config): void {
   // Handlers run outside the plugin's injection scope; capture services now.
-  const { agents, sessionController, permissionPresets, fileUploads, logger } = ctx
+  const { agents, sessionController, permissionPresets, fileUploads, llm, logger } = ctx
+
+  /** The bot's own default model from config, when both route and model are set. */
+  const configuredModel = (): ModelChoice | undefined => {
+    const provider = config.modelProvider.get().trim()
+    const model = config.model.get().trim()
+    const effort = config.reasoningEffort.get().trim()
+    return provider === '' || model === '' ? undefined : { provider, model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
+  }
+
+  /** Check a route can serve a model before recording it (Agent.model.select leaves validation to callers). */
+  const validateModel = async (choice: ModelChoice): Promise<void> => {
+    const { groups } = await sessionController.modelCatalog()
+    const listed = groups.some(group => group.id === choice.provider && group.models.some(model => model.id === choice.model))
+    if (!listed) throw new Error(`model ${choice.provider}/${choice.model} is not available`)
+    await llm.resolveCallConfig({
+      provider: choice.provider,
+      model: choice.model,
+      ...(choice.reasoningEffort === undefined ? {} : { reasoningEffort: choice.reasoningEffort }),
+    } as Parameters<typeof llm.resolveCallConfig>[0])
+  }
+
+  /** Record a choice on a live Agent's Session: durable, Session-local, and never the Web default. */
+  const pinModel = (sessionId: string, choice: ModelChoice): boolean => {
+    const agent = agents.get(sessionId as SessionId)
+    if (agent === undefined) return false
+    agent.model.select(choice as Parameters<typeof agent.model.select>[0])
+    return true
+  }
 
   const settings = (): BridgeSettings => ({
     enabled: config.enabled.get(),
@@ -121,11 +158,14 @@ export function apply(ctx: Context, config: Config): void {
     pollTimeoutSec: config.pollTimeoutSec,
     maxDownloadMb: config.maxDownloadMb.get(),
     sendDeliverables: config.sendDeliverables.get(),
+    ...(configuredModel() === undefined ? {} : { model: configuredModel()! }),
   })
 
   const harness: HarnessPort = {
-    async createSession(cwd, agentPreset, permissionPreset) {
+    async createSession(cwd, agentPreset, permissionPreset, model) {
+      if (model !== undefined) await validateModel(model)
       const { sessionId } = await sessionController.create({ cwd, ...(agentPreset === '' ? {} : { agentPreset }) })
+      if (model !== undefined) pinModel(sessionId, model)
       if (permissionPreset !== '') {
         permissionPresets.resolve(permissionPreset)
         const agent = agents.get(sessionId)
@@ -171,6 +211,29 @@ export function apply(ctx: Context, config: Config): void {
       const cwd = agent.session.header.cwd
       return { running: agent.status === 'running', ...(cwd === undefined ? {} : { cwd }) }
     },
+    async listModels() {
+      const catalog = await sessionController.modelCatalog()
+      return {
+        default: catalog.default,
+        groups: catalog.groups.map(group => ({
+          provider: group.id,
+          name: group.name,
+          models: group.models.map(model => ({ id: model.id, name: model.name })),
+        })),
+      }
+    },
+    currentModel(sessionId) {
+      const current = agents.get(sessionId as SessionId)?.model.current()
+      return current === undefined ? undefined : {
+        provider: current.provider,
+        model: current.model,
+        ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: String(current.reasoningEffort) }),
+      }
+    },
+    async selectModel(sessionId, choice) {
+      await validateModel(choice)
+      return pinModel(sessionId, choice)
+    },
     async listSessions() {
       const { items } = await sessionController.list({}, new AbortController().signal)
       return items
@@ -192,11 +255,19 @@ export function apply(ctx: Context, config: Config): void {
 
   // The Web viewer reads history through owner-only routes on the shared API channel.
   ctx.inject(['connection'], (scope) => {
-    registerHistoryRoutes(scope, chatLog, bridge)
+    registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog())
   })
 
   ctx.on('session/event', (session, event) => {
     bridge.onSessionEvent(session.header.id, event, agents.get(session.header.id)?.session.header.cwd ?? session.header.cwd)
+  })
+
+  // A /model choice made while its Session was cold lands as soon as the
+  // Session loads, before the Agent handles the prompt that loaded it.
+  ctx.on('agent/created', ({ agent }) => {
+    const choice = bridge.takePendingModel(agent.session.header.id)
+    if (choice !== undefined) agent.model.select(choice as Parameters<typeof agent.model.select>[0])
+    return undefined
   })
 
   ctx.on('agent/status', ({ agent, status }) => {

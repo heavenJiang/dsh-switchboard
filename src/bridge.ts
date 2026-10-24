@@ -39,6 +39,22 @@ export interface BridgeSettings {
   readonly maxDownloadMb: number
   /** Send files the Agent presents back to the chat. */
   readonly sendDeliverables: boolean
+  /** Model for Sessions the bot creates; the Web default when undefined. */
+  readonly model?: ModelChoice
+}
+
+/** A provider route, model, and optional reasoning effort. */
+export interface ModelChoice {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** One selectable model, grouped under its provider. */
+export interface ModelGroup {
+  readonly provider: string
+  readonly name: string
+  readonly models: readonly { readonly id: string; readonly name: string }[]
 }
 
 /** One part of a prompt: text, or an attachment staged with {@link HarnessPort.stageFile}. */
@@ -64,8 +80,18 @@ export interface SessionRow {
 
 /** What the bridge needs from the Harness. */
 export interface HarnessPort {
-  /** Create a Session in `cwd` and return its id. */
-  createSession(cwd: string, agentPreset: string, permissionPreset: string): Promise<string>
+  /** Create a Session in `cwd` and return its id; `model` pins its model instead of following the Web default. */
+  createSession(cwd: string, agentPreset: string, permissionPreset: string, model?: ModelChoice): Promise<string>
+  /** Every currently routable model, and the Web default. */
+  listModels(): Promise<{ groups: ModelGroup[]; default: ModelChoice }>
+  /** The model a live Session's next step uses, or undefined when it is not loaded. */
+  currentModel(sessionId: string): ModelChoice | undefined
+  /**
+   * Validate a choice and select it for one live Session only (the Web default is untouched).
+   * @returns false when the Session is not loaded; the bridge applies it when the Session loads.
+   * @throws when the route cannot serve the model.
+   */
+  selectModel(sessionId: string, choice: ModelChoice): Promise<boolean>
   /** Queue (or steer) one prompt into a Session, resuming it when cold. */
   prompt(sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void>
   /**
@@ -126,6 +152,9 @@ const TOOL_PREVIEW_LENGTH = 300
 const MEDIA_GROUP_WAIT_MS = 1500
 /** Telegram's document upload ceiling for bots. */
 const SEND_LIMIT_BYTES = 50 * 1024 * 1024
+/** Buttons in one /model picker; longer catalogs are reached by name. */
+const MODEL_BUTTONS = 30
+const PICKER_TTL_MS = 10 * 60 * 1000
 
 /** The bridge core. One instance lives for the plugin's lifetime; polling restarts on token changes. */
 export class TelegramBridge {
@@ -137,6 +166,10 @@ export class TelegramBridge {
   private readonly activity = new Map<string, ChatActivity>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly toolCalls = new Map<string, { name: string; arguments: string }>()
+  /** Choices made with /model for Sessions that were not loaded at the time. */
+  private readonly pendingModels = new Map<string, ModelChoice>()
+  /** Model pickers sent with /model, by short id, so a button press fits Telegram's 64-byte callback data. */
+  private readonly pickers = new Map<string, { sessionId: string; choices: ModelChoice[]; at: number }>()
   private readonly albums = new Map<string, { chatId: number; messages: TgMessage[]; timer: ReturnType<typeof setTimeout> }>()
 
   constructor(
@@ -250,6 +283,7 @@ export class TelegramBridge {
     await client.setMyCommands([
       { command: 'new', description: t.cmdNew },
       { command: 'stop', description: t.cmdStop },
+      { command: 'model', description: t.cmdModel },
       { command: 'status', description: t.cmdStatus },
       { command: 'help', description: t.cmdHelp },
     ]).catch((error: unknown) => {
@@ -423,17 +457,94 @@ export class TelegramBridge {
       }
       case 'status': {
         const live = binding.sessionId === undefined ? undefined : this.harness.live(binding.sessionId)
+        const model = binding.sessionId === undefined ? undefined : this.modelOf(binding.sessionId)
         return this.reply(chatId, t.status({
           bot: this.state.kind === 'running' ? `@${this.state.username}` : this.state.kind,
           ...(binding.sessionId === undefined ? {} : { session: binding.sessionId }),
           ...(live?.cwd === undefined ? {} : { cwd: live.cwd }),
           ...(live === undefined ? {} : { running: live.running }),
+          ...(model === undefined ? {} : { model: modelLabel(model) }),
         }))
       }
+      case 'model':
+        return this.modelCommand(chatId, binding.sessionId, args)
       default:
         // Unknown slash commands go to the Agent verbatim (skills such as /plan are commands there too).
         return this.promptFromChat(chatId, [{ type: 'text', text: `/${name}${args === '' ? '' : ` ${args}`}` }], 'queue')
     }
+  }
+
+  /**
+   * The model a Session uses next: a pending /model choice, else the live
+   * Session's selection; undefined for a cold Session with no pending choice.
+   */
+  modelOf(sessionId: string): ModelChoice | undefined {
+    return this.pendingModels.get(sessionId) ?? this.harness.currentModel(sessionId)
+  }
+
+  /**
+   * Hand over a /model choice made while the Session was not loaded. The host
+   * calls this when the Session's Agent is created, before it handles input.
+   * @returns the choice to select, once.
+   */
+  takePendingModel(sessionId: string): ModelChoice | undefined {
+    const choice = this.pendingModels.get(sessionId)
+    this.pendingModels.delete(sessionId)
+    return choice
+  }
+
+  /** `/model` lists models as buttons; `/model <name>` switches the chat's Session directly. */
+  private async modelCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+    const t = this.t
+    if (sessionId === undefined) return this.reply(chatId, t.modelNoSession)
+    const { groups } = await this.harness.listModels()
+    const all = groups.flatMap(group => group.models.map(model => ({ group, model })))
+    if (args === '') {
+      const current = this.modelOf(sessionId)
+      const choices = all.slice(0, MODEL_BUTTONS).map(({ group, model }) => ({ provider: group.provider, model: model.id }))
+      const id = randomUUID().slice(0, 8)
+      this.prunePickers()
+      this.pickers.set(id, { sessionId, choices, at: Date.now() })
+      const buttons = all.slice(0, MODEL_BUTTONS).map(({ group, model }, index) => [{
+        text: `${current?.provider === group.provider && current.model === model.id ? '✓ ' : ''}${model.name} · ${group.name}`.slice(0, 60),
+        callback_data: `md:${id}:${index}`,
+      }])
+      const client = this.client
+      if (client === undefined) return
+      const text = t.modelList(current === undefined ? undefined : modelLabel(current), all.length)
+      await this.enqueue(chatId, async (c) => { await c.sendMessage(chatId, text, buttons) })
+      this.log({ chatId }, { dir: 'out', kind: 'notice', text })
+      return
+    }
+    const needle = args.trim().toLowerCase()
+    const exact = all.filter(({ group, model }) =>
+      [`${group.provider}/${model.id}`, model.id, model.name].some(value => value.toLowerCase() === needle))
+    const matches = exact.length > 0 ? exact : all.filter(({ group, model }) =>
+      [`${group.provider}/${model.id}`, model.name].some(value => value.toLowerCase().includes(needle)))
+    if (matches.length === 0) return this.reply(chatId, t.modelNotFound(args))
+    if (matches.length > 1) {
+      return this.reply(chatId, t.modelAmbiguous(matches.slice(0, 10).map(({ group, model }) => `${model.name} (${group.provider}/${model.id})`)))
+    }
+    const { group, model } = matches[0]!
+    return this.switchModel(chatId, sessionId, { provider: group.provider, model: model.id }, model.name)
+  }
+
+  private async switchModel(chatId: number, sessionId: string, choice: ModelChoice, name: string): Promise<void> {
+    const t = this.t
+    try {
+      const applied = await this.harness.selectModel(sessionId, choice)
+      if (applied) this.pendingModels.delete(sessionId)
+      else this.pendingModels.set(sessionId, choice)
+      await this.reply(chatId, applied ? t.modelSwitched(name, modelLabel(choice)) : t.modelPending(name, modelLabel(choice)))
+    } catch (error: unknown) {
+      await this.reply(chatId, t.failed(describe(error)))
+    }
+  }
+
+  private prunePickers(): void {
+    const cutoff = Date.now() - PICKER_TTL_MS
+    for (const [id, picker] of this.pickers) if (picker.at < cutoff) this.pickers.delete(id)
+    while (this.pickers.size >= 32) this.pickers.delete(this.pickers.keys().next().value as string)
   }
 
   private defaultWorkspace(chatId: number): string | undefined {
@@ -444,7 +555,7 @@ export class TelegramBridge {
   private async newSession(chatId: number, cwd: string): Promise<string> {
     if (!(await isDirectory(cwd))) throw new Error(this.t.badWorkspace(cwd))
     const s = this.settings()
-    const sessionId = await this.harness.createSession(cwd, s.agentPreset, s.permissionPreset)
+    const sessionId = await this.harness.createSession(cwd, s.agentPreset, s.permissionPreset, s.model)
     await this.store.update(chatId, { sessionId })
     await this.chatLog?.bind(chatId, sessionId).catch(() => {})
     return sessionId
@@ -659,6 +770,7 @@ export class TelegramBridge {
   private async handleCallback(query: TgCallbackQuery): Promise<void> {
     const client = this.client
     if (client === undefined) return
+    if (query.data?.startsWith('md:') === true) return this.handleModelPick(client, query)
     const match = /^ap:([\w-]+):([yn])$/u.exec(query.data ?? '')
     if (match === null) {
       await client.answerCallbackQuery(query.id)
@@ -679,6 +791,31 @@ export class TelegramBridge {
     else pending.settle('rejected', t.approvalRejected(who), who)
     await client.answerCallbackQuery(query.id)
   }
+  private async handleModelPick(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
+    const t = this.t
+    if (!isAllowed(this.settings().allowedUsers, query.from.id, query.from.username)) {
+      await client.answerCallbackQuery(query.id, t.unauthorized(query.from.id))
+      return
+    }
+    const [, id = '', index = ''] = (query.data ?? '').split(':')
+    const picker = this.pickers.get(id)
+    const choice = picker?.choices[Number(index)]
+    const chatId = query.message?.chat.id
+    if (picker === undefined || choice === undefined || chatId === undefined) {
+      await client.answerCallbackQuery(query.id, t.modelPickerExpired)
+      return
+    }
+    await client.answerCallbackQuery(query.id)
+    const { groups } = await this.harness.listModels()
+    const name = groups.find(g => g.provider === choice.provider)?.models.find(m => m.id === choice.model)?.name ?? choice.model
+    await this.switchModel(chatId, picker.sessionId, choice, name)
+  }
+
+}
+
+/** `provider/model`, plus the effort when one is pinned. */
+export function modelLabel(choice: ModelChoice): string {
+  return `${choice.provider}/${choice.model}${choice.reasoningEffort === undefined ? '' : ` (${choice.reasoningEffort})`}`
 }
 
 /** What the history knows about a chat from one incoming message. */

@@ -210,6 +210,7 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
   const meta = [
     chat.type === 'private' ? t('privateChat') : t('groupChat'),
     chat.username === undefined ? undefined : `@${chat.username}`,
+    chat.model === undefined ? undefined : `🧠 ${chat.model}`,
     `ID ${chat.chatId}`,
     `${chat.count} ${t('messages')}`,
   ].filter(Boolean).join(' · ')

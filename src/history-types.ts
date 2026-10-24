@@ -56,6 +56,8 @@ export interface ChatSummary {
   count: number
   /** True while every message so far came from users outside the allow-list. */
   deniedOnly: boolean
+  /** The bound Session's model (`provider/model`), when known; added by the overview route, never stored. */
+  model?: string
 }
 
 /** Facts about a chat known when a message arrives. */

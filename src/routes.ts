@@ -6,7 +6,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type { TelegramBridge } from './bridge.ts'
+import { modelLabel, type TelegramBridge } from './bridge.ts'
 import type { ChatLog } from './chatlog.ts'
 
 /** Route prefix; the browser half calls these relative to the page. */
@@ -33,16 +33,36 @@ async function body(request: Request): Promise<Record<string, unknown>> {
  * Register the viewer's routes on the Host connection.
  * @param ctx - a context with `connection` injected; registrations are its effects.
  * @param log - the chat history.
- * @param bridge - the running bridge, for its connection state.
+ * @param bridge - the running bridge, for its connection state and Session models.
+ * @param models - the Host's model catalog, for the settings page's model picker.
  */
-export function registerHistoryRoutes(ctx: Context, log: ChatLog, bridge: TelegramBridge): void {
+export function registerHistoryRoutes(ctx: Context, log: ChatLog, bridge: TelegramBridge, models: () => Promise<unknown>): void {
   const fetchRoutes = ctx.connection.fetch
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/overview`,
     methods: ['POST'],
     requestBody: 'buffered',
-    fetch: async () => json({ state: bridge.state, chats: await log.chats() }),
+    fetch: async () => {
+      const chats = (await log.chats()).map((chat) => {
+        const model = chat.sessionId === undefined ? undefined : bridge.modelOf(chat.sessionId)
+        return model === undefined ? chat : { ...chat, model: modelLabel(model) }
+      })
+      return json({ state: bridge.state, chats })
+    },
   }), 'telegram-bridge: overview route')
+
+  ctx.effect(() => fetchRoutes.register({
+    path: `${API_PREFIX}/models`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        return json(await models())
+      } catch (error: unknown) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 503)
+      }
+    },
+  }), 'telegram-bridge: models route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/history`,

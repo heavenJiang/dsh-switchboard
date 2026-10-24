@@ -441,3 +441,19 @@
 }
 
 .tgb-container { container: tgb / inline-size; height: 100%; min-height: 0; }
+
+/* Native select used by the settings page's model picker. */
+.tgb-select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.tgb-select:focus { outline: none; border-color: var(--dsw-alias-label-secondary); }
+.tgb-select:disabled { color: var(--dsw-alias-label-tertiary); }

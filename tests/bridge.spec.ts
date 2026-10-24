@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BindingStore } from '../src/bindings.ts'
 import { ChatLog } from '../src/chatlog.ts'
-import { TelegramBridge, type BridgeSettings, type HarnessPort, type PromptPart, type StagedFileInput } from '../src/bridge.ts'
+import { TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type PromptPart, type StagedFileInput } from '../src/bridge.ts'
 import type { TgUpdate } from '../src/telegram.ts'
 
 const USER = { id: 42, is_bot: false, first_name: 'Ann', username: 'ann' }
@@ -73,13 +73,34 @@ class FakeTelegram {
 class FakeHarness implements HarnessPort {
   readonly prompts: { sessionId: string; parts: readonly PromptPart[]; mode: string }[] = []
   readonly staged: (Omit<StagedFileInput, 'data'> & { sessionId: string; bytes: number })[] = []
-  readonly created: { cwd: string; agentPreset: string; permissionPreset: string }[] = []
+  readonly created: { cwd: string; agentPreset: string; permissionPreset: string; model?: ModelChoice }[] = []
+  readonly selected: { sessionId: string; choice: ModelChoice }[] = []
+  /** Sessions currently loaded, with their model. */
+  readonly loaded = new Map<string, ModelChoice>()
   readonly cancelled: string[] = []
   running = false
 
-  async createSession(cwd: string, agentPreset: string, permissionPreset: string): Promise<string> {
-    this.created.push({ cwd, agentPreset, permissionPreset })
+  async createSession(cwd: string, agentPreset: string, permissionPreset: string, model?: ModelChoice): Promise<string> {
+    this.created.push({ cwd, agentPreset, permissionPreset, ...(model === undefined ? {} : { model }) })
     return `s${this.created.length}`
+  }
+  async listModels() {
+    return {
+      default: { provider: 'local', model: 'small' },
+      groups: [
+        { provider: 'local', name: 'Local', models: [{ id: 'small', name: 'Small' }, { id: 'qwen-large', name: 'Qwen Large' }] },
+        { provider: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }, { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' }] },
+      ],
+    }
+  }
+  currentModel(sessionId: string): ModelChoice | undefined {
+    return this.loaded.get(sessionId)
+  }
+  async selectModel(sessionId: string, choice: ModelChoice): Promise<boolean> {
+    this.selected.push({ sessionId, choice })
+    if (!this.loaded.has(sessionId)) return false
+    this.loaded.set(sessionId, choice)
+    return true
   }
   async prompt(sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void> {
     this.prompts.push({ sessionId, parts, mode })
@@ -407,5 +428,58 @@ describe('chat history', () => {
     await chatLog.settled()
     const approval = (await chatLog.history(CHAT.id, undefined, 10)).entries.find(e => e.kind === 'approval')
     expect(approval).toMatchObject({ text: 'writes outside the workspace', approval: { tool: 'bash', outcome: 'rejected', by: '@ann' } })
+  })
+})
+
+describe('models', () => {
+  it('pins the configured model on Sessions the bot creates', async () => {
+    settings = { ...settings, model: { provider: 'deepseek', model: 'deepseek-chat' } }
+    telegram.push(text(USER, 'hello'))
+    await until(() => harness.created.length === 1)
+    expect(harness.created[0]?.model).toEqual({ provider: 'deepseek', model: 'deepseek-chat' })
+  })
+
+  it('lists models as buttons and switches the live Session from a press', async () => {
+    await store.update(CHAT.id, { sessionId: 's1' })
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    telegram.push(text(USER, '/model'))
+    await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
+    const picker = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!
+    expect(String(picker.params['text'])).toContain('local/small')
+    const rows = (picker.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard
+    expect(rows.map(row => row[0]!.text)).toEqual(['✓ Small · Local', 'Qwen Large · Local', 'DeepSeek Chat · DeepSeek', 'DeepSeek Reasoner · DeepSeek'])
+    expect(rows.every(row => Buffer.byteLength(row[0]!.callback_data) <= 64)).toBe(true)
+    telegram.push({ callback_query: { id: 'q', from: USER, message: { message_id: 1, chat: CHAT, date: 0 }, data: rows[3]![0]!.callback_data } })
+    await until(() => harness.selected.length === 1)
+    expect(harness.loaded.get('s1')).toEqual({ provider: 'deepseek', model: 'deepseek-reasoner' })
+    await until(() => telegram.sent().some(t => t.includes('deepseek/deepseek-reasoner')))
+  })
+
+  it('matches /model <name> and defers the choice for a cold Session', async () => {
+    await store.update(CHAT.id, { sessionId: 's2' })
+    telegram.push(text(USER, '/model qwen'))
+    await until(() => harness.selected.length === 1)
+    expect(harness.selected[0]).toEqual({ sessionId: 's2', choice: { provider: 'local', model: 'qwen-large' } })
+    expect(bridge.modelOf('s2')).toEqual({ provider: 'local', model: 'qwen-large' })
+    expect(bridge.takePendingModel('s2')).toEqual({ provider: 'local', model: 'qwen-large' })
+    expect(bridge.takePendingModel('s2')).toBeUndefined()
+  })
+
+  it('asks for detail when several models match, and reports unknown names', async () => {
+    await store.update(CHAT.id, { sessionId: 's3' })
+    telegram.push(text(USER, '/model deepseek'))
+    telegram.push(text(USER, '/model gpt-9'))
+    await until(() => telegram.sent().length === 2)
+    expect(telegram.sent()[0]).toContain('DeepSeek Chat (deepseek/deepseek-chat)')
+    expect(telegram.sent()[1]).toContain('gpt-9')
+    expect(harness.selected).toEqual([])
+  })
+
+  it('shows the model in /status', async () => {
+    await store.update(CHAT.id, { sessionId: 's4' })
+    harness.loaded.set('s4', { provider: 'local', model: 'small', reasoningEffort: 'high' })
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().length === 1)
+    expect(telegram.sent()[0]).toContain('local/small (high)')
   })
 })

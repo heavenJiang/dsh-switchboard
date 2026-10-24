@@ -31,6 +31,7 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 | `/sessions` | Recent Sessions |
 | `/stop` | Stop current work |
 | `/steer <text>` | Steer the running turn |
+| `/model [name]` | List models as buttons, or switch the current Session's model |
 | `/status` | Session, directory, and run state |
 | `/whoami` | Your user and chat id (available to anyone) |
 | other `/xxx` | Passed to the Agent verbatim (e.g. `/plan …`, skills) |
@@ -42,6 +43,10 @@ Assistant text, tool-call lines (optional), and failure/stop notices are posted 
 Photos, documents, videos, audio, voice notes, video notes, and static stickers sent to the bot are downloaded and staged into the Session through `ctx.fileUploads`, the Web composer's attachment path. Images (detected by their bytes) go through the image channel so the model sees them; everything else arrives as a file. Captions become the prompt text, and an album becomes one prompt. The public Bot API serves files up to 20 MB; use a self-hosted Bot API server for larger ones.
 
 Files the Agent hands over with the `present` tool are sent back: common images inline, everything else as a document (up to Telegram's 50 MB).
+
+## Models
+
+Precedence: a `/model` choice for the chat's Session (buttons, or `/model <name>` with fuzzy matching; applied when a cold Session next loads) > the plugin page's **Bot default model** for Sessions the bot creates (optionally with a reasoning effort) > the Web default model. Neither bot setting changes the Web default; the plugin records the choice on the Session itself. `/status` and the history panel header show the Session's model.
 
 ## Chat history in the Web UI
 

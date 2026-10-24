@@ -28,7 +28,7 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import {
   SettingsForm, SettingsSecretField, SettingsValueField, Switch,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { useState, useSyncExternalStore, type CSSProperties } from 'react'
+import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
 import panelCss from './panel.css'
 import { PlaneIcon, createTelegramPanel } from './TelegramPanel.tsx'
@@ -64,7 +64,19 @@ interface BridgeValues {
   maxDownloadMb?: number
   sendDeliverables?: boolean
   historyLimit?: number
+  modelProvider?: string
+  model?: string
+  reasoningEffort?: string
 }
+
+/** The Host model catalog as the models route returns it. */
+interface Catalog {
+  default: { provider: string; model: string; reasoningEffort?: string }
+  groups: { id: string; name: string; models: { id: string; name: string; reasoning?: { efforts: { id: string; name: string }[]; defaultEffort?: string } }[] }[]
+}
+
+/** A staged model choice; `undefined` provider follows the Web default. */
+interface ModelDraft { provider?: string; model?: string; effort?: string }
 
 type TextField = 'allowedUsers' | 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec' | 'maxDownloadMb' | 'historyLimit' | 'apiBaseUrl'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
@@ -193,6 +205,52 @@ function tokenConfigured(describe: SettingsDescribeFace): boolean {
 }
 
 /** Whether the user layer stores a field (what marks it overridden). */
+/** The bot's default model: follow the Web default, or pin one catalog model and optional effort. */
+function ModelPicker(props: {
+  t: (key: TelegramBridgeLocaleKey) => string
+  catalog: Catalog | undefined
+  value: ModelDraft
+  disabled: boolean
+  onChange: (next: ModelDraft) => void
+}) {
+  const { t, catalog, value } = props
+  const key = (provider: string, model: string): string => `${provider}\u0000${model}`
+  const selected = value.provider !== undefined && value.model !== undefined ? key(value.provider, value.model) : ''
+  const entry = catalog?.groups.find(g => g.id === value.provider)?.models.find(m => m.id === value.model)
+  const listed = selected === '' || entry !== undefined
+  const efforts = entry?.reasoning?.efforts ?? []
+  const fallback = catalog === undefined ? '' : `${catalog.default.provider}/${catalog.default.model}`
+  return (
+    <div style={styles.feature}>
+      <label style={{ ...styles.toggle, fontWeight: 500 }} htmlFor="plugin-config-telegram-model">{t('botModel')}</label>
+      <select id="plugin-config-telegram-model" className="tgb-select" disabled={props.disabled || catalog === undefined} value={selected}
+        onChange={(event) => {
+          const [provider, model] = event.target.value.split('\u0000')
+          props.onChange(provider === undefined || model === undefined || event.target.value === '' ? {} : { provider, model })
+        }}>
+        <option value="">{catalog === undefined ? t('loading') : `${t('followWebDefault')}${fallback === '' ? '' : ` (${fallback})`}`}</option>
+        {!listed && <option value={selected}>{`${t('modelUnavailable')} ${value.provider}/${value.model}`}</option>}
+        {catalog?.groups.map(group => (
+          <optgroup key={group.id} label={group.name}>
+            {group.models.map(model => <option key={model.id} value={key(group.id, model.id)}>{model.name}</option>)}
+          </optgroup>
+        ))}
+      </select>
+      {efforts.length > 0 && (
+        <select className="tgb-select" aria-label={t('reasoningEffort')} disabled={props.disabled} value={value.effort ?? ''}
+          onChange={(event) => {
+            const { effort: _drop, ...rest } = value
+            props.onChange(event.target.value === '' ? rest : { ...rest, effort: event.target.value })
+          }}>
+          <option value="">{t('effortDefault')}{entry?.reasoning?.defaultEffort === undefined ? '' : ` (${entry.reasoning.defaultEffort})`}</option>
+          {efforts.map(effort => <option key={effort.id} value={effort.id}>{t('reasoningEffort')}: {effort.name}</option>)}
+        </select>
+      )}
+      <p style={styles.hint}>{t('botModelHint')}</p>
+    </div>
+  )
+}
+
 function userHas(user: unknown, field: string): boolean {
   return user !== null && typeof user === 'object' && Object.hasOwn(user, field)
 }
@@ -212,6 +270,16 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     const [token, setToken] = useState('')
     const [saving, setSaving] = useState(false)
     const [failed, setFailed] = useState(false)
+    const [modelDraft, setModelDraft] = useState<ModelDraft | undefined>(undefined)
+    const [catalog, setCatalog] = useState<Catalog | undefined>(undefined)
+    useEffect(() => {
+      if (props.view !== 'page') return
+      let live = true
+      void fetch('api/telegram-bridge/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+        .then(async response => response.ok ? await response.json() as Catalog : undefined)
+        .then((value) => { if (live && value?.groups !== undefined) setCatalog(value) }, () => {})
+      return () => { live = false }
+    }, [props.view])
 
     if (props.view === 'summary') return <>{t('summary')}</>
 
@@ -237,7 +305,11 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     }
 
     const invalid = (Object.keys(TEXT_FIELDS) as TextField[]).some(field => textState(field).invalid)
-    const dirty = Object.keys(drafts).length > 0 || token.trim() !== ''
+    const dirty = Object.keys(drafts).length > 0 || token.trim() !== '' || modelDraft !== undefined
+    const stored: ModelDraft = values.modelProvider && values.model
+      ? { provider: values.modelProvider, model: values.model, ...(values.reasoningEffort ? { effort: values.reasoningEffort } : {}) }
+      : {}
+    const shownModel = modelDraft ?? stored
     const disabled = !snapshot.writable || saving
 
     const save = (): void => {
@@ -254,12 +326,24 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         }
       }
       if (token.trim() !== '') list.push({ op: 'set', path: ['botToken'], value: token.trim() })
+      if (modelDraft !== undefined) {
+        if (modelDraft.provider === undefined || modelDraft.model === undefined) {
+          for (const field of ['modelProvider', 'model', 'reasoningEffort']) list.push({ op: 'unset', path: [field] })
+        } else {
+          list.push({ op: 'set', path: ['modelProvider'], value: modelDraft.provider })
+          list.push({ op: 'set', path: ['model'], value: modelDraft.model })
+          list.push(modelDraft.effort === undefined
+            ? { op: 'unset', path: ['reasoningEffort'] }
+            : { op: 'set', path: ['reasoningEffort'], value: modelDraft.effort })
+        }
+      }
       if (list.length === 0) return
       setSaving(true)
       form.mutate(list, snapshot.revision).then((accepted) => {
         if (accepted) {
           setDrafts({})
           setToken('')
+          setModelDraft(undefined)
         }
         setFailed(!accepted)
       }, () => { setFailed(true) }).finally(() => { setSaving(false) })
@@ -296,7 +380,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         labels={{ unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') }}
         state={{ available: snapshot.status !== 'unavailable', writable: snapshot.writable, dirty, invalid, saving, failed }}
         onSave={save}
-        onDiscard={() => { setDrafts({}); setToken('') }}
+        onDiscard={() => { setDrafts({}); setToken(''); setModelDraft(undefined) }}
       >
         {toggle('enabled')}
         <SettingsSecretField
@@ -311,6 +395,8 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         />
         {valueField('allowedUsers', 'allowed-users', { placeholder: '123456789, @alice' })}
         {valueField('workspacePath', 'workspace', { placeholder: '/Users/me/projects/app' })}
+        <ModelPicker t={t} catalog={catalog} value={shownModel} disabled={disabled}
+          onChange={(next) => { setFailed(false); setModelDraft(next) }} />
         {valueField('agentPreset', 'agent-preset')}
         {valueField('permissionPreset', 'permission-preset')}
         {toggle('approvalViaTelegram')}

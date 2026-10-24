@@ -14,6 +14,7 @@ const zh = {
     '/sessions — 最近的会话',
     '/stop — 中止当前会话正在进行的工作',
     '/steer <文字> — 在当前轮次中途插话引导',
+    '/model [模型名] — 查看或切换当前会话的模型（不影响 Web 默认）',
     '/status — 查看当前会话与机器人状态',
     '/whoami — 查看你的 Telegram 用户 ID',
   ].join('\n'),
@@ -30,9 +31,10 @@ const zh = {
   stopped: '已请求中止。',
   notRunning: '当前会话空闲。',
   sessions: (lines: string[]) => lines.length === 0 ? '没有会话。' : `最近的会话：\n${lines.join('\n')}`,
-  status: (s: { session?: string; cwd?: string; running?: boolean; bot: string }) => [
+  status: (s: { session?: string; cwd?: string; running?: boolean; bot: string; model?: string }) => [
     `机器人：${s.bot}`,
     `会话：${s.session ?? '（无）'}`,
+    ...(s.model === undefined ? [] : [`模型：${s.model}`]),
     ...(s.cwd === undefined ? [] : [`工作目录：${s.cwd}`]),
     ...(s.running === undefined ? [] : [`状态：${s.running ? '运行中' : '空闲'}`]),
   ].join('\n'),
@@ -57,7 +59,14 @@ const zh = {
   approvalTimedOut: '审批超时，已交回 Harness 其他审批渠道。',
   approvalCancelled: '审批已撤回。',
   approvalGone: '这个审批已经结束。',
-  cmdNew: '新建会话', cmdStop: '中止当前工作', cmdStatus: '查看状态', cmdHelp: '帮助',
+  cmdNew: '新建会话', cmdStop: '中止当前工作', cmdStatus: '查看状态', cmdHelp: '帮助', cmdModel: '切换模型',
+  modelNoSession: '当前没有会话。先发一条消息新建会话，再用 /model 切换；也可以在插件页设置机器人默认模型。',
+  modelList: (current: string | undefined, count: number) => `当前模型：${current ?? '（会话未加载，下一条消息时确定）'}\n点击下方按钮切换当前会话的模型（共 ${count} 个；也可以发送 /model 模型名）。只影响这个会话，不改变 Web 默认模型。`,
+  modelSwitched: (name: string, label: string) => `已切换到 ${name}（${label}），仅对当前会话生效。`,
+  modelPending: (name: string, label: string) => `会话当前未加载，下一条消息时切换到 ${name}（${label}）。`,
+  modelNotFound: (query: string) => `没有找到模型「${query}」。发送 /model 查看可用模型。`,
+  modelAmbiguous: (names: string[]) => `匹配到多个模型，请写得更具体：\n${names.join('\n')}`,
+  modelPickerExpired: '这个模型列表已过期，请重新发送 /model。',
 }
 
 const en: typeof zh = {
@@ -71,6 +80,7 @@ const en: typeof zh = {
     '/sessions — recent Sessions',
     '/stop — stop the current Session\'s work',
     '/steer <text> — steer the running turn',
+    '/model [name] — show or switch the current Session\'s model (the Web default is untouched)',
     '/status — Session and bot status',
     '/whoami — your Telegram user id',
   ].join('\n'),
@@ -87,9 +97,10 @@ const en: typeof zh = {
   stopped: 'Stop requested.',
   notRunning: 'The Session is idle.',
   sessions: (lines: string[]) => lines.length === 0 ? 'No Sessions.' : `Recent Sessions:\n${lines.join('\n')}`,
-  status: (s: { session?: string; cwd?: string; running?: boolean; bot: string }) => [
+  status: (s: { session?: string; cwd?: string; running?: boolean; bot: string; model?: string }) => [
     `Bot: ${s.bot}`,
     `Session: ${s.session ?? '(none)'}`,
+    ...(s.model === undefined ? [] : [`Model: ${s.model}`]),
     ...(s.cwd === undefined ? [] : [`Directory: ${s.cwd}`]),
     ...(s.running === undefined ? [] : [`State: ${s.running ? 'running' : 'idle'}`]),
   ].join('\n'),
@@ -114,7 +125,14 @@ const en: typeof zh = {
   approvalTimedOut: 'Approval timed out; handed back to the other Harness approval channels.',
   approvalCancelled: 'Approval withdrawn.',
   approvalGone: 'This approval is already settled.',
-  cmdNew: 'New Session', cmdStop: 'Stop current work', cmdStatus: 'Status', cmdHelp: 'Help',
+  cmdNew: 'New Session', cmdStop: 'Stop current work', cmdStatus: 'Status', cmdHelp: 'Help', cmdModel: 'Switch model',
+  modelNoSession: 'No Session yet. Send a message to start one, then use /model; or set the bot\'s default model on the plugin page.',
+  modelList: (current: string | undefined, count: number) => `Current model: ${current ?? '(Session not loaded; decided on the next message)'}\nTap a button to switch this Session's model (${count} available; or send /model <name>). Only this Session changes; the Web default stays.`,
+  modelSwitched: (name: string, label: string) => `Switched to ${name} (${label}) for this Session only.`,
+  modelPending: (name: string, label: string) => `The Session is not loaded; it switches to ${name} (${label}) on the next message.`,
+  modelNotFound: (query: string) => `No model matches "${query}". Send /model to see the list.`,
+  modelAmbiguous: (names: string[]) => `Several models match; be more specific:\n${names.join('\n')}`,
+  modelPickerExpired: 'This model list expired; send /model again.',
 }
 
 /** Reply copy by language. */
