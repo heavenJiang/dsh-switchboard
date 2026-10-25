@@ -29,18 +29,18 @@ export function parseInput(text: string, botUsername?: string): ParsedInput | un
 }
 
 /**
- * Whether a Telegram user may drive the harness. An empty list admits no one:
- * the bridge runs tools on this machine, so access is opt-in per user id.
- * @param allowed - configured user ids (numeric strings; `@username` entries also match).
+ * Whether a user may drive the harness. An empty list admits no one: the
+ * bridge runs tools on this machine, so access is opt-in per user id.
+ * @param allowed - configured user ids (`@username` entries also match on Telegram).
  * @param userId - sender id.
  * @param username - sender username, when set.
  */
-export function isAllowed(allowed: readonly string[], userId: number, username?: string): boolean {
+export function isAllowed(allowed: readonly string[], userId: string | number, username?: string): boolean {
   const id = String(userId)
   const handle = username === undefined ? undefined : `@${username.toLowerCase()}`
   return allowed.some((entry) => {
     const value = entry.trim().toLowerCase()
-    return value === id || (handle !== undefined && value === handle)
+    return value === id.toLowerCase() || (handle !== undefined && value === handle)
   })
 }
 

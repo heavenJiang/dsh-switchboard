@@ -1,6 +1,6 @@
 /**
- * Switchboard browser half: the sidebar panel showing Telegram
- * conversation history (see TelegramPanel.tsx), the Session tab, and the settings page.
+ * Switchboard browser half: the sidebar panel showing the chat history of
+ * every line (see TelegramPanel.tsx), the Session tab, and the settings page.
  *
  * Settings page: Registers the bundle's own
  * configuration into the Plugins page's `plugins.bundle.config` slot while
@@ -9,10 +9,12 @@
  * revision-fenced, Host-validated profile patch write that the running
  * bridge picks up without a restart.
  *
- * The bot token goes to the Host credentials store under `botTokenRef`
- * (default `TELEGRAM_BOT_TOKEN`), never into the profile file; a legacy
- * literal `botToken` is cleared once the store accepts the token. The page
- * only learns whether a token is set, and a blank draft keeps it.
+ * Each line's secret (Telegram bot token, Feishu app secret) goes to the Host
+ * credentials store under the line's `secretRef`, never into the profile
+ * file; a legacy literal `botToken` is cleared once the store accepts a new
+ * token for the Telegram line. The page only learns whether a secret is set,
+ * and a blank draft keeps it. A profile from before lines shows its Telegram
+ * fields as one line, written to `lines` on the next save.
  */
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
@@ -29,11 +31,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 // Type-only: the conversation.view slot the Session tab registers into.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import {
-  SettingsForm, SettingsSecretField, SettingsValueField, Switch,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+import { SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
+import { LinesEditor, lineOf, rowOf, rowsValid, type LineRow, type LineState, type LineValue } from './LinesEditor.tsx'
 import panelCss from './panel.css'
 import { ConsoleIcon, createTelegramPanel } from './TelegramPanel.tsx'
 import { remotes, trackRemotes } from './remotes.ts'
@@ -60,6 +61,7 @@ const PANEL_ID = 'switchboard' as MainPanelId
 /** The Config fields this page edits, as the Host resolves them (the token is redacted). */
 interface BridgeValues {
   enabled?: boolean
+  lines?: LineValue[]
   allowedUsers?: string[]
   workspacePath?: string
   agentPreset?: string
@@ -100,11 +102,11 @@ interface Catalog {
 /** A staged model choice; `undefined` provider follows the Web default. */
 interface ModelDraft { provider?: string; model?: string; effort?: string }
 
-type TextField = 'allowedUsers' | 'allowedChats' | 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
-  | 'maxDownloadMb' | 'historyLimit' | 'apiBaseUrl' | 'botTokenRef' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
+type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
+  | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
   | 'scheduleChats' | 'ffmpegPath'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
-  | 'groupMentionOnly' | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
+  | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
 /** A comma- or space-separated list field. */
 const listField = (read: (v: BridgeValues) => string[] | undefined) => ({
@@ -120,15 +122,9 @@ const intField = (read: (v: BridgeValues) => number | undefined, min: number, ma
 
 /** How a text field renders and parses; `undefined` from parse marks the draft invalid. */
 const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; parse: (text: string) => string | string[] | number | undefined }> = {
-  allowedUsers: listField(v => v.allowedUsers),
-  allowedChats: listField(v => v.allowedChats),
   scheduleChats: listField(v => v.scheduleChats),
   turnSummaryMinSec: intField(v => v.turnSummaryMinSec, 0, 86400),
   turnSummary: { format: v => v.turnSummary ?? 'long', parse: text => ['off', 'long', 'always'].includes(text) ? text : undefined },
-  botTokenRef: {
-    format: v => v.botTokenRef ?? '',
-    parse: text => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(text.trim()) ? text.trim() : undefined,
-  },
   channelPromptText: { format: v => v.channelPromptText ?? '', parse: text => text.trim() },
   ffmpegPath: { format: v => v.ffmpegPath ?? '', parse: text => text.trim() === '' ? undefined : text.trim() },
   workspacePath: {
@@ -159,10 +155,6 @@ const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; pars
       return Number.isInteger(n) && n >= 100 && n <= 100000 ? n : undefined
     },
   },
-  apiBaseUrl: {
-    format: v => v.apiBaseUrl ?? '',
-    parse: text => /^https?:\/\/\S+$/u.test(text.trim()) ? text.trim().replace(/\/+$/u, '') : undefined,
-  },
 }
 
 /** A toggle's Config field and how its boolean maps to the stored value. */
@@ -172,7 +164,6 @@ const TOGGLES: Record<ToggleField, { field: keyof BridgeValues; read: (v: Bridge
   notifyToolCalls: { field: 'notifyToolCalls', read: v => v.notifyToolCalls ?? true, write: on => on },
   sendDeliverables: { field: 'sendDeliverables', read: v => v.sendDeliverables ?? true, write: on => on },
   englishReplies: { field: 'language', read: v => v.language === 'en', write: on => on ? 'en' : 'zh' },
-  groupMentionOnly: { field: 'groupMentionOnly', read: v => v.groupMentionOnly ?? true, write: on => on },
   channelPrompt: { field: 'channelPrompt', read: v => v.channelPrompt ?? true, write: on => on },
   streamReplies: { field: 'streamReplies', read: v => v.streamReplies ?? true, write: on => on },
   transcribeVoice: { field: 'transcribeVoice', read: v => v.transcribeVoice ?? true, write: on => on },
@@ -183,6 +174,8 @@ const TOGGLES: Record<ToggleField, { field: keyof BridgeValues; read: (v: Bridge
 
 /** One path edit of the shared form's atomic write. */
 type PathOp = Parameters<ConfigForm<BridgeValues>['mutate']>[0][number]
+/** A value one path edit sets. */
+type PathValue = Extract<PathOp, { op: 'set' }>['value']
 
 /** One staged edit. */
 type Draft = { kind: 'text'; text: string } | { kind: 'toggle'; on: boolean } | { kind: 'reset' }
@@ -285,6 +278,22 @@ function whileOn(form: ConfigForm<BridgeValues>, field: 'showPanel' | 'showSessi
   }
 }
 
+/** The line a profile from before lines describes with its Telegram fields. */
+function legacyLine(v: BridgeValues): LineValue {
+  return {
+    id: 'telegram', type: 'telegram', name: '', enabled: true,
+    secretRef: (v.botTokenRef ?? '').trim() || 'TELEGRAM_BOT_TOKEN',
+    allowedUsers: v.allowedUsers ?? [], allowedChats: v.allowedChats ?? [],
+    groupMentionOnly: v.groupMentionOnly ?? true, workspacePath: '',
+    apiBaseUrl: v.apiBaseUrl ?? 'https://api.telegram.org', appId: '', domain: 'feishu',
+  }
+}
+
+/** The stored lines, or the legacy Telegram line. */
+function storedLines(v: BridgeValues): LineValue[] {
+  return v.lines !== undefined && v.lines.length > 0 ? v.lines : [legacyLine(v)]
+}
+
 /** Whether the Host reports a stored bot token. */
 function tokenConfigured(describe: SettingsDescribeFace): boolean {
   const view = describe.getSnapshot().view?.namespaces.find(entry => entry.ns === ENTRY)
@@ -373,20 +382,36 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     const { t } = props
     const snapshot = useSyncExternalStore(form.subscribe.bind(form), form.getSnapshot.bind(form))
     const literalToken = useSyncExternalStore(describe.subscribe.bind(describe), () => tokenConfigured(describe))
-    const tokenRef = (snapshot.value?.botTokenRef ?? 'TELEGRAM_BOT_TOKEN').trim() || 'TELEGRAM_BOT_TOKEN'
-    const [credential, setCredential] = useState<{ ref: string; configured: boolean } | undefined>(undefined)
+    const [lineRows, setLineRows] = useState<LineRow[] | undefined>(undefined)
+    const rows = lineRows ?? storedLines(snapshot.value ?? {}).map(rowOf)
+    const refs = [...new Set(rows.map(row => row.value.secretRef.trim()).filter(ref => ref !== ''))]
+    const [storedRefs, setStoredRefs] = useState<Record<string, boolean>>({})
     const [credentialTick, setCredentialTick] = useState(0)
+    useEffect(() => {
+      if (props.view !== 'page' || refs.length === 0) return
+      let live = true
+      void remotes.credentials?.describe(refs).then((answer) => {
+        if (live && answer.ok) setStoredRefs(Object.fromEntries(refs.map(ref => [ref, answer.value[ref]?.configured ?? false])))
+      }, () => {})
+      return () => { live = false }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [props.view, refs.join('\n'), credentialTick])
+    const configured = Object.fromEntries(rows.map(row => [row.value.id,
+      storedRefs[row.value.secretRef.trim()] === true || (row.value.id === 'telegram' && literalToken)]))
+    const [lineStates, setLineStates] = useState<Record<string, LineState>>({})
     useEffect(() => {
       if (props.view !== 'page') return
       let live = true
-      void remotes.credentials?.describe([tokenRef]).then((answer) => {
-        if (live && answer.ok) setCredential({ ref: tokenRef, configured: answer.value[tokenRef]?.configured ?? false })
-      }, () => {})
-      return () => { live = false }
-    }, [props.view, tokenRef, credentialTick])
-    const configured = literalToken || (credential?.ref === tokenRef && credential.configured)
+      const poll = (): void => {
+        void fetch('api/switchboard/overview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+          .then(async response => response.ok ? await response.json() as { lines?: { id: string; state: LineState }[] } : undefined)
+          .then((value) => { if (live && value?.lines !== undefined) setLineStates(Object.fromEntries(value.lines.map(line => [line.id, line.state]))) }, () => {})
+      }
+      poll()
+      const timer = setInterval(poll, 5000)
+      return () => { live = false; clearInterval(timer) }
+    }, [props.view])
     const [drafts, setDrafts] = useState<Partial<Record<TextField | ToggleField, Draft>>>({})
-    const [token, setToken] = useState('')
     const [saving, setSaving] = useState(false)
     const [failed, setFailed] = useState(false)
     const [modelDraft, setModelDraft] = useState<ModelDraft | undefined>(undefined)
@@ -424,7 +449,8 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     }
 
     const invalid = (Object.keys(TEXT_FIELDS) as TextField[]).some(field => textState(field).invalid)
-    const dirty = Object.keys(drafts).length > 0 || token.trim() !== '' || modelDraft !== undefined
+      || (lineRows !== undefined && !rowsValid(lineRows))
+    const dirty = Object.keys(drafts).length > 0 || lineRows !== undefined || modelDraft !== undefined
     const stored: ModelDraft = values.modelProvider && values.model
       ? { provider: values.modelProvider, model: values.model, ...(values.reasoningEffort ? { effort: values.reasoningEffort } : {}) }
       : {}
@@ -444,10 +470,17 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
           list.push({ op: 'set', path: [key], value: TEXT_FIELDS[key as TextField].parse(draft.text) ?? '' })
         }
       }
-      // Prefer the credentials store; only a client without it falls back to the literal field.
-      const storeToken = token.trim() !== '' && remotes.credentials !== undefined
-      if (token.trim() !== '' && !storeToken) list.push({ op: 'set', path: ['botToken'], value: token.trim() })
-      if (storeToken && literalToken) list.push({ op: 'unset', path: ['botToken'] })
+      if (lineRows !== undefined) list.push({ op: 'set', path: ['lines'], value: lineRows.map(lineOf) as unknown as PathValue })
+      // Secrets go to the credentials store; only a client without it falls back to the legacy literal token.
+      const secrets = (lineRows ?? []).filter(row => row.secret.trim() !== '')
+      const credentials = remotes.credentials
+      if (credentials === undefined) {
+        const telegram = secrets.find(row => row.value.id === 'telegram')
+        if (telegram !== undefined) list.push({ op: 'set', path: ['botToken'], value: telegram.secret.trim() })
+      } else if (literalToken && secrets.some(row => row.value.id === 'telegram')) {
+        list.push({ op: 'unset', path: ['botToken'] })
+      }
+      const storeSecrets = credentials !== undefined && secrets.length > 0
       if (modelDraft !== undefined) {
         if (modelDraft.provider === undefined || modelDraft.model === undefined) {
           for (const field of ['modelProvider', 'model', 'reasoningEffort']) list.push({ op: 'unset', path: [field] })
@@ -459,19 +492,21 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
             : { op: 'set', path: ['reasoningEffort'], value: modelDraft.effort })
         }
       }
-      if (list.length === 0 && !storeToken) return
+      if (list.length === 0 && !storeSecrets) return
       setSaving(true)
-      const credentialWrite = storeToken
-        ? remotes.credentials!.set(tokenRef, token.trim()).then(answer => answer.ok)
+      const credentialWrite = storeSecrets
+        ? secrets.reduce<Promise<boolean>>((done, row) => done.then(ok => ok
+          ? credentials.set(row.value.secretRef.trim(), row.secret.trim()).then(answer => answer.ok)
+          : false), Promise.resolve(true))
         : Promise.resolve(true)
-      // The literal field is cleared only after the store accepted the token.
+      // The profile changes only after the store accepted every secret.
       credentialWrite.then(stored => stored
         ? (list.length === 0 ? Promise.resolve(true) : form.mutate(list, snapshot.revision))
         : false).then((accepted) => {
         setCredentialTick(n => n + 1)
         if (accepted) {
           setDrafts({})
-          setToken('')
+          setLineRows(undefined)
           setModelDraft(undefined)
         }
         setFailed(!accepted)
@@ -511,28 +546,15 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         labels={{ unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') }}
         state={{ available: snapshot.status !== 'unavailable', writable: snapshot.writable, dirty, invalid, saving, failed }}
         onSave={save}
-        onDiscard={() => { setDrafts({}); setToken(''); setModelDraft(undefined) }}
+        onDiscard={() => { setDrafts({}); setLineRows(undefined); setModelDraft(undefined) }}
       >
-        <h3 style={styles.firstSection}>{t('groupConnection')}</h3>
+        <h3 style={styles.firstSection}>{t('groupGeneral')}</h3>
         {toggle('enabled')}
-        <SettingsSecretField
-          id="plugin-config-telegram-token"
-          label={t('botToken')}
-          hint={t('botTokenHint')}
-          disabled={disabled}
-          text={token}
-          configured={configured}
-          stateLabel={configured ? t('botTokenSet') : t('botTokenUnset')}
-          onEdit={(text) => { setFailed(false); setToken(text) }}
-        />
-        {valueField('botTokenRef', 'token-ref', { placeholder: 'TELEGRAM_BOT_TOKEN' })}
-        {valueField('apiBaseUrl', 'api-base-url')}
         {toggle('englishReplies')}
 
-        <h3 style={styles.section}>{t('groupAccess')}</h3>
-        {valueField('allowedUsers', 'allowed-users', { placeholder: '123456789, @alice' })}
-        {valueField('allowedChats', 'allowed-chats', { placeholder: '-1001234567890' })}
-        {toggle('groupMentionOnly')}
+        <h3 style={styles.section}>{t('groupLines')}</h3>
+        <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} disabled={disabled}
+          onChange={(next) => { setFailed(false); setLineRows(next) }} />
 
         <h3 style={styles.section}>{t('groupSession')}</h3>
         {valueField('workspacePath', 'workspace', { placeholder: '/Users/me/projects/app' })}

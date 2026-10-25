@@ -79,10 +79,12 @@ describe.skipIf(!enabled)('real Loader composition', () => {
       '/api/switchboard/session', '/api/switchboard/update-check',
     ])
     const overview = await (await routes.get('/api/switchboard/overview')!(new Request('http://x/', { method: 'POST' }))).json() as {
-      state: { kind: string }; chats: unknown[]; stats: { series: unknown[] }
+      state: { kind: string }; lines: unknown[]; chats: unknown[]; stats: { series: unknown[] }
     }
     // No token configured: the bridge stays stopped and the viewer still answers.
     expect(overview.state.kind).toBe('stopped')
+    // A profile without lines runs its Telegram fields as the legacy line.
+    expect(overview.lines).toEqual([{ id: 'telegram', type: 'telegram', name: 'Telegram', state: { kind: 'stopped' } }])
     expect(overview.chats).toEqual([])
     expect(overview.stats.series).toHaveLength(14)
   })

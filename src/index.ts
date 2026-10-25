@@ -1,11 +1,12 @@
 /**
- * Telegram bridge for DeepSeek Harness, host half.
+ * Switchboard (掌上指挥台) for DeepSeek Harness, host half.
  *
- * A Telegram bot becomes another client of the Web host: messages prompt a
- * Session through `ctx.sessionController` (the same path the Web UI uses, so
- * Telegram Sessions appear in the Web sidebar and vice versa), assistant
- * output is mirrored back to the bound chat as rendered Markdown, and tool
- * approvals can be answered with inline buttons. Photos and files are staged
+ * Bots on chat platforms — Telegram, Feishu — become other clients of the Web
+ * host, one line per bot account: messages prompt a Session through
+ * `ctx.sessionController` (the same path the Web UI uses, so chat Sessions
+ * appear in the Web sidebar and vice versa), assistant output is mirrored
+ * back to the bound chat as rendered Markdown, and tool approvals can be
+ * answered with buttons. Photos and files are staged
  * through `ctx.fileUploads` — the Web composer's attachment path — voice notes
  * are transcribed by `ctx.speechToText` when it is composed, and files the
  * Agent presents are sent back. Every user-facing setting is a volatile Config
@@ -45,33 +46,81 @@ import type {} from '@deepseek-ai/dsh-workspace-changes'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { BindingStore, defaultStateFile, migrateLegacyStateDir } from './bindings.ts'
 import {
-  TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
+  Switchboard, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
 } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { registerWebCommand } from './command.ts'
+import { LEGACY_LINE, LINE_ID, type ChannelType, type LineSettings } from './lines.ts'
 import type { BotLanguage } from './messages.ts'
 import { registerHistoryRoutes } from './routes.ts'
 import { UpdateChecker } from './updates.ts'
 
-export { TelegramBridge } from './bridge.ts'
+export { Switchboard } from './bridge.ts'
 export type { BridgeSettings, HarnessPort } from './bridge.ts'
 
 export const name = 'switchboard'
 /** The Web host's Session controller drives Sessions exactly as the Web UI does. */
 export const inject = ['agents', 'sessionController', 'permissionPresets', 'fileUploads', 'llm']
 
-/** Model-facing note for Sessions mirrored to Telegram, unless the plugin page replaces it. */
+/** Model-facing note for Sessions mirrored to a chat, unless the plugin page replaces it. */
 const CHANNEL_PROMPT = [
-  'This conversation is mirrored to the user\'s Telegram chat, usually read on a phone.',
+  'This conversation is mirrored to the user\'s chat app (such as Telegram or Feishu), usually read on a phone.',
   'Keep replies concise: short paragraphs and lists, no wide tables, at most a few lines of code inline.',
   'Hand over long output, logs, or code as files with the present tool instead of pasting them.',
   'Messages from the user may arrive as photos, files, or voice-note transcripts.',
 ].join(' ')
 
+/** One line as configured: a bot account on one platform and who may use it. */
+export interface LineConfig {
+  /** Stable key; chat keys of the line start with it. */
+  id: string
+  type: ChannelType
+  /** Display name on the Web pages; the platform's name when empty. */
+  name: string
+  enabled: boolean
+  /** Credential reference holding the Telegram bot token or the Feishu app secret. */
+  secretRef: string
+  /** User ids allowed to drive the Harness: Telegram ids or `@username`; Feishu open_id, user_id, or union_id. */
+  allowedUsers: readonly string[]
+  /** Chat ids whose every member may drive the Harness. */
+  allowedChats: readonly string[]
+  /** In groups, answer only commands, @mentions, and replies to the bot. */
+  groupMentionOnly: boolean
+  /** Working directory for this line's new Sessions; empty uses the plugin-wide one. */
+  workspacePath: string
+  /** Telegram: Bot API root. */
+  apiBaseUrl: string
+  /** Feishu: app id (`cli_…`). */
+  appId: string
+  /** Feishu: `feishu` (open.feishu.cn) or `lark` (open.larksuite.com). */
+  domain: 'feishu' | 'lark'
+}
+
+const LineConfig: Schema<LineConfig> = Schema.object({
+  id: Schema.string().pattern(LINE_ID).required(),
+  type: Schema.union(['telegram', 'feishu'] as const).default('telegram'),
+  name: Schema.string().default(''),
+  enabled: Schema.boolean().default(true),
+  secretRef: Schema.string().role('credential-ref').default(''),
+  allowedUsers: Schema.array(Schema.string()).default([]),
+  allowedChats: Schema.array(Schema.string()).default([]),
+  groupMentionOnly: Schema.boolean().default(true),
+  workspacePath: Schema.string().default(''),
+  apiBaseUrl: Schema.string().default('https://api.telegram.org'),
+  appId: Schema.string().default(''),
+  domain: Schema.union(['feishu', 'lark'] as const).default('feishu'),
+}) as unknown as Schema<LineConfig>
+
 /** Plugin configuration. Volatile fields are live-editable from the Plugins page. */
 export interface Config {
-  /** Run the bot. Turning it off stops polling without unloading the plugin. */
+  /** Run the bots. Turning it off stops every line without unloading the plugin. */
   enabled: Volatile<boolean>
+  /**
+   * Lines to run. When empty, the Telegram fields below (from releases before
+   * lines) make up one Telegram line with id `telegram`; the plugin page
+   * moves them here on its next save.
+   */
+  lines: Volatile<LineConfig[]>
   /** Literal bot token (legacy); prefer {@link botTokenRef}, which keeps the token out of the profile file. */
   botToken: Volatile<string | undefined>
   /** Credential reference holding the bot token (the credentials store, or an environment variable of that name). */
@@ -140,6 +189,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   enabled: Schema.boolean().default(true).volatile(),
+  lines: Schema.array(LineConfig).default([]).volatile(),
   botToken: Schema.string().role('secret').volatile(),
   botTokenRef: Schema.string().role('credential-ref').default('TELEGRAM_BOT_TOKEN').volatile(),
   allowedUsers: Schema.array(Schema.string()).default([]).volatile(),
@@ -240,18 +290,64 @@ export function apply(ctx: Context, config: Config): void {
     return 'agent' in resolved ? resolved.agent : undefined
   }
 
-  /** The token the bridge connects with: the literal field when set, else the credential reference. */
-  let resolvedToken: string | undefined
+  /** Configured lines; the legacy Telegram fields stand in while none is configured. */
+  const configuredLines = (): readonly Readonly<LineConfig>[] => {
+    const lines = config.lines.get()
+    if (lines.length > 0) return lines
+    return [{
+      id: LEGACY_LINE, type: 'telegram', name: '', enabled: true,
+      secretRef: config.botTokenRef.get(),
+      allowedUsers: [...config.allowedUsers.get()],
+      allowedChats: [...config.allowedChats.get()],
+      groupMentionOnly: config.groupMentionOnly.get(),
+      workspacePath: '',
+      apiBaseUrl: config.apiBaseUrl.get(),
+      appId: '', domain: 'feishu',
+    }]
+  }
+
+  /**
+   * Secrets the lines connect with, by line id: the credential reference. The
+   * legacy literal token serves the `telegram` line: first while lines are
+   * not configured (as before), afterwards only until the store holds one.
+   */
+  let secrets = new Map<string, string>()
   const refreshToken = async (): Promise<void> => {
-    const literal = config.botToken.get()?.trim()
-    if (literal !== undefined && literal !== '') {
-      resolvedToken = literal
-      return
+    const next = new Map<string, string>()
+    const literal = config.botToken.get()?.trim() || undefined
+    const legacy = config.lines.get().length === 0
+    for (const line of configuredLines()) {
+      if (line.id === LEGACY_LINE && legacy && literal !== undefined) {
+        next.set(line.id, literal)
+        continue
+      }
+      const ref = line.secretRef.trim()
+      const value = ref === '' || optional.credentials === undefined
+        ? undefined
+        : (await optional.credentials.resolve(ref as CredentialRef).catch(() => undefined))?.value
+      const secret = value || (line.id === LEGACY_LINE ? literal : undefined)
+      if (secret !== undefined) next.set(line.id, secret)
     }
-    const ref = config.botTokenRef.get().trim()
-    resolvedToken = ref === '' || optional.credentials === undefined
-      ? undefined
-      : (await optional.credentials.resolve(ref as CredentialRef).catch(() => undefined))?.value
+    secrets = next
+  }
+
+  /** A configured line as the bridge runs it. */
+  const lineSettings = (line: Readonly<LineConfig>): LineSettings => {
+    const secret = secrets.get(line.id)
+    return {
+      id: line.id,
+      type: line.type,
+      name: line.name.trim() || (line.type === 'feishu' ? (line.domain === 'lark' ? 'Lark' : '飞书') : 'Telegram'),
+      enabled: line.enabled,
+      allowedUsers: line.allowedUsers,
+      allowedChats: line.allowedChats,
+      groupMentionOnly: line.groupMentionOnly,
+      workspacePath: line.workspacePath,
+      ...(secret === undefined ? {} : { secret }),
+      ...(line.type === 'telegram'
+        ? { apiBaseUrl: line.apiBaseUrl, pollTimeoutSec: config.pollTimeoutSec }
+        : { appId: line.appId.trim(), domain: line.domain }),
+    }
   }
 
   /** The bot's own default model from config, when both route and model are set. */
@@ -286,11 +382,7 @@ export function apply(ctx: Context, config: Config): void {
     const model = configuredModel()
     return {
       enabled: config.enabled.get(),
-      botToken: resolvedToken,
-      apiBaseUrl: config.apiBaseUrl.get(),
-      allowedUsers: config.allowedUsers.get(),
-      allowedChats: config.allowedChats.get(),
-      groupMentionOnly: config.groupMentionOnly.get(),
+      lines: configuredLines().map(lineSettings),
       workspacePath: config.workspacePath.get(),
       agentPreset: config.agentPreset.get(),
       permissionPreset: config.permissionPreset.get(),
@@ -304,7 +396,6 @@ export function apply(ctx: Context, config: Config): void {
       transcribeVoice: config.transcribeVoice.get(),
       scheduleChats: config.scheduleChats.get(),
       language: config.language.get(),
-      pollTimeoutSec: config.pollTimeoutSec,
       maxDownloadMb: config.maxDownloadMb.get(),
       sendDeliverables: config.sendDeliverables.get(),
       ...(model === undefined ? {} : { model }),
@@ -490,7 +581,7 @@ export function apply(ctx: Context, config: Config): void {
   const stateFile = config.stateFile ?? defaultStateFile()
   const store = new BindingStore(stateFile)
   const chatLog = new ChatLog(join(dirname(stateFile), 'chats'), () => config.historyLimit.get())
-  const bridge = new TelegramBridge(settings, harness, store, logger, undefined, chatLog)
+  const bridge = new Switchboard(settings, harness, store, logger, {}, chatLog)
   const updates = new UpdateChecker()
 
   const restart = (): void => {
@@ -502,9 +593,9 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['credentials'], (scope) => {
     optional.credentials = scope.credentials
     scope.effect(() => () => { delete optional.credentials }, 'switchboard: credentials')
-    // A token written on the plugin page lands in the credentials store; reconnect with it.
+    // A secret written on the plugin page lands in the credentials store; reconnect with it.
     scope.on('credentials/reference-updated', (ref) => {
-      if (ref === config.botTokenRef.get().trim()) restart()
+      if (configuredLines().some(line => line.secretRef.trim() === ref)) restart()
     })
     restart()
   })
@@ -514,7 +605,7 @@ export function apply(ctx: Context, config: Config): void {
     registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog(), updates)
   })
 
-  // `/telegram` in the Web composer links the open Session to a chat.
+  // `/switchboard` in the Web composer links the open Session to a chat.
   ctx.inject(['commands'], (scope) => {
     registerWebCommand(scope, bridge, chatLog, () => config.language.get())
   })
@@ -538,7 +629,7 @@ export function apply(ctx: Context, config: Config): void {
     bridge.onSessionEvent(session.header.id, event, agents.get(session.header.id)?.session.header.cwd ?? session.header.cwd)
   })
 
-  // Only top-level Agents stream to Telegram; subagent output stays inside their parent's turn.
+  // Only top-level Agents stream to chats; subagent output stays inside their parent's turn.
   ctx.on('agent/assistant-stream', ({ agent, frame }) => {
     if (agent.session.header.parentSession !== undefined) return
     bridge.onAssistantStream(agent.session.header.id, frame as Parameters<typeof bridge.onAssistantStream>[1])
@@ -589,7 +680,7 @@ export function apply(ctx: Context, config: Config): void {
     return outcome === 'cancelled' ? { answers: [] } : outcome
   }, { prepend: true })
 
-  // Token, endpoint, or switch edits restart polling; other fields are read per operation.
+  // Line, secret, or switch edits restart the affected lines; other fields are read per operation.
   ctx.on('loader/volatile-update', restart)
 
   ctx.effect(() => {

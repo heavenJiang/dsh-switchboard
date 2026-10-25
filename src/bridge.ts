@@ -1,29 +1,35 @@
 /**
- * Telegram ⇄ Harness bridge core: long-polls the Bot API, turns messages and
- * commands into Session operations, mirrors assistant output back to the bound
- * chats (rendered from Markdown, streamed as a draft while it is written), and
- * asks tool approvals with inline buttons. Photos, files, and voice notes are
- * staged into the Session; files the Agent presents are sent back. Chats can
- * follow Sessions they do not drive for completion and approval notices, and
- * scheduled runs can report to chosen chats.
+ * Switchboard core: runs one adapter per configured line (Telegram, Feishu),
+ * turns messages and commands into Session operations, mirrors assistant
+ * output back to the bound chats (rendered from Markdown, streamed as a draft
+ * while it is written), and asks tool approvals with buttons. Photos, files,
+ * and voice notes are staged into the Session; files the Agent presents are
+ * sent back. Chats can follow Sessions they do not drive for completion and
+ * approval notices, and scheduled runs can report to chosen chats.
  *
- * Harness access goes through {@link HarnessPort}, so this module does not
- * touch Cordis and can be exercised with a fake.
+ * Chats are known by chat keys (see `lines.ts`), so one Session can be
+ * followed from several platforms at once. Harness access goes through
+ * {@link HarnessPort}, so this module does not touch Cordis and can be
+ * exercised with a fake.
  */
 
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { BindingStore, PendingChoice } from './bindings.ts'
+import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
+import { createFeishuApi } from './channels/feishu-sdk.ts'
+import { TelegramChannel } from './channels/telegram.ts'
+import type {
+  Button, Channel, ChannelChat, ChannelSink, ChannelUser, InboundAction, InboundAttachment, InboundMessage, LineState,
+} from './channels/types.ts'
 import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
-import { chunkMarkdown, markdownToTelegramHtml } from './markdown.ts'
-import { incomingAttachments, outgoingKind, promptImageType, sniffImageType, type IncomingAttachment } from './media.ts'
+import { chatKey, splitChatKey, type LineSettings } from './lines.ts'
+import { outgoingKind, promptImageType, sniffImageType } from './media.ts'
 import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
-import {
-  FileTooLargeError, TelegramApiError, TelegramClient,
-  type TgCallbackQuery, type TgChat, type TgInlineButton, type TgMessage, type TgUpdate, type TgUser,
-} from './telegram.ts'
 import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
+
+export type { LineState } from './channels/types.ts'
 
 /** When to post a summary at the end of a bound Session's turn. */
 export type TurnSummaryMode = 'off' | 'long' | 'always'
@@ -31,18 +37,14 @@ export type TurnSummaryMode = 'off' | 'long' | 'always'
 /** Live settings the bridge reads at the start of each operation. */
 export interface BridgeSettings {
   readonly enabled: boolean
-  readonly botToken: string | undefined
-  readonly apiBaseUrl: string
-  readonly allowedUsers: readonly string[]
-  /** Chat ids whose every member may drive the Harness (groups shared with a team). */
-  readonly allowedChats: readonly string[]
-  /** In groups, answer only commands, @mentions, and replies to the bot. */
-  readonly groupMentionOnly: boolean
+  /** Lines to run; secrets already resolved. */
+  readonly lines: readonly LineSettings[]
+  /** Working directory for new Sessions when neither the chat nor its line set one. */
   readonly workspacePath: string
   readonly agentPreset: string
   readonly permissionPreset: string
   readonly approvalViaTelegram: boolean
-  /** Ask the Agent's questions (ask_user_question) in Telegram too. */
+  /** Ask the Agent's questions (ask_user_question) in chats too. */
   readonly questionsViaTelegram: boolean
   readonly approvalTimeoutSec: number
   readonly notifyToolCalls: boolean
@@ -53,11 +55,10 @@ export interface BridgeSettings {
   readonly turnSummaryMinSec: number
   /** Transcribe voice notes into prompts when the host can. */
   readonly transcribeVoice: boolean
-  /** Chats that receive scheduled-run results. */
+  /** Chat keys that receive scheduled-run results. */
   readonly scheduleChats: readonly string[]
   readonly language: BotLanguage
-  readonly pollTimeoutSec: number
-  /** Largest file accepted from Telegram, in MB (the public Bot API serves at most 20). */
+  /** Largest file accepted from a chat, in MB (the public Telegram Bot API serves at most 20). */
   readonly maxDownloadMb: number
   /** Send files the Agent presents back to the chat. */
   readonly sendDeliverables: boolean
@@ -196,17 +197,25 @@ export interface BridgeLogger {
   debug(message: string): void
 }
 
-/** Approval answer from Telegram, or a hand-back to the next answerer. */
+/** How the bridge builds adapters; tests substitute transports. */
+export interface ChannelOptions {
+  /** Fetch for Telegram lines. */
+  readonly fetch?: typeof fetch
+  /** Open Platform client for a Feishu line. */
+  readonly feishu?: (line: LineSettings) => FeishuApi
+}
+
+/** Approval answer from a chat, or a hand-back to the next answerer. */
 export type TelegramApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'delegate'
 
-/** One question waiting on an inline button. */
+/** One question waiting on a button. */
 interface PendingApproval {
   readonly sessionId: string
-  readonly prompts: { chatId: number; messageId: number }[]
+  readonly prompts: { chat: string; messageId: string }[]
   settle(outcome: TelegramApprovalOutcome, note: string, by?: string): void
 }
 
-/** One question the Agent asked, as Telegram shows it. */
+/** One question the Agent asked, as a chat shows it. */
 export interface QuestionItem {
   readonly id: string
   readonly question: string
@@ -221,13 +230,14 @@ export interface QuestionAnswer {
   readonly answers: { id: string; selected: string[]; custom?: string }[]
 }
 
-/** A question request waiting on Telegram. */
+/** A question request waiting on its chats. */
 interface PendingQuestions {
   readonly sessionId: string
-  readonly chats: number[]
+  readonly chats: string[]
   readonly items: {
     readonly item: QuestionItem
-    readonly messages: Map<number, number>
+    /** Message id per chat key. */
+    readonly messages: Map<string, string>
     readonly selected: Set<string>
     custom?: string
     done: boolean
@@ -246,8 +256,8 @@ type OutKind = 'assistant' | 'tool' | 'notice'
 /** A reply being written, shown as one edited message per chat. */
 interface Draft {
   text: string
-  /** Draft message per chat, once sent. */
-  readonly messages: Map<number, number>
+  /** Draft message per chat key, once sent. */
+  readonly messages: Map<string, string>
   lastFlush: number
   timer: ReturnType<typeof setTimeout> | undefined
   /** The send or edit in flight; finalization waits for it. */
@@ -258,7 +268,7 @@ interface Draft {
 interface ToolActivity {
   readonly lines: string[]
   count: number
-  readonly messages: Map<number, number>
+  readonly messages: Map<string, string>
   timer: ReturnType<typeof setTimeout> | undefined
   lastFlush: number
   pending: Promise<void>
@@ -274,20 +284,29 @@ interface TurnState {
   lastText?: string
 }
 
+/** One running line. */
+interface LiveLine {
+  readonly line: LineSettings
+  readonly channel: Channel
+  readonly controller: AbortController
+  done: Promise<void>
+  /** Restart key: the line's settings, secret included. */
+  readonly key: string
+  state: LineState
+  /** Whether the line's menu already lists Harness commands (filled once a Session can list them). */
+  menuHasHarness: boolean
+}
+
 /** Observable connection state for `/status` and logs. */
-export type BridgeState =
-  | { readonly kind: 'stopped' }
-  | { readonly kind: 'connecting' }
-  | { readonly kind: 'running'; readonly username: string }
-  | { readonly kind: 'error'; readonly message: string }
+export type BridgeState = LineState
 
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
   'start', 'help', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
   'status', 'model', 'mode', 'get', 'whoami',
 ])
-/** Harness commands that only make sense in the Web composer (`/telegram` links a Web Session to a chat). */
-const WEB_ONLY_COMMANDS = new Set(['telegram'])
+/** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
+const WEB_ONLY_COMMANDS = new Set(['switchboard'])
 /** Telegram's command-name rule for the bot menu. */
 const MENU_NAME = /^[a-z0-9_]{1,32}$/u
 
@@ -297,7 +316,6 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
   'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
 }
 const TYPING_INTERVAL_MS = 4500
-const MAX_BACKOFF_MS = 60_000
 const TOOL_PREVIEW_LENGTH = 200
 /** Tool lines arriving within this window go out as one message (Telegram allows about one message per second per chat). */
 const TOOL_BATCH_MS = 1500
@@ -307,10 +325,6 @@ const TOOL_LINES_SHOWN = 12
 const DRAFT_INTERVAL_MS = 1500
 /** A draft appears once the reply has this much text. */
 const DRAFT_MIN_CHARS = 40
-/** How long to wait for the rest of an album before prompting with it. */
-const MEDIA_GROUP_WAIT_MS = 1500
-/** Telegram's document upload ceiling for bots. */
-const SEND_LIMIT_BYTES = 50 * 1024 * 1024
 /** Buttons in one /model picker; longer catalogs are reached by name. */
 const PICKER_BUTTONS = 30
 const PICKER_TTL_MS = 10 * 60 * 1000
@@ -319,13 +333,10 @@ const DENIED_REPLY_INTERVAL_MS = 60 * 60 * 1000
 const DIRECTORY_LIST_LIMIT = 50
 const EXCERPT_LENGTH = 400
 
-/** The bridge core. One instance lives for the plugin's lifetime; polling restarts on token changes. */
-export class TelegramBridge {
-  state: BridgeState = { kind: 'stopped' }
-  private client: TelegramClient | undefined
-  private poll: { controller: AbortController; done: Promise<void>; key: string } | undefined
-  private botUsername: string | undefined
-  private readonly sendTails = new Map<number, Promise<void>>()
+/** The bridge core. One instance lives for the plugin's lifetime; lines restart when their settings change. */
+export class Switchboard {
+  private readonly live = new Map<string, LiveLine>()
+  private readonly sendTails = new Map<string, Promise<void>>()
   private readonly typing = new Map<string, ReturnType<typeof setInterval>>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly questions = new Map<string, PendingQuestions>()
@@ -335,33 +346,44 @@ export class TelegramBridge {
   private readonly drafts = new Map<string, Draft>()
   private readonly turns = new Map<string, TurnState>()
   private readonly pickers = new Map<string, Picker>()
-  private readonly albums = new Map<string, { chatId: number; messages: TgMessage[]; timer: ReturnType<typeof setTimeout> }>()
   /** The last /sessions listing per chat, so `/use 2` and `/watch 2` work. */
-  private readonly listings = new Map<number, string[]>()
-  private readonly deniedReplies = new Map<number, number>()
+  private readonly listings = new Map<string, string[]>()
+  private readonly deniedReplies = new Map<string, number>()
   private readonly lifetime = new AbortController()
-  /** Whether the bot menu already lists Harness commands (it is filled once a Session can list them). */
-  private menuHasHarness = false
 
   constructor(
     private readonly settings: () => BridgeSettings,
     private readonly harness: HarnessPort,
     private readonly store: BindingStore,
     private readonly logger: BridgeLogger,
-    private readonly fetchImpl?: typeof fetch,
+    private readonly channelOptions: ChannelOptions = {},
     private readonly chatLog?: ChatLog,
   ) {}
 
-  /** @returns the bot's username while connected. */
+  /** State of the first line, for callers that know only one. */
+  get state(): BridgeState {
+    return this.live.values().next().value?.state ?? { kind: 'stopped' }
+  }
+
+  /** @returns the first line's bot handle while connected. */
   get username(): string | undefined {
-    return this.state.kind === 'running' ? this.state.username : undefined
+    const state = this.state
+    return state.kind === 'running' ? state.username : undefined
+  }
+
+  /** Every configured line with its connection state. */
+  lineStates(): { id: string; type: LineSettings['type']; name: string; state: LineState }[] {
+    return this.settings().lines.map(line => ({
+      id: line.id, type: line.type, name: line.name,
+      state: this.live.get(line.id)?.state ?? { kind: 'stopped' },
+    }))
   }
 
   private get t(): Messages {
     return MESSAGES[this.settings().language]
   }
 
-  /** Append to the Web viewer's history; failures are logged, never surfaced to Telegram. */
+  /** Append to the Web viewer's history; failures are logged, never surfaced in the chat. */
   private log(chat: ChatInfo, entry: Omit<ChatEntry, 'id' | 'at' | 'sessionId'>, sessionId?: string): void {
     if (this.chatLog === undefined) return
     const session = sessionId ?? this.store.get(chat.chatId).sessionId
@@ -372,47 +394,74 @@ export class TelegramBridge {
 
   // ─── lifecycle ──────────────────────────────────────────────────────────
 
-  /** Start, stop, or restart polling so it matches the current settings. */
+  /** Start, stop, or restart lines so they match the current settings. */
   async reconcile(): Promise<void> {
     const s = this.settings()
-    const token = s.botToken?.trim() ?? ''
-    const key = s.enabled && token !== '' ? `${s.apiBaseUrl}\n${token}` : ''
-    if (this.poll?.key === key) return
-    await this.stop()
-    if (key === '') {
-      this.state = { kind: 'stopped' }
-      return
+    const wanted = new Map(s.lines
+      .filter(line => s.enabled && line.enabled && (line.secret ?? '') !== '')
+      .map(line => [line.id, line] as const))
+    for (const [id, running] of [...this.live]) {
+      const line = wanted.get(id)
+      if (line === undefined || lineKey(line) !== running.key) await this.stopLine(id)
     }
-    this.client = new TelegramClient({
-      token,
-      apiBaseUrl: s.apiBaseUrl,
-      ...(this.fetchImpl === undefined ? {} : { fetch: this.fetchImpl }),
-    })
-    const controller = new AbortController()
-    const done = this.run(this.client, controller.signal)
-    this.poll = { controller, done, key }
+    for (const [id, line] of wanted) {
+      if (!this.live.has(id)) this.startLine(line)
+    }
   }
 
-  /** Stop polling, withdraw pending approvals, and stop typing indicators. */
-  async stop(): Promise<void> {
-    const poll = this.poll
-    this.poll = undefined
-    if (poll !== undefined) {
-      poll.controller.abort()
-      await poll.done
+  private startLine(line: LineSettings): void {
+    const logger = {
+      info: (message: string) => { this.logger.info(`switchboard [${line.id}]: ${message}`) },
+      warn: (message: string) => { this.logger.warn(`switchboard [${line.id}]: ${message}`) },
+      debug: (message: string) => { this.logger.debug(`switchboard [${line.id}]: ${message}`) },
     }
+    const channel: Channel = line.type === 'feishu'
+      ? new FeishuChannel(line, { api: (this.channelOptions.feishu ?? (l => createFeishuApi(l, logger)))(line), logger })
+      : new TelegramChannel(line, {
+        cursor: { get: () => this.store.offset(line.id), set: offset => this.store.setOffset(line.id, offset) },
+        logger,
+        ...(this.channelOptions.fetch === undefined ? {} : { fetch: this.channelOptions.fetch }),
+      })
+    const controller = new AbortController()
+    const entry: LiveLine = { line, channel, controller, done: Promise.resolve(), key: lineKey(line), state: { kind: 'connecting' }, menuHasHarness: false }
+    const sink: ChannelSink = {
+      state: (state) => {
+        const connected = state.kind === 'running' && entry.state.kind !== 'running'
+        entry.state = state
+        if (connected) {
+          logger.info(`connected as ${line.type === 'telegram' ? '@' : ''}${state.username}`)
+          void this.registerCommands(entry)
+        }
+      },
+      message: message => this.handleMessage(entry, message),
+      action: action => this.handleAction(entry, action),
+    }
+    this.live.set(line.id, entry)
+    entry.done = channel.run(sink, controller.signal).catch((error: unknown) => {
+      entry.state = { kind: 'error', message: describe(error) }
+      logger.warn(`stopped: ${describe(error)}`)
+    })
+  }
+
+  private async stopLine(id: string): Promise<void> {
+    const entry = this.live.get(id)
+    if (entry === undefined) return
+    entry.controller.abort()
+    await entry.done
+    this.live.delete(id)
+  }
+
+  /** Stop every line, withdraw pending approvals, and stop typing indicators. */
+  async stop(): Promise<void> {
     for (const approval of this.approvals.values()) approval.settle('delegate', this.t.approvalCancelled)
     for (const pending of this.questions.values()) pending.settle('delegate', this.t.questionTimedOut)
-    for (const album of this.albums.values()) clearTimeout(album.timer)
-    this.albums.clear()
     for (const timer of this.typing.values()) clearInterval(timer)
     this.typing.clear()
     for (const sessionId of [...this.toolBatches.keys()]) this.flushTools(sessionId)
     for (const draft of this.drafts.values()) clearTimeout(draft.timer)
     this.drafts.clear()
     await Promise.allSettled([...this.sendTails.values()])
-    this.client = undefined
-    this.state = { kind: 'stopped' }
+    for (const id of [...this.live.keys()]) await this.stopLine(id)
   }
 
   /** Stop for good: also abort in-flight transcriptions. */
@@ -421,53 +470,15 @@ export class TelegramBridge {
     await this.stop()
   }
 
-  /** The long-poll loop; returns once `signal` aborts or the token is rejected. */
-  private async run(client: TelegramClient, signal: AbortSignal): Promise<void> {
-    let backoff = 1000
-    this.state = { kind: 'connecting' }
-    while (!signal.aborted) {
-      try {
-        if (this.state.kind !== 'running') {
-          const me = await client.getMe(signal)
-          this.botUsername = me.username
-          this.state = { kind: 'running', username: me.username ?? String(me.id) }
-          this.logger.info(`switchboard: connected as @${this.state.username}`)
-          await this.registerCommands(client)
-        }
-        const updates = await client.getUpdates(this.store.offset, this.settings().pollTimeoutSec, signal)
-        backoff = 1000
-        for (const update of updates) {
-          // Advance first: an update that crashes the handler is not replayed forever.
-          await this.store.setOffset(update.update_id + 1)
-          await this.handleUpdate(update).catch((error: unknown) => {
-            this.logger.warn(`switchboard: update ${update.update_id} failed: ${describe(error)}`)
-          })
-        }
-      } catch (error: unknown) {
-        if (signal.aborted) break
-        if (error instanceof TelegramApiError && error.code === 401) {
-          this.state = { kind: 'error', message: 'bot token rejected (401)' }
-          this.logger.warn('switchboard: bot token rejected; fix it on the plugin page')
-          return
-        }
-        this.state = { kind: 'error', message: describe(error) }
-        this.logger.warn(`switchboard: polling failed, retrying in ${backoff / 1000}s: ${describe(error)}`)
-        await sleep(backoff, signal)
-        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
-        if (!signal.aborted) this.state = { kind: 'connecting' }
-      }
-    }
-  }
-
   /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
-  private async registerCommands(client: TelegramClient, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
+  private async registerCommands(entry: LiveLine, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
     const t = this.t
     const extra = (harnessCommands ?? await this.harness.listCommands(undefined).catch(() => []))
       .filter(command => MENU_NAME.test(command.name) && !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
       .slice(0, 20)
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
-    this.menuHasHarness = extra.length > 0
-    await client.setMyCommands([
+    entry.menuHasHarness = extra.length > 0
+    await entry.channel.setMenu([
       { command: 'new', description: t.cmdNew },
       { command: 'stop', description: t.cmdStop },
       { command: 'model', description: t.cmdModel },
@@ -478,52 +489,37 @@ export class TelegramBridge {
       { command: 'help', description: t.cmdHelp },
       ...extra,
     ]).catch((error: unknown) => {
-      this.logger.debug(`switchboard: setMyCommands failed: ${describe(error)}`)
+      this.logger.debug(`switchboard [${entry.line.id}]: menu update failed: ${describe(error)}`)
     })
   }
 
   // ─── inbound ────────────────────────────────────────────────────────────
 
-  /** Route one update. Exposed for tests. */
-  async handleUpdate(update: TgUpdate): Promise<void> {
-    if (update.callback_query !== undefined) return this.handleCallback(update.callback_query)
-    if (update.message !== undefined) return this.handleMessage(update.message)
+  /** Whether a user (or the whole chat) may drive the Harness through a line. */
+  private allowed(line: LineSettings, user: ChannelUser, chat: ChannelChat | undefined): boolean {
+    if ([user.id, ...(user.aliases ?? [])].some(id => isAllowed(line.allowedUsers, id, user.username))) return true
+    return chat !== undefined && line.allowedChats.some(id => id.trim() === chat.id)
   }
 
-  /** Whether a user (or the whole chat) may drive the Harness. */
-  private allowed(user: TgUser, chat: TgChat): boolean {
-    const s = this.settings()
-    return isAllowed(s.allowedUsers, user.id, user.username) || s.allowedChats.some(id => id.trim() === String(chat.id))
+  /** A running line's current settings (access lists and directories change without a restart). */
+  private settingsOf(entry: LiveLine): LineSettings {
+    return this.settings().lines.find(line => line.id === entry.line.id) ?? entry.line
   }
 
-  /**
-   * In groups the bot answers only what is addressed to it.
-   * @returns the message text with the bot's @mention removed, or undefined to ignore the message.
-   */
-  private addressed(message: TgMessage, text: string | undefined): { text: string | undefined } | undefined {
-    const group = message.chat.type === 'group' || message.chat.type === 'supergroup'
-    if (!group || !this.settings().groupMentionOnly) return { text }
-    const bot = this.botUsername?.toLowerCase()
-    const mention = bot === undefined ? undefined : new RegExp(`@${bot}\\b`, 'iu')
-    if (text !== undefined && text.trimStart().startsWith('/')) return { text }
-    if (text !== undefined && mention?.test(text) === true) return { text: text.replace(mention, '').trim() }
-    const repliedTo = message.reply_to_message?.from
-    if (repliedTo?.is_bot === true && repliedTo.username?.toLowerCase() === bot) return { text }
-    return undefined
-  }
-
-  private async handleMessage(message: TgMessage): Promise<void> {
+  private async handleMessage(entry: LiveLine, message: InboundMessage): Promise<void> {
+    const { channel } = entry
+    const line = this.settingsOf(entry)
+    const key = chatKey(line.id, message.chat.id)
     const from = message.from
-    if (from === undefined || from.is_bot) return
-    const chatId = message.chat.id
     const t = this.t
-    const addressed = this.addressed(message, message.text ?? message.caption)
-    if (addressed === undefined) return
-    const text = addressed.text
-    const parsed = text === undefined ? undefined : parseInput(text, this.botUsername)
-    const allowed = this.allowed(from, message.chat)
-    const attachments = incomingAttachments(message)
-    const chat = chatInfo(message.chat, from)
+    const text = message.text
+    // In groups the bot answers only what is addressed to it.
+    const isCommand = text?.trimStart().startsWith('/') === true
+    if (message.chat.type === 'group' && line.groupMentionOnly && !message.addressed && !isCommand) return
+    const parsed = text === undefined ? undefined : parseInput(text, channel.username)
+    const allowed = this.allowed(line, from, message.chat)
+    const attachments = message.attachments
+    const chat = chatInfo(key, message.chat)
     if (!allowed) {
       this.log(chat, {
         dir: 'in', kind: 'denied', from: sender(from),
@@ -534,64 +530,49 @@ export class TelegramBridge {
       this.log(chat, { dir: 'in', kind: parsed?.kind === 'command' ? 'command' : 'text', from: sender(from), text })
     }
     if (parsed?.kind === 'command' && parsed.name === 'whoami') {
-      return this.reply(chatId, t.whoami(from.id, chatId))
+      return this.reply(key, t.whoami(from.id, message.chat.id))
     }
     if (!allowed) {
       // Answer strangers only in private chats, and only now and then, so nobody can make the bot spam.
-      const last = this.deniedReplies.get(from.id) ?? 0
+      const strangerKey = `${line.id}:${from.id}`
+      const last = this.deniedReplies.get(strangerKey) ?? 0
       if (message.chat.type === 'private' && Date.now() - last > DENIED_REPLY_INTERVAL_MS) {
-        this.deniedReplies.set(from.id, Date.now())
-        await this.reply(chatId, t.unauthorized(from.id))
+        this.deniedReplies.set(strangerKey, Date.now())
+        await this.reply(key, t.unauthorized(from.id))
       }
       return
     }
-    if (message.media_group_id !== undefined) return this.collectAlbum(chatId, message)
     try {
-      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(chatId, message)
-      if (attachments.length > 0) return await this.promptWithMedia(chatId, [message])
-      if (text === undefined) return await this.reply(chatId, t.unsupported)
+      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(key, message)
+      if (attachments.length > 0) return await this.promptWithMedia(key, message)
+      if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
-      if (parsed.kind === 'text' && this.answerByText(chatId, parsed.text)) return
-      if (parsed.kind === 'text') return await this.promptFromChat(chatId, [{ type: 'text', text: parsed.text }], 'queue')
-      return await this.runCommand(chatId, parsed.name, parsed.args)
+      if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: parsed.text }], 'queue')
+      return await this.runCommand(key, parsed.name, parsed.args)
     } catch (error: unknown) {
-      await this.reply(chatId, t.failed(describe(error)))
+      await this.reply(key, t.failed(describe(error)))
     }
   }
 
-  /** Buffer one album item; the album is prompted once no item arrived for a moment. */
-  private collectAlbum(chatId: number, message: TgMessage): void {
-    const key = `${chatId}:${message.media_group_id}`
-    const album = this.albums.get(key) ?? { chatId, messages: [], timer: undefined as unknown as ReturnType<typeof setTimeout> }
-    clearTimeout(album.timer)
-    album.messages.push(message)
-    album.timer = setTimeout(() => {
-      this.albums.delete(key)
-      void this.promptWithMedia(chatId, album.messages).catch(async (error: unknown) => {
-        await this.reply(chatId, this.t.failed(describe(error)))
-      })
-    }, MEDIA_GROUP_WAIT_MS)
-    this.albums.set(key, album)
-  }
-
   /**
-   * Download every attachment of one message or album, stage it into the
-   * chat's Session, and prompt with the captions plus the receipts.
+   * Download every attachment of one message (or album), stage it into the
+   * chat's Session, and prompt with the text plus the receipts.
    */
-  private async promptWithMedia(chatId: number, messages: readonly TgMessage[], note?: string): Promise<void> {
-    const client = this.client
-    if (client === undefined) return
+  private async promptWithMedia(key: string, message: InboundMessage, note?: string): Promise<void> {
+    const channel = this.channelOf(key)
+    if (channel === undefined) return
     const t = this.t
-    const sessionId = await this.ensureSession(chatId)
+    const sessionId = await this.ensureSession(key)
     if (sessionId === undefined) return
     const limit = this.settings().maxDownloadMb * 1024 * 1024
     const parts: PromptPart[] = []
-    const captions = messages.map(m => (m.caption ?? m.text ?? '').trim()).filter(c => c !== '')
+    const caption = (message.text ?? '').trim()
     const logged: ChatAttachment[] = []
     this.startTyping(sessionId)
-    for (const attachment of messages.flatMap(incomingAttachments)) {
+    for (const attachment of message.attachments) {
       try {
-        const data = await this.download(client, attachment, limit)
+        const data = await channel.download(attachment, limit)
         const imageType = promptImageType(attachment, data)
         const receiptId = await this.harness.stageFile(sessionId, {
           data,
@@ -599,25 +580,22 @@ export class TelegramBridge {
           ...(imageType === undefined ? {} : { imageType }),
         })
         parts.push({ type: 'file', receiptId })
-        logged.push(await this.viewerAttachment(chatId, attachment.name, data, imageType))
+        logged.push(await this.viewerAttachment(key, attachment.name, data, imageType))
       } catch (error: unknown) {
         logged.push({ name: attachment.name, kind: 'file', ...(attachment.size === undefined ? {} : { size: attachment.size }) })
-        await this.reply(chatId, t.attachmentFailed(attachment.name, describe(error)))
+        await this.reply(key, t.attachmentFailed(attachment.name, describe(error)))
       }
     }
-    const first = messages[0]
-    if (first !== undefined && first.from !== undefined) {
-      this.log(chatInfo(first.chat, first.from), {
-        dir: 'in', kind: 'media', from: sender(first.from), attachments: logged,
-        ...(captions.length === 0 ? {} : { text: captions.join('\n\n') }),
-      })
-    }
-    if (note !== undefined) await this.reply(chatId, note)
+    this.log(chatInfo(key, message.chat), {
+      dir: 'in', kind: 'media', from: sender(message.from), attachments: logged,
+      ...(caption === '' ? {} : { text: caption }),
+    })
+    if (note !== undefined) await this.reply(key, note)
     if (parts.length === 0) {
       this.stopTyping(sessionId)
       return
     }
-    if (captions.length > 0) parts.unshift({ type: 'text', text: captions.join('\n\n') })
+    if (caption !== '') parts.unshift({ type: 'text', text: caption })
     await this.harness.prompt(sessionId, parts, 'queue')
   }
 
@@ -625,131 +603,126 @@ export class TelegramBridge {
    * Transcribe a voice note and prompt with the text; when the host cannot
    * transcribe, the note goes to the Agent as an audio file instead.
    */
-  private async promptWithVoice(chatId: number, message: TgMessage): Promise<void> {
-    const client = this.client
-    const voice = message.voice
-    if (client === undefined || voice === undefined || message.from === undefined) return
+  private async promptWithVoice(key: string, message: InboundMessage): Promise<void> {
+    const channel = this.channelOf(key)
+    const voice: InboundAttachment | undefined = message.voice
+    if (channel === undefined || voice === undefined) return
     const t = this.t
     let transcript: string
     try {
       const limit = this.settings().maxDownloadMb * 1024 * 1024
-      const audio = await this.download(client, { fileId: voice.file_id, name: `voice_${message.message_id}.ogg`, ...(voice.file_size === undefined ? {} : { size: voice.file_size }) }, limit)
+      const audio = await channel.download(voice, limit)
       transcript = (await this.harness.transcribe(audio, this.lifetime.signal)).trim()
     } catch (error: unknown) {
-      return this.promptWithMedia(chatId, [message], t.voiceUnavailable(describe(error)))
+      return this.promptWithMedia(key, message, t.voiceUnavailable(describe(error)))
     }
-    if (transcript === '') return this.reply(chatId, t.voiceEmpty)
-    const caption = (message.caption ?? '').trim()
+    if (transcript === '') return this.reply(key, t.voiceEmpty)
+    const caption = (message.text ?? '').trim()
     const text = caption === '' ? transcript : `${caption}\n\n${transcript}`
-    this.log(chatInfo(message.chat, message.from), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
-    await this.reply(chatId, t.voiceHeard(transcript))
-    await this.promptFromChat(chatId, [{ type: 'text', text }], 'queue')
+    this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
+    await this.reply(key, t.voiceHeard(transcript))
+    await this.promptFromChat(key, [{ type: 'text', text }], 'queue')
   }
 
   /** Describe an attachment for the history, keeping a copy of images the viewer can show. */
-  private async viewerAttachment(chatId: number, name: string, data: Uint8Array, imageType?: string): Promise<ChatAttachment> {
+  private async viewerAttachment(key: string, name: string, data: Uint8Array, imageType?: string): Promise<ChatAttachment> {
     const base = { name, size: data.byteLength }
     if (imageType === undefined || this.chatLog === undefined || data.byteLength > VIEWER_IMAGE_LIMIT) return { ...base, kind: imageType === undefined ? 'file' : 'image' }
-    const media = await this.chatLog.saveMedia(chatId, IMAGE_EXTENSIONS[imageType] ?? '', data).catch(() => undefined)
+    const media = await this.chatLog.saveMedia(key, IMAGE_EXTENSIONS[imageType] ?? '', data).catch(() => undefined)
     return { ...base, kind: 'image', ...(media === undefined ? {} : { media }) }
-  }
-
-  private async download(client: TelegramClient, attachment: IncomingAttachment, limit: number): Promise<Uint8Array> {
-    if (attachment.size !== undefined && attachment.size > limit) throw new FileTooLargeError(attachment.size, limit)
-    const file = await client.getFile(attachment.fileId)
-    // The public Bot API omits file_path for files over 20 MB.
-    if (file.file_path === undefined) throw new FileTooLargeError(file.file_size ?? limit + 1, limit)
-    return client.downloadFile(file.file_path, limit)
   }
 
   // ─── commands ───────────────────────────────────────────────────────────
 
-  private async runCommand(chatId: number, name: string, args: string): Promise<void> {
+  private async runCommand(key: string, name: string, args: string): Promise<void> {
     const t = this.t
-    const binding = this.store.get(chatId)
+    const binding = this.store.get(key)
     switch (name) {
       case 'start':
       case 'help': {
         const commands = (await this.harness.listCommands(binding.sessionId).catch(() => []))
           .filter(command => !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
-        if (commands.length > 0 && !this.menuHasHarness && this.client !== undefined) void this.registerCommands(this.client, commands)
+        const entry = this.live.get(splitChatKey(key).line)
+        if (commands.length > 0 && entry !== undefined && !entry.menuHasHarness) void this.registerCommands(entry, commands)
         const lines = commands.map(command => `/${command.name}${command.hint === undefined ? '' : ` ${command.hint}`} — ${command.description}`)
-        return this.reply(chatId, lines.length === 0 ? t.help : `${t.help}\n\n${t.harnessCommands}\n${lines.join('\n')}`)
+        return this.reply(key, lines.length === 0 ? t.help : `${t.help}\n\n${t.harnessCommands}\n${lines.join('\n')}`)
       }
       case 'new': {
-        const cwd = args === '' ? this.defaultWorkspace(chatId) : args
-        if (cwd === undefined) return this.reply(chatId, t.noWorkspace)
-        const sessionId = await this.newSession(chatId, cwd)
-        return this.reply(chatId, t.created(sessionId, cwd))
+        const cwd = args === '' ? this.defaultWorkspace(key) : args
+        if (cwd === undefined) return this.reply(key, t.noWorkspace)
+        const sessionId = await this.newSession(key, cwd)
+        return this.reply(key, t.created(sessionId, cwd))
       }
       case 'cwd': {
-        if (args === '') return this.reply(chatId, this.defaultWorkspace(chatId) ?? t.noWorkspace)
-        if (!(await isDirectory(args))) return this.reply(chatId, t.badWorkspace(args))
-        await this.store.update(chatId, { workspacePath: args })
-        return this.reply(chatId, t.cwdSet(args))
+        if (args === '') return this.reply(key, this.defaultWorkspace(key) ?? t.noWorkspace)
+        if (!(await isDirectory(args))) return this.reply(key, t.badWorkspace(args))
+        await this.store.update(key, { workspacePath: args })
+        return this.reply(key, t.cwdSet(args))
       }
       case 'use': {
-        if (args === '') return this.reply(chatId, t.useUsage)
-        const sessionId = this.sessionRef(chatId, args)
-        await this.store.update(chatId, { sessionId })
-        await this.chatLog?.bind(chatId, sessionId).catch(() => {})
+        if (args === '') return this.reply(key, t.useUsage)
+        const sessionId = this.sessionRef(key, args)
+        await this.store.update(key, { sessionId })
+        await this.chatLog?.bind(key, sessionId).catch(() => {})
         this.attachToWorkspace(sessionId)
-        return this.reply(chatId, t.bound(sessionId))
+        return this.reply(key, t.bound(sessionId))
       }
       case 'sessions': {
         const rows = (await this.harness.listSessions()).slice(0, 10)
-        this.listings.set(chatId, rows.map(row => row.sessionId))
+        this.listings.set(key, rows.map(row => row.sessionId))
         const lines = rows.map((row, index) =>
           `${index + 1}. ${row.running ? '▶' : '·'} ${row.sessionId}${row.cwd === undefined ? '' : `  ${row.cwd}`}${row.sessionId === binding.sessionId ? ' ✓' : ''}`)
-        return this.reply(chatId, t.sessions(lines))
+        return this.reply(key, t.sessions(lines))
       }
       case 'watch': {
-        if (args === '') return this.reply(chatId, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
-        const sessionId = this.sessionRef(chatId, args)
-        await this.store.setWatch(chatId, sessionId, true)
+        if (args === '') return this.reply(key, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
+        const sessionId = this.sessionRef(key, args)
+        await this.store.setWatch(key, sessionId, true)
         this.attachToWorkspace(sessionId)
-        return this.reply(chatId, t.watchOn(sessionId))
+        return this.reply(key, t.watchOn(sessionId))
       }
       case 'unwatch': {
         if (args.trim().toLowerCase() === 'all') {
-          for (const id of binding.watch ?? []) await this.store.setWatch(chatId, id, false)
-          return this.reply(chatId, t.watchOffAll)
+          for (const id of binding.watch ?? []) await this.store.setWatch(key, id, false)
+          return this.reply(key, t.watchOffAll)
         }
-        if (args === '') return this.reply(chatId, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
-        const sessionId = this.sessionRef(chatId, args)
-        await this.store.setWatch(chatId, sessionId, false)
-        return this.reply(chatId, t.watchOff(sessionId))
+        if (args === '') return this.reply(key, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
+        const sessionId = this.sessionRef(key, args)
+        await this.store.setWatch(key, sessionId, false)
+        return this.reply(key, t.watchOff(sessionId))
       }
       case 'stop': {
-        if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
+        if (binding.sessionId === undefined) return this.reply(key, t.noSession)
         const live = this.harness.live(binding.sessionId)
-        if (live?.running !== true || !this.harness.cancel(binding.sessionId)) return this.reply(chatId, t.notRunning)
-        return this.reply(chatId, t.stopped)
+        if (live?.running !== true || !this.harness.cancel(binding.sessionId)) return this.reply(key, t.notRunning)
+        return this.reply(key, t.stopped)
       }
       case 'steer': {
-        if (args === '') return this.reply(chatId, t.steerUsage)
-        return this.promptFromChat(chatId, [{ type: 'text', text: args }], 'steer')
+        if (args === '') return this.reply(key, t.steerUsage)
+        return this.promptFromChat(key, [{ type: 'text', text: args }], 'steer')
       }
       case 'queue': {
-        if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
+        if (binding.sessionId === undefined) return this.reply(key, t.noSession)
         const items = this.harness.queued(binding.sessionId)
-        if (items === undefined) return this.reply(chatId, t.queueNotLive)
-        return this.reply(chatId, t.queueList(items.map((item, index) => `${index + 1}. ${truncate(item.text.replace(/\s+/gu, ' '), 80)}`)))
+        if (items === undefined) return this.reply(key, t.queueNotLive)
+        return this.reply(key, t.queueList(items.map((item, index) => `${index + 1}. ${truncate(item.text.replace(/\s+/gu, ' '), 80)}`)))
       }
       case 'cancel': {
-        if (binding.sessionId === undefined) return this.reply(chatId, t.noSession)
+        if (binding.sessionId === undefined) return this.reply(key, t.noSession)
         const items = this.harness.queued(binding.sessionId)
-        if (items === undefined) return this.reply(chatId, t.queueNotLive)
-        if (args.trim().toLowerCase() === 'all') return this.reply(chatId, t.queueCancelled(this.harness.dropQueued(binding.sessionId, 'all')))
+        if (items === undefined) return this.reply(key, t.queueNotLive)
+        if (args.trim().toLowerCase() === 'all') return this.reply(key, t.queueCancelled(this.harness.dropQueued(binding.sessionId, 'all')))
         const picked = args.split(/[\s,]+/u).map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= items.length)
-        if (picked.length === 0) return this.reply(chatId, t.cancelUsage)
-        return this.reply(chatId, t.queueCancelled(this.harness.dropQueued(binding.sessionId, picked.map(n => items[n - 1]!.id))))
+        if (picked.length === 0) return this.reply(key, t.cancelUsage)
+        return this.reply(key, t.queueCancelled(this.harness.dropQueued(binding.sessionId, picked.map(n => items[n - 1]!.id))))
       }
       case 'status': {
         const live = binding.sessionId === undefined ? undefined : this.harness.live(binding.sessionId)
         const model = binding.sessionId === undefined ? undefined : this.modelOf(binding.sessionId)
-        return this.reply(chatId, t.status({
-          bot: this.state.kind === 'running' ? `@${this.state.username}` : this.state.kind,
+        const entry = this.live.get(splitChatKey(key).line)
+        const state = entry?.state ?? { kind: 'stopped' as const }
+        return this.reply(key, t.status({
+          bot: state.kind === 'running' ? `${entry?.line.type === 'telegram' ? '@' : ''}${state.username}` : state.kind,
           ...(binding.sessionId === undefined ? {} : { session: binding.sessionId }),
           ...(live?.cwd === undefined ? {} : { cwd: live.cwd }),
           ...(live === undefined ? {} : { running: live.running }),
@@ -757,28 +730,28 @@ export class TelegramBridge {
         }))
       }
       case 'model':
-        return this.modelCommand(chatId, binding.sessionId, args)
+        return this.modelCommand(key, binding.sessionId, args)
       case 'mode':
-        return this.modeCommand(chatId, binding.sessionId, args)
+        return this.modeCommand(key, binding.sessionId, args)
       case 'get':
-        return this.getCommand(chatId, binding.sessionId, args)
+        return this.getCommand(key, binding.sessionId, args)
       default: {
         const line = `/${name}${args === '' ? '' : ` ${args}`}`
         // Harness commands run on the Host as in the Web composer; anything else is text for the Agent.
         if (binding.sessionId !== undefined) {
           const result = await this.harness.runCommand(binding.sessionId, line)
           if (result !== undefined) {
-            return this.reply(chatId, result.kind === 'error'
+            return this.reply(key, result.kind === 'error'
               ? t.commandFailed(name, result.text ?? '')
               : result.text === undefined || result.text.trim() === '' ? t.commandDone(name) : result.text)
           }
         }
-        return this.promptFromChat(chatId, [{ type: 'text', text: line }], 'queue')
+        return this.promptFromChat(key, [{ type: 'text', text: line }], 'queue')
       }
     }
   }
 
-  /** Put a linked Session into its directory's Web Workspace; a failure is logged, never shown in Telegram. */
+  /** Put a linked Session into its directory's Web Workspace; a failure is logged, never shown in the chat. */
   private attachToWorkspace(sessionId: string): void {
     void this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
       this.logger.warn(`switchboard: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
@@ -795,10 +768,10 @@ export class TelegramBridge {
   }
 
   /** Resolve `/use 2` against the chat's last /sessions listing; anything else is a Session id. */
-  private sessionRef(chatId: number, arg: string): string {
+  private sessionRef(key: string, arg: string): string {
     const value = arg.trim()
     if (/^\d{1,2}$/u.test(value)) {
-      const listed = this.listings.get(chatId)?.[Number(value) - 1]
+      const listed = this.listings.get(key)?.[Number(value) - 1]
       if (listed === undefined) throw new Error(this.t.sessionNotFound(value))
       return listed
     }
@@ -825,9 +798,9 @@ export class TelegramBridge {
   }
 
   /** `/model` lists models as buttons; `/model <name>` switches the chat's Session directly. */
-  private async modelCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+  private async modelCommand(key: string, sessionId: string | undefined, args: string): Promise<void> {
     const t = this.t
-    if (sessionId === undefined) return this.reply(chatId, t.modelNoSession)
+    if (sessionId === undefined) return this.reply(key, t.modelNoSession)
     const { groups } = await this.harness.listModels()
     const all = groups.flatMap(group => group.models.map(model => ({ group, model })))
     if (args === '') {
@@ -835,7 +808,7 @@ export class TelegramBridge {
       const choices = all.slice(0, PICKER_BUTTONS).map(({ group, model }) => ({ choice: { provider: group.provider, model: model.id }, name: model.name }))
       const buttons = all.slice(0, PICKER_BUTTONS).map(({ group, model }) =>
         `${current?.provider === group.provider && current.model === model.id ? '✓ ' : ''}${model.name} · ${group.name}`)
-      return this.sendPicker(chatId, { kind: 'model', sessionId, choices, at: Date.now() }, buttons,
+      return this.sendPicker(key, { kind: 'model', sessionId, choices, at: Date.now() }, buttons,
         t.modelList(current === undefined ? undefined : modelLabel(current), all.length))
     }
     const needle = args.trim().toLowerCase()
@@ -843,71 +816,71 @@ export class TelegramBridge {
       [`${group.provider}/${model.id}`, model.id, model.name].some(value => value.toLowerCase() === needle))
     const matches = exact.length > 0 ? exact : all.filter(({ group, model }) =>
       [`${group.provider}/${model.id}`, model.name].some(value => value.toLowerCase().includes(needle)))
-    if (matches.length === 0) return this.reply(chatId, t.modelNotFound(args))
+    if (matches.length === 0) return this.reply(key, t.modelNotFound(args))
     if (matches.length > 1) {
-      return this.reply(chatId, t.modelAmbiguous(matches.slice(0, 10).map(({ group, model }) => `${model.name} (${group.provider}/${model.id})`)))
+      return this.reply(key, t.modelAmbiguous(matches.slice(0, 10).map(({ group, model }) => `${model.name} (${group.provider}/${model.id})`)))
     }
     const { group, model } = matches[0]!
-    return this.switchModel(chatId, sessionId, { provider: group.provider, model: model.id }, model.name)
+    return this.switchModel(key, sessionId, { provider: group.provider, model: model.id }, model.name)
   }
 
-  private async switchModel(chatId: number, sessionId: string, choice: ModelChoice, name: string): Promise<void> {
+  private async switchModel(key: string, sessionId: string, choice: ModelChoice, name: string): Promise<void> {
     const t = this.t
     try {
       const applied = await this.harness.selectModel(sessionId, choice)
       await this.store.setPending(sessionId, { model: applied ? undefined : { ...choice } })
-      await this.reply(chatId, applied ? t.modelSwitched(name, modelLabel(choice)) : t.modelPending(name, modelLabel(choice)))
+      await this.reply(key, applied ? t.modelSwitched(name, modelLabel(choice)) : t.modelPending(name, modelLabel(choice)))
     } catch (error: unknown) {
-      await this.reply(chatId, t.failed(describe(error)))
+      await this.reply(key, t.failed(describe(error)))
     }
   }
 
   /** `/mode` lists permission presets as buttons; `/mode <name>` switches directly. */
-  private async modeCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+  private async modeCommand(key: string, sessionId: string | undefined, args: string): Promise<void> {
     const t = this.t
-    if (sessionId === undefined) return this.reply(chatId, t.noSession)
+    if (sessionId === undefined) return this.reply(key, t.noSession)
     const options = this.harness.listPresets()
     if (args === '') {
       const current = this.store.pending(sessionId)?.preset ?? this.harness.currentPreset(sessionId)
       const currentName = options.find(option => option.value === current)?.name ?? current
       const buttons = options.map(option => `${option.value === current ? '✓ ' : ''}${option.name}${option.description === undefined ? '' : ` — ${option.description}`}`)
-      return this.sendPicker(chatId, { kind: 'mode', sessionId, choices: options.slice(0, PICKER_BUTTONS), at: Date.now() }, buttons, t.modeList(currentName))
+      return this.sendPicker(key, { kind: 'mode', sessionId, choices: options.slice(0, PICKER_BUTTONS), at: Date.now() }, buttons, t.modeList(currentName))
     }
     const needle = args.trim().toLowerCase()
     const match = options.find(option => option.value.toLowerCase() === needle || option.name.toLowerCase() === needle)
       ?? options.filter(option => option.value.toLowerCase().includes(needle) || option.name.toLowerCase().includes(needle)).at(0)
-    if (match === undefined) return this.reply(chatId, t.modeNotFound(args))
-    return this.switchMode(chatId, sessionId, match)
+    if (match === undefined) return this.reply(key, t.modeNotFound(args))
+    return this.switchMode(key, sessionId, match)
   }
 
-  private async switchMode(chatId: number, sessionId: string, option: PresetOption): Promise<void> {
+  private async switchMode(key: string, sessionId: string, option: PresetOption): Promise<void> {
     const t = this.t
     try {
       const applied = this.harness.selectPreset(sessionId, option.value)
       await this.store.setPending(sessionId, { preset: applied ? undefined : option.value })
-      await this.reply(chatId, applied ? t.modeSwitched(option.name) : t.modePending(option.name))
+      await this.reply(key, applied ? t.modeSwitched(option.name) : t.modePending(option.name))
     } catch (error: unknown) {
-      await this.reply(chatId, t.failed(describe(error)))
+      await this.reply(key, t.failed(describe(error)))
     }
   }
 
-  private async sendPicker(chatId: number, picker: Picker, labels: string[], text: string): Promise<void> {
+  private async sendPicker(key: string, picker: Picker, labels: string[], text: string): Promise<void> {
     const id = randomUUID().slice(0, 8)
     const cutoff = Date.now() - PICKER_TTL_MS
-    for (const [key, old] of this.pickers) if (old.at < cutoff) this.pickers.delete(key)
+    for (const [pickerId, old] of this.pickers) if (old.at < cutoff) this.pickers.delete(pickerId)
     while (this.pickers.size >= 32) this.pickers.delete(this.pickers.keys().next().value as string)
     this.pickers.set(id, picker)
-    const buttons: TgInlineButton[][] = labels.slice(0, PICKER_BUTTONS).map((label, index) => [{ text: label.slice(0, 60), callback_data: `pk:${id}:${index}` }])
-    await this.enqueue(chatId, async (client) => { await client.sendMessage(chatId, text, { buttons }) })
-    this.log({ chatId }, { dir: 'out', kind: 'notice', text })
+    const buttons: Button[][] = labels.slice(0, PICKER_BUTTONS).map((label, index) => [{ text: label.slice(0, 60), data: `pk:${id}:${index}` }])
+    await this.enqueue(key, async (channel, chat) => { await channel.send(chat, { text, buttons }) })
+    this.log({ chatId: key }, { dir: 'out', kind: 'notice', text })
   }
 
   /** `/get <path>`: send a file from the working directory, or list a directory. */
-  private async getCommand(chatId: number, sessionId: string | undefined, args: string): Promise<void> {
+  private async getCommand(key: string, sessionId: string | undefined, args: string): Promise<void> {
     const t = this.t
-    if (args.trim() === '') return this.reply(chatId, t.getUsage)
-    const base = (sessionId === undefined ? undefined : this.harness.live(sessionId)?.cwd) ?? this.defaultWorkspace(chatId)
-    if (base === undefined) return this.reply(chatId, t.noWorkspace)
+    if (args.trim() === '') return this.reply(key, t.getUsage)
+    const base = (sessionId === undefined ? undefined : this.harness.live(sessionId)?.cwd) ?? this.defaultWorkspace(key)
+    if (base === undefined) return this.reply(key, t.noWorkspace)
     const target = resolve(base, args.trim())
     let real: string
     let root: string
@@ -915,50 +888,52 @@ export class TelegramBridge {
       root = await realpath(base)
       real = await realpath(target)
     } catch {
-      return this.reply(chatId, t.getMissing(args.trim()))
+      return this.reply(key, t.getMissing(args.trim()))
     }
     // Symlinks resolve before the check, so a link cannot reach outside the directory.
-    if (real !== root && !real.startsWith(root + sep)) return this.reply(chatId, t.getOutside)
+    if (real !== root && !real.startsWith(root + sep)) return this.reply(key, t.getOutside)
     const info = await stat(real)
     if (info.isDirectory()) {
       const entries = (await readdir(real, { withFileTypes: true }))
         .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
       const lines = entries.slice(0, DIRECTORY_LIST_LIMIT).map(entry => `${entry.isDirectory() ? '📁' : '📄'} ${entry.name}`)
-      return this.reply(chatId, t.getDir(relative(root, real) || '.', lines, entries.length - lines.length))
+      return this.reply(key, t.getDir(relative(root, real) || '.', lines, entries.length - lines.length))
     }
-    return this.sendLocalFile(chatId, real)
+    return this.sendLocalFile(key, real)
   }
 
-  private defaultWorkspace(chatId: number): string | undefined {
-    const path = this.store.get(chatId).workspacePath ?? this.settings().workspacePath
+  /** The chat's directory, else its line's, else the plugin-wide default. */
+  private defaultWorkspace(key: string): string | undefined {
+    const line = this.settings().lines.find(candidate => candidate.id === splitChatKey(key).line)
+    const path = this.store.get(key).workspacePath ?? (line?.workspacePath.trim() || this.settings().workspacePath)
     return path.trim() === '' ? undefined : path
   }
 
-  private async newSession(chatId: number, cwd: string): Promise<string> {
+  private async newSession(key: string, cwd: string): Promise<string> {
     if (!(await isDirectory(cwd))) throw new Error(this.t.badWorkspace(cwd))
     const s = this.settings()
     const sessionId = await this.harness.createSession(cwd, s.agentPreset, s.permissionPreset, s.model)
-    await this.store.update(chatId, { sessionId })
-    await this.chatLog?.bind(chatId, sessionId).catch(() => {})
+    await this.store.update(key, { sessionId })
+    await this.chatLog?.bind(key, sessionId).catch(() => {})
     return sessionId
   }
 
   /** The chat's Session, creating one in the default directory when it has none. */
-  private async ensureSession(chatId: number): Promise<string | undefined> {
-    const existing = this.store.get(chatId).sessionId
+  private async ensureSession(key: string): Promise<string | undefined> {
+    const existing = this.store.get(key).sessionId
     if (existing !== undefined) return existing
-    const cwd = this.defaultWorkspace(chatId)
+    const cwd = this.defaultWorkspace(key)
     if (cwd === undefined) {
-      await this.reply(chatId, this.t.noWorkspace)
+      await this.reply(key, this.t.noWorkspace)
       return undefined
     }
-    const sessionId = await this.newSession(chatId, cwd)
-    await this.reply(chatId, this.t.created(sessionId, cwd))
+    const sessionId = await this.newSession(key, cwd)
+    await this.reply(key, this.t.created(sessionId, cwd))
     return sessionId
   }
 
-  private async promptFromChat(chatId: number, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void> {
-    const sessionId = await this.ensureSession(chatId)
+  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void> {
+    const sessionId = await this.ensureSession(key)
     if (sessionId === undefined) return
     this.startTyping(sessionId)
     await this.harness.prompt(sessionId, parts, mode)
@@ -968,29 +943,30 @@ export class TelegramBridge {
 
   /**
    * Bind a chat to a Session from the Web UI, or make it follow the Session.
+   * @param key - chat key.
    * @param mode - `active` makes the chat talk to the Session; `watch` follows it; `none` removes both.
    */
-  async linkChat(chatId: number, sessionId: string, mode: 'active' | 'watch' | 'none'): Promise<void> {
+  async linkChat(key: string, sessionId: string, mode: 'active' | 'watch' | 'none'): Promise<void> {
     const t = this.t
     if (mode !== 'none') this.attachToWorkspace(sessionId)
-    const binding = this.store.get(chatId)
+    const binding = this.store.get(key)
     if (mode === 'active') {
-      await this.store.update(chatId, { sessionId })
-      await this.store.setWatch(chatId, sessionId, false)
-      await this.chatLog?.bind(chatId, sessionId).catch(() => {})
-      await this.reply(chatId, t.boundFromWeb(sessionId))
+      await this.store.update(key, { sessionId })
+      await this.store.setWatch(key, sessionId, false)
+      await this.chatLog?.bind(key, sessionId).catch(() => {})
+      await this.reply(key, t.boundFromWeb(sessionId))
     } else if (mode === 'watch') {
-      if (binding.sessionId === sessionId) await this.store.update(chatId, { sessionId: undefined })
-      await this.store.setWatch(chatId, sessionId, true)
-      await this.reply(chatId, t.watchFromWeb(sessionId))
+      if (binding.sessionId === sessionId) await this.store.update(key, { sessionId: undefined })
+      await this.store.setWatch(key, sessionId, true)
+      await this.reply(key, t.watchFromWeb(sessionId))
     } else {
-      if (binding.sessionId === sessionId) await this.store.update(chatId, { sessionId: undefined })
-      await this.store.setWatch(chatId, sessionId, false)
+      if (binding.sessionId === sessionId) await this.store.update(key, { sessionId: undefined })
+      await this.store.setWatch(key, sessionId, false)
     }
   }
 
   /** How each known chat relates to a Session. */
-  linksOf(sessionId: string): { chatId: number; mode: 'active' | 'watch' }[] {
+  linksOf(sessionId: string): { chatId: string; mode: 'active' | 'watch' }[] {
     return [
       ...this.store.chatsFor(sessionId).map(chatId => ({ chatId, mode: 'active' as const })),
       ...this.store.watchersOf(sessionId).map(chatId => ({ chatId, mode: 'watch' as const })),
@@ -998,19 +974,19 @@ export class TelegramBridge {
   }
 
   /** Send a message to a chat as the bot, typed in the Web UI. */
-  async sendFromWeb(chatId: number, text: string): Promise<void> {
-    if (this.client === undefined) throw new Error('the bot is not connected')
-    await this.deliverMarkdown(chatId, text)
-    this.log({ chatId }, { dir: 'out', kind: 'web', text })
+  async sendFromWeb(key: string, text: string): Promise<void> {
+    if (this.channelOf(key) === undefined) throw new Error('the line of this chat is not connected')
+    await this.deliverMarkdown(key, text)
+    this.log({ chatId: key }, { dir: 'out', kind: 'web', text })
   }
 
   // ─── outbound: Session events ───────────────────────────────────────────
 
   /** Chats that see a Session's output: bound chats, plus the schedule chats during a scheduled run. */
-  private outputChats(sessionId: string): number[] {
+  private outputChats(sessionId: string): string[] {
     const chats = new Set(this.store.chatsFor(sessionId))
     if (this.turns.get(sessionId)?.scheduled === true) {
-      for (const id of this.settings().scheduleChats) if (Number.isSafeInteger(Number(id))) chats.add(Number(id))
+      for (const id of this.settings().scheduleChats) if (id.trim() !== '') chats.add(id.trim())
     }
     return [...chats]
   }
@@ -1022,7 +998,7 @@ export class TelegramBridge {
    * @param cwd - the Session's working directory, which relative presented paths resolve against.
    */
   onSessionEvent(sessionId: string, event: { type: string; data?: unknown; seq?: number; time?: number }, cwd?: string): void {
-    if (this.client === undefined) return
+    if (this.live.size === 0) return
     if (event.type === 'turn/start') {
       this.turns.set(sessionId, { startedAt: event.time ?? Date.now(), tools: 0, scheduled: false })
       return
@@ -1057,7 +1033,7 @@ export class TelegramBridge {
       const files = (event.data as { files?: readonly { path: string; description?: string }[] }).files ?? []
       for (const file of files) {
         const path = isAbsolute(file.path) || cwd === undefined ? file.path : resolve(cwd, file.path)
-        for (const chatId of chats) void this.sendLocalFile(chatId, path, file.description)
+        for (const key of chats) void this.sendLocalFile(key, path, file.description)
       }
     } else if (event.type === 'turn/end') {
       this.flushTools(sessionId)
@@ -1071,15 +1047,15 @@ export class TelegramBridge {
   /** Turn-end notices: failures to everyone, summaries by setting, and always to followers. */
   private endTurn(
     sessionId: string, kind: string, error: string | undefined, turn: TurnState | undefined,
-    chats: number[], watchers: number[], endedAt: number,
+    chats: string[], watchers: string[], endedAt: number,
   ): void {
     const t = this.t
     const title = shortId(sessionId)
     if (kind !== 'completed') {
       const message = t.turnEnded(kind, error)
-      for (const chatId of chats) void this.reply(chatId, message)
+      for (const key of chats) void this.reply(key, message)
       const watchMessage = kind === 'aborted' ? t.watchAborted(title) : t.watchFailed(title, error ?? kind)
-      for (const chatId of watchers) void this.reply(chatId, watchMessage)
+      for (const key of watchers) void this.reply(key, watchMessage)
       return
     }
     if (turn === undefined) return
@@ -1087,11 +1063,11 @@ export class TelegramBridge {
     const s = this.settings()
     const summary = { seconds, tools: turn.tools, files: turn.files ?? [] }
     const wanted = s.turnSummary === 'always' || (s.turnSummary === 'long' && seconds >= s.turnSummaryMinSec)
-    if (wanted) for (const chatId of chats) void this.reply(chatId, t.turnDone(summary))
+    if (wanted) for (const key of chats) void this.reply(key, t.turnDone(summary))
     if (watchers.length > 0) {
       const excerpt = turn.lastText === undefined ? undefined : truncate(turn.lastText, EXCERPT_LENGTH)
       const message = t.turnDone({ ...summary, title, ...(excerpt === undefined ? {} : { excerpt }) })
-      for (const chatId of watchers) void this.reply(chatId, message)
+      for (const key of watchers) void this.reply(key, message)
     }
   }
 
@@ -1104,7 +1080,7 @@ export class TelegramBridge {
     const preview = previewArguments(args, TOOL_PREVIEW_LENGTH)
     const line = `🔧 ${name}${preview === '' ? '' : ` · ${preview}`}`
     // The history viewer keeps every call.
-    for (const chatId of this.outputChats(sessionId)) this.log({ chatId }, { dir: 'out', kind: 'tool', text: line }, sessionId)
+    for (const key of this.outputChats(sessionId)) this.log({ chatId: key }, { dir: 'out', kind: 'tool', text: line }, sessionId)
     let activity = this.toolBatches.get(sessionId)
     if (activity === undefined) {
       activity = { lines: [], count: 0, messages: new Map(), timer: undefined, lastFlush: 0, pending: Promise.resolve() }
@@ -1128,10 +1104,10 @@ export class TelegramBridge {
     const text = [this.t.toolActivity(activity.count), ...(hidden > 0 ? ['…'] : []), ...activity.lines].join('\n')
     // Each chat's send queue is serial, so an edit runs after the send that
     // created its message; the id is read when the operation runs.
-    const sends = this.outputChats(sessionId).map(chatId => this.enqueue(chatId, async (client) => {
-      const messageId = activity.messages.get(chatId)
-      if (messageId === undefined) activity.messages.set(chatId, (await client.sendMessage(chatId, text)).message_id)
-      else await client.editMessageText(chatId, messageId, text).catch(() => {})
+    const sends = this.outputChats(sessionId).map(key => this.enqueue(key, async (channel, chat) => {
+      const messageId = activity.messages.get(key)
+      if (messageId === undefined) activity.messages.set(key, await channel.send(chat, { text, editable: true }))
+      else await channel.edit(chat, messageId, { text, editable: true }).catch(() => {})
     }))
     activity.pending = Promise.all(sends).then(() => {})
     return activity.pending
@@ -1156,7 +1132,7 @@ export class TelegramBridge {
    * @param frame - one assistant stream frame.
    */
   onAssistantStream(sessionId: string, frame: { type: string; chunk?: { type: string; text?: string }; outcome?: { kind: string } }): void {
-    if (this.client === undefined || !this.settings().streamReplies) return
+    if (this.live.size === 0 || !this.settings().streamReplies) return
     if (frame.type === 'start') {
       const old = this.drafts.get(sessionId)
       if (old !== undefined) clearTimeout(old.timer)
@@ -1184,58 +1160,40 @@ export class TelegramBridge {
   }
 
   private async showDraft(sessionId: string, draft: Draft, text: string): Promise<void> {
-    for (const chatId of this.store.chatsFor(sessionId)) {
-      const messageId = draft.messages.get(chatId)
+    for (const key of this.store.chatsFor(sessionId)) {
+      const messageId = draft.messages.get(key)
       if (messageId === undefined) {
-        await this.enqueue(chatId, async (client) => {
-          const sent = await client.sendMessage(chatId, text)
-          draft.messages.set(chatId, sent.message_id)
+        await this.enqueue(key, async (channel, chat) => {
+          draft.messages.set(key, await channel.send(chat, { text, editable: true }))
         })
       } else {
-        await this.client?.editMessageText(chatId, messageId, text).catch(() => {})
+        const { chat } = splitChatKey(key)
+        await this.channelOf(key)?.edit(chat, messageId, { text, editable: true }).catch(() => {})
       }
     }
   }
 
   /** Deliver a committed reply: replace the draft when there is one, else send it. */
-  private async finishDraft(sessionId: string, chats: number[], text: string): Promise<void> {
+  private async finishDraft(sessionId: string, chats: string[], text: string): Promise<void> {
     const draft = this.drafts.get(sessionId)
     this.drafts.delete(sessionId)
     if (draft !== undefined) {
       clearTimeout(draft.timer)
       await draft.pending
     }
-    for (const chatId of chats) {
-      void this.deliverMarkdown(chatId, text, draft?.messages.get(chatId)).then(() => {
-        this.log({ chatId }, { dir: 'out', kind: 'assistant', text }, sessionId)
+    for (const key of chats) {
+      void this.deliverMarkdown(key, text, draft?.messages.get(key)).then(() => {
+        this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text }, sessionId)
       })
     }
   }
 
   /**
-   * Send Markdown as Telegram HTML, split to size; falls back to plain text when Telegram rejects the markup.
+   * Send Markdown rendered for the chat's platform, in order with the chat's other messages.
    * @param replaceId - a draft message to turn into the first piece.
    */
-  private deliverMarkdown(chatId: number, markdown: string, replaceId?: number): Promise<void> {
-    return this.enqueue(chatId, async (client) => {
-      let first = true
-      for (const piece of chunkMarkdown(markdown)) {
-        const html = markdownToTelegramHtml(piece)
-        const target = first ? replaceId : undefined
-        first = false
-        try {
-          if (target === undefined) await client.sendMessage(chatId, html, { parseMode: 'HTML' })
-          else await client.editMessageText(chatId, target, html, 'HTML')
-        } catch (error: unknown) {
-          if (!(error instanceof TelegramApiError) || error.code !== 400) throw error
-          if (/not modified/iu.test(error.description)) continue
-          for (const plain of chunkText(piece)) {
-            if (target === undefined) await client.sendMessage(chatId, plain)
-            else await client.editMessageText(chatId, target, plain).catch(() => client.sendMessage(chatId, plain))
-          }
-        }
-      }
-    })
+  private deliverMarkdown(key: string, markdown: string, replaceId?: string): Promise<void> {
+    return this.enqueue(key, (channel, chat) => channel.sendMarkdown(chat, markdown, replaceId))
   }
 
   /**
@@ -1249,11 +1207,12 @@ export class TelegramBridge {
   }
 
   private startTyping(sessionId: string): void {
-    const client = this.client
-    if (client === undefined || this.typing.has(sessionId)) return
+    if (this.live.size === 0 || this.typing.has(sessionId)) return
     if (this.store.chatsFor(sessionId).length === 0) return
     const tick = (): void => {
-      for (const chatId of this.store.chatsFor(sessionId)) void client.sendTyping(chatId).catch(() => {})
+      for (const key of this.store.chatsFor(sessionId)) {
+        void this.channelOf(key)?.typing(splitChatKey(key).chat).catch(() => {})
+      }
     }
     tick()
     this.typing.set(sessionId, setInterval(tick, TYPING_INTERVAL_MS))
@@ -1271,49 +1230,60 @@ export class TelegramBridge {
   }
 
   /** Send one local file to a chat, in order with its text messages. */
-  private sendLocalFile(chatId: number, path: string, description?: string): Promise<void> {
-    return this.enqueue(chatId, async (client) => {
+  private sendLocalFile(key: string, path: string, description?: string): Promise<void> {
+    return this.enqueue(key, async (channel, chat) => {
       const info = await stat(path)
       if (!info.isFile()) throw new Error(`${path} is not a file`)
-      if (info.size > SEND_LIMIT_BYTES) {
+      if (info.size > channel.sendLimitBytes) {
         const notice = this.t.deliverableTooLarge(path)
-        await client.sendMessage(chatId, notice)
-        this.log({ chatId }, { dir: 'out', kind: 'notice', text: notice })
+        await channel.send(chat, { text: notice })
+        this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: notice })
         return
       }
       const data = new Uint8Array(await readFile(path))
       const caption = description === undefined ? basename(path) : `${basename(path)}\n${description}`.slice(0, 1024)
-      const kind = outgoingKind(path, info.size)
-      await client.sendFile(kind, chatId, { data, name: basename(path) }, caption)
-      const attachment = await this.viewerAttachment(chatId, basename(path), data, kind === 'photo' ? sniffImageType(data) : undefined)
-      this.log({ chatId }, {
+      const photo = outgoingKind(path, info.size) === 'photo'
+      await channel.sendFile(chat, { data, name: basename(path), photo }, caption)
+      const attachment = await this.viewerAttachment(key, basename(path), data, photo ? sniffImageType(data) : undefined)
+      this.log({ chatId: key }, {
         dir: 'out', kind: 'file', attachments: [{ ...attachment, path }],
         ...(description === undefined ? {} : { text: description }),
       })
     })
   }
 
-  /** Send plain text to a chat in order, split to Telegram's size limit. */
-  private reply(chatId: number, text: string, kind: OutKind = 'notice'): Promise<void> {
-    return this.enqueue(chatId, async (client) => {
-      for (const chunk of chunkText(text)) await client.sendMessage(chatId, chunk)
-      this.log({ chatId }, { dir: 'out', kind, text })
+  /** Send plain text to a chat in order, split to the platform's size limit. */
+  private reply(key: string, text: string, kind: OutKind = 'notice'): Promise<void> {
+    return this.enqueue(key, async (channel, chat) => {
+      for (const chunk of chunkText(text)) await channel.send(chat, { text: chunk })
+      this.log({ chatId: key }, { dir: 'out', kind, text })
     })
   }
 
+  /** The connected adapter of a chat's line. */
+  private channelOf(key: string): Channel | undefined {
+    return this.live.get(splitChatKey(key).line)?.channel
+  }
+
   /** Run one send operation after the chat's earlier ones, containing its failure. */
-  private enqueue(chatId: number, send: (client: TelegramClient) => Promise<void>): Promise<void> {
-    const client = this.client
-    if (client === undefined) return Promise.resolve()
-    const previous = this.sendTails.get(chatId) ?? Promise.resolve()
-    const next = previous.then(() => send(client)).catch((error: unknown) => {
-      this.logger.warn(`switchboard: send to chat ${chatId} failed: ${describe(error)}`)
+  private enqueue(key: string, send: (channel: Channel, chat: string) => Promise<void>): Promise<void> {
+    const channel = this.channelOf(key)
+    if (channel === undefined) return Promise.resolve()
+    const { chat } = splitChatKey(key)
+    const previous = this.sendTails.get(key) ?? Promise.resolve()
+    const next = previous.then(() => send(channel, chat)).catch((error: unknown) => {
+      this.logger.warn(`switchboard: send to chat ${key} failed: ${describe(error)}`)
     })
-    this.sendTails.set(chatId, next)
+    this.sendTails.set(key, next)
     void next.then(() => {
-      if (this.sendTails.get(chatId) === next) this.sendTails.delete(chatId)
+      if (this.sendTails.get(key) === next) this.sendTails.delete(key)
     })
     return next
+  }
+
+  /** Chats of a Session whose line is connected now. */
+  private reachable(chats: readonly string[]): string[] {
+    return chats.filter(key => this.live.get(splitChatKey(key).line)?.state.kind === 'running')
   }
 
   // ─── approvals and pickers ──────────────────────────────────────────────
@@ -1321,7 +1291,7 @@ export class TelegramBridge {
   /**
    * Ask the chats bound to or following a Session to approve one tool call.
    * @param request - the Session, tool, optional call id and reason, and withdrawal signal.
-   * @returns the Telegram answer, or `delegate` when no chat is linked, approvals are off, or the wait timed out.
+   * @returns the chat's answer, or `delegate` when no connected chat is linked, approvals are off, or the wait timed out.
    */
   async requestApproval(request: {
     sessionId: string
@@ -1331,9 +1301,8 @@ export class TelegramBridge {
     signal?: AbortSignal
   }): Promise<TelegramApprovalOutcome> {
     const s = this.settings()
-    const client = this.client
-    if (!s.approvalViaTelegram || client === undefined || this.state.kind !== 'running') return 'delegate'
-    const chats = [...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])]
+    if (!s.approvalViaTelegram) return 'delegate'
+    const chats = this.reachable([...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])])
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
     // The question should follow the reply that led to it.
@@ -1343,9 +1312,9 @@ export class TelegramBridge {
     const call = request.callId === undefined ? undefined : this.toolCalls.get(request.callId)
     const detail = call === undefined ? '' : previewArguments(call.arguments, 800)
     const text = t.approvalAsk(request.toolName, detail, request.reason)
-    const buttons = [[
-      { text: t.allow, callback_data: `ap:${id}:y` },
-      { text: t.reject, callback_data: `ap:${id}:n` },
+    const buttons: Button[][] = [[
+      { text: t.allow, data: `ap:${id}:y` },
+      { text: t.reject, data: `ap:${id}:n` },
     ]]
 
     const answer = Promise.withResolvers<TelegramApprovalOutcome>()
@@ -1357,8 +1326,8 @@ export class TelegramBridge {
         clearTimeout(timer)
         request.signal?.removeEventListener('abort', onAbort)
         for (const prompt of pending.prompts) {
-          void client.editMessageText(prompt.chatId, prompt.messageId, `${text}\n\n${note}`).catch(() => {})
-          this.log({ chatId: prompt.chatId }, {
+          void this.channelOf(prompt.chat)?.edit(splitChatKey(prompt.chat).chat, prompt.messageId, { text: `${text}\n\n${note}` }).catch(() => {})
+          this.log({ chatId: prompt.chat }, {
             dir: 'out', kind: 'approval',
             ...(request.reason === undefined ? {} : { text: request.reason }),
             approval: {
@@ -1378,9 +1347,9 @@ export class TelegramBridge {
     this.approvals.set(id, pending)
 
     // Through each chat's queue, so the question follows the messages that led to it.
-    await Promise.all(chats.map(chatId => this.enqueue(chatId, async (c) => {
-      const sent = await c.sendMessage(chatId, text, { buttons })
-      pending.prompts.push({ chatId, messageId: sent.message_id })
+    await Promise.all(chats.map(key => this.enqueue(key, async (channel, chat) => {
+      const messageId = await channel.send(chat, { text, buttons })
+      pending.prompts.push({ chat: key, messageId })
     })))
     if (pending.prompts.length === 0) pending.settle('delegate', '')
     return answer.promise
@@ -1388,13 +1357,12 @@ export class TelegramBridge {
 
   /**
    * Ask the Agent's questions in the chats bound to or following a Session.
-   * @returns the answers, `delegate` when no chat is linked, the feature is off, or nobody answered in time.
+   * @returns the answers, `delegate` when no connected chat is linked, the feature is off, or nobody answered in time.
    */
   async requestAnswers(request: { sessionId: string; questions: readonly QuestionItem[]; signal?: AbortSignal }): Promise<QuestionAnswer | 'delegate' | 'cancelled'> {
     const s = this.settings()
-    const client = this.client
-    if (!s.questionsViaTelegram || client === undefined || this.state.kind !== 'running' || request.questions.length === 0) return 'delegate'
-    const chats = [...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])]
+    if (!s.questionsViaTelegram || request.questions.length === 0) return 'delegate'
+    const chats = this.reachable([...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])])
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
     this.flushTools(request.sessionId)
@@ -1413,8 +1381,8 @@ export class TelegramBridge {
           const summary = note ?? (entry.custom !== undefined
             ? t.questionAnswered([...entry.selected, entry.custom].join(', '))
             : entry.selected.size > 0 ? t.questionAnswered([...entry.selected].join(', ')) : t.questionSkipped)
-          for (const [chatId, messageId] of entry.messages) {
-            void client.editMessageText(chatId, messageId, `${questionText(t, entry.item)}\n\n${summary}`).catch(() => {})
+          for (const [key, messageId] of entry.messages) {
+            void this.channelOf(key)?.edit(splitChatKey(key).chat, messageId, { text: `${questionText(t, entry.item)}\n\n${summary}` }).catch(() => {})
           }
         }
         answer.resolve(outcome)
@@ -1426,12 +1394,11 @@ export class TelegramBridge {
     this.questions.set(id, pending)
     for (const [index, entry] of pending.items.entries()) {
       const text = questionText(t, entry.item)
-      for (const chatId of chats) {
-        await this.enqueue(chatId, async (c) => {
-          const sent = await c.sendMessage(chatId, text, { buttons: questionButtons(t, id, index, entry) })
-          entry.messages.set(chatId, sent.message_id)
+      for (const key of chats) {
+        await this.enqueue(key, async (channel, chat) => {
+          entry.messages.set(key, await channel.send(chat, { text, buttons: questionButtons(t, id, index, entry) }))
         })
-        this.log({ chatId }, { dir: 'out', kind: 'notice', text }, request.sessionId)
+        this.log({ chatId: key }, { dir: 'out', kind: 'notice', text }, request.sessionId)
       }
     }
     if (pending.items.every(entry => entry.messages.size === 0)) pending.settle('delegate', '')
@@ -1439,9 +1406,9 @@ export class TelegramBridge {
   }
 
   /** Take free text in a chat as the answer to its oldest unanswered question. */
-  private answerByText(chatId: number, text: string): boolean {
+  private answerByText(key: string, text: string): boolean {
     for (const pending of this.questions.values()) {
-      if (!pending.chats.includes(chatId)) continue
+      if (!pending.chats.includes(key)) continue
       const entry = pending.items.find(candidate => !candidate.done)
       if (entry === undefined) continue
       entry.custom = text
@@ -1465,31 +1432,30 @@ export class TelegramBridge {
     }
   }
 
-  private async handleQuestionPress(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
-    const [, id = '', index = '', action = ''] = (query.data ?? '').split(':')
+  private async handleQuestionPress(channel: Channel, action: InboundAction): Promise<void> {
+    const [, id = '', index = '', choice = ''] = action.data.split(':')
     const pending = this.questions.get(id)
     const entry = pending?.items[Number(index)]
     if (pending === undefined || entry === undefined || entry.done) {
-      await client.answerCallbackQuery(query.id, this.t.approvalGone)
+      await channel.ack(action, this.t.approvalGone)
       return
     }
-    await client.answerCallbackQuery(query.id)
+    await channel.ack(action)
     const options = entry.item.options ?? []
-    if (action === 's') {
+    if (choice === 's') {
       entry.selected.clear()
       entry.done = true
-    } else if (action === 'd') {
+    } else if (choice === 'd') {
       entry.done = true
     } else {
-      const label = options[Number(action)]?.label
+      const label = options[Number(choice)]?.label
       if (label === undefined) return
       if (entry.item.multiSelect === true) {
         if (entry.selected.has(label)) entry.selected.delete(label)
         else entry.selected.add(label)
-        for (const [chatId, messageId] of entry.messages) {
-          void client.call('editMessageReplyMarkup', {
-            chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: questionButtons(this.t, id, Number(index), entry) },
-          }).catch(() => {})
+        const text = questionText(this.t, entry.item)
+        for (const [key, messageId] of entry.messages) {
+          void this.channelOf(key)?.editButtons(splitChatKey(key).chat, messageId, { text, buttons: questionButtons(this.t, id, Number(index), entry) }).catch(() => {})
         }
         return
       }
@@ -1499,50 +1465,53 @@ export class TelegramBridge {
     this.afterAnswer(pending)
   }
 
-  private async handleCallback(query: TgCallbackQuery): Promise<void> {
-    const client = this.client
-    if (client === undefined) return
+  private async handleAction(line: LiveLine, action: InboundAction): Promise<void> {
+    const { channel } = line
     const t = this.t
-    const chat = query.message?.chat ?? { id: 0, type: 'private' as const }
-    if (!this.allowed(query.from, chat)) {
-      await client.answerCallbackQuery(query.id, t.unauthorized(query.from.id))
+    if (!this.allowed(this.settingsOf(line), action.from, action.chat)) {
+      await channel.ack(action, t.unauthorized(action.from.id))
       return
     }
-    if (query.data?.startsWith('pk:') === true) return this.handlePick(client, query)
-    if (query.data?.startsWith('qa:') === true) return this.handleQuestionPress(client, query)
-    const match = /^ap:([\w-]+):([yn])$/u.exec(query.data ?? '')
+    if (action.data.startsWith('pk:')) return this.handlePick(line, action)
+    if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action)
+    const match = /^ap:([\w-]+):([yn])$/u.exec(action.data)
     if (match === null) {
-      await client.answerCallbackQuery(query.id)
+      await channel.ack(action)
       return
     }
     const pending = this.approvals.get(match[1] ?? '')
     if (pending === undefined) {
-      await client.answerCallbackQuery(query.id, t.approvalGone)
+      await channel.ack(action, t.approvalGone)
       return
     }
-    const who = query.from.username === undefined ? query.from.first_name : `@${query.from.username}`
+    const who = action.from.username === undefined ? action.from.name : `@${action.from.username}`
     if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who), who)
     else pending.settle('rejected', t.approvalRejected(who), who)
-    await client.answerCallbackQuery(query.id)
+    await channel.ack(action)
   }
 
-  private async handlePick(client: TelegramClient, query: TgCallbackQuery): Promise<void> {
-    const [, id = '', index = ''] = (query.data ?? '').split(':')
+  private async handlePick(line: LiveLine, action: InboundAction): Promise<void> {
+    const [, id = '', index = ''] = action.data.split(':')
     const picker = this.pickers.get(id)
-    const chatId = query.message?.chat.id
-    if (picker === undefined || chatId === undefined) {
-      await client.answerCallbackQuery(query.id, this.t.modelPickerExpired)
+    if (picker === undefined || action.chat === undefined) {
+      await line.channel.ack(action, this.t.modelPickerExpired)
       return
     }
-    await client.answerCallbackQuery(query.id)
+    await line.channel.ack(action)
+    const key = chatKey(line.line.id, action.chat.id)
     if (picker.kind === 'model') {
       const picked = picker.choices[Number(index)]
-      if (picked !== undefined) await this.switchModel(chatId, picker.sessionId, picked.choice, picked.name)
+      if (picked !== undefined) await this.switchModel(key, picker.sessionId, picked.choice, picked.name)
     } else {
       const picked = picker.choices[Number(index)]
-      if (picked !== undefined) await this.switchMode(chatId, picker.sessionId, picked)
+      if (picked !== undefined) await this.switchMode(key, picker.sessionId, picked)
     }
   }
+}
+
+/** Restart key of a line: only connection settings restart it; the rest is read per message. */
+function lineKey(line: LineSettings): string {
+  return JSON.stringify([line.type, line.secret, line.apiBaseUrl, line.pollTimeoutSec, line.appId, line.domain])
 }
 
 /** The text of one question message. */
@@ -1551,14 +1520,14 @@ function questionText(t: Messages, item: QuestionItem): string {
 }
 
 /** Option buttons, ticked for a multi-select question, plus Done/Skip. */
-function questionButtons(t: Messages, id: string, index: number, entry: { item: QuestionItem; selected: Set<string> }): TgInlineButton[][] {
-  const rows: TgInlineButton[][] = (entry.item.options ?? []).slice(0, PICKER_BUTTONS).map((option, optionIndex) => [{
+function questionButtons(t: Messages, id: string, index: number, entry: { item: QuestionItem; selected: Set<string> }): Button[][] {
+  const rows: Button[][] = (entry.item.options ?? []).slice(0, PICKER_BUTTONS).map((option, optionIndex) => [{
     text: `${entry.item.multiSelect === true && entry.selected.has(option.label) ? '☑ ' : entry.item.multiSelect === true ? '☐ ' : ''}${option.label}`.slice(0, 60),
-    callback_data: `qa:${id}:${index}:${optionIndex}`,
+    data: `qa:${id}:${index}:${optionIndex}`,
   }])
-  const tail: TgInlineButton[] = []
-  if (entry.item.multiSelect === true) tail.push({ text: t.questionDone, callback_data: `qa:${id}:${index}:d` })
-  tail.push({ text: t.questionSkip, callback_data: `qa:${id}:${index}:s` })
+  const tail: Button[] = []
+  if (entry.item.multiSelect === true) tail.push({ text: t.questionDone, data: `qa:${id}:${index}:d` })
+  tail.push({ text: t.questionSkip, data: `qa:${id}:${index}:s` })
   rows.push(tail)
   return rows
 }
@@ -1582,22 +1551,17 @@ function draftPreview(text: string): string {
 }
 
 /** What the history knows about a chat from one incoming message. */
-function chatInfo(chat: TgChat, from: TgUser): ChatInfo {
-  const username = chat.username ?? (chat.type === 'private' ? from.username : undefined)
+function chatInfo(key: string, chat: ChannelChat): ChatInfo {
   return {
-    chatId: chat.id,
-    title: chat.title ?? displayName(from),
+    chatId: key,
     type: chat.type,
-    ...(username === undefined ? {} : { username }),
+    ...(chat.title === undefined ? {} : { title: chat.title }),
+    ...(chat.username === undefined ? {} : { username: chat.username }),
   }
 }
 
-function sender(user: TgUser): { id: number; name: string; username?: string } {
-  return { id: user.id, name: displayName(user), ...(user.username === undefined ? {} : { username: user.username }) }
-}
-
-function displayName(user: TgUser): string {
-  return [user.first_name, user.last_name].filter(Boolean).join(' ') || (user.username ?? String(user.id))
+function sender(user: ChannelUser): { id: string; name: string; username?: string } {
+  return { id: user.id, name: user.name, ...(user.username === undefined ? {} : { username: user.username }) }
 }
 
 /** Concatenate the visible text blocks of a committed assistant message. */
@@ -1622,16 +1586,4 @@ async function isDirectory(path: string): Promise<boolean> {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, ms)
-    function done(): void {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', done)
-      resolve()
-    }
-    signal.addEventListener('abort', done, { once: true })
-  })
 }

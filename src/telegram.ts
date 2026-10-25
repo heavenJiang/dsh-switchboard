@@ -3,6 +3,8 @@
  * over Node's built-in fetch so the launcher's proxy policy applies.
  */
 
+import { FileTooLargeError } from './channels/types.ts'
+
 /** Telegram user as the Bot API reports it. */
 export interface TgUser {
   readonly id: number
@@ -113,13 +115,7 @@ export class TelegramApiError extends Error {
   }
 }
 
-/** A download over the configured size limit. */
-export class FileTooLargeError extends Error {
-  constructor(readonly size: number, readonly limit: number) {
-    super(`file is ${(size / 1048576).toFixed(1)} MB, over the ${(limit / 1048576).toFixed(0)} MB limit`)
-    this.name = 'FileTooLargeError'
-  }
-}
+export { FileTooLargeError }
 
 /** Transport options for {@link TelegramClient}. */
 export interface TelegramClientOptions {

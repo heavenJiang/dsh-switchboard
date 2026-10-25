@@ -5,7 +5,8 @@
 
 /** Who sent an incoming message. */
 export interface ChatSender {
-  readonly id: number
+  /** Numbers in entries written before lines existed. */
+  readonly id: string | number
   readonly name: string
   readonly username?: string
 }
@@ -46,7 +47,8 @@ export interface ChatEntry {
 
 /** What the chat list shows per chat. */
 export interface ChatSummary {
-  readonly chatId: number
+  /** Chat key: `<line>:<chat id>`, or a bare Telegram id on the legacy line. */
+  readonly chatId: string
   title: string
   type: string
   username?: string
@@ -58,11 +60,14 @@ export interface ChatSummary {
   deniedOnly: boolean
   /** The bound Session's model (`provider/model`), when known; added by the overview route, never stored. */
   model?: string
+  /** The chat's line and its platform; added by the overview route, never stored. */
+  line?: string
+  channel?: string
 }
 
 /** Facts about a chat known when a message arrives. */
 export interface ChatInfo {
-  readonly chatId: number
+  readonly chatId: string
   readonly title?: string
   readonly type?: string
   readonly username?: string
@@ -75,7 +80,7 @@ export interface ChatPage {
   readonly more: boolean
 }
 
-/** Dashboard figures for the Telegram panel. */
+/** Dashboard figures for the panel. */
 export interface ChatStats {
   readonly today: { readonly in: number; readonly out: number }
   readonly week: {

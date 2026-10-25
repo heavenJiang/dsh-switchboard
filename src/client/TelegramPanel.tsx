@@ -1,5 +1,5 @@
 /**
- * The Telegram history viewer: a chat list beside the selected chat's
+ * The chat history viewer, across every line: a chat list beside the selected chat's
  * messages, read from the Host's owner-only `/api/switchboard/*` routes
  * and refreshed by polling while the page is open and visible.
  */
@@ -12,6 +12,14 @@ import type { UpdateCheck } from './update.ts'
 /** Connection state as the Host reports it. */
 type BridgeState =
   | { kind: 'stopped' } | { kind: 'connecting' } | { kind: 'running'; username: string } | { kind: 'error'; message: string }
+
+/** One line and its connection. */
+interface LineStatus {
+  id: string
+  type: 'telegram' | 'feishu'
+  name: string
+  state: BridgeState
+}
 
 /** What the page asks of the rest of the Web client. */
 export interface PanelActions {
@@ -73,18 +81,18 @@ function usePolling(tick: () => Promise<void>, ms: number, deps: readonly unknow
  */
 export function createTelegramPanel(actions: PanelActions) {
   return function TelegramPanel({ t }: { t: T }): ReactNode {
-    const [state, setState] = useState<BridgeState>({ kind: 'stopped' })
+    const [lines, setLines] = useState<LineStatus[]>([])
     const [chats, setChats] = useState<ChatSummary[] | undefined>(undefined)
     const [failed, setFailed] = useState(false)
-    const [selected, setSelected] = useState<number | undefined>(undefined)
+    const [selected, setSelected] = useState<string | undefined>(undefined)
     const [query, setQuery] = useState('')
     const [stats, setStats] = useState<ChatStats | undefined>(undefined)
     const update = actions.useUpdate()
 
     usePolling(async () => {
       try {
-        const overview = await post<{ state: BridgeState; chats: ChatSummary[]; stats?: ChatStats }>('overview')
-        setState(overview.state)
+        const overview = await post<{ state: BridgeState; lines?: LineStatus[]; chats: ChatSummary[]; stats?: ChatStats }>('overview')
+        setLines(overview.lines ?? [{ id: 'telegram', type: 'telegram', name: 'Telegram', state: overview.state }])
         setStats(overview.stats)
         setChats(overview.chats)
         setFailed(false)
@@ -119,7 +127,11 @@ export function createTelegramPanel(actions: PanelActions) {
                   </button>
                 </div>
               </div>
-              <StateBadge state={state} t={t} />
+              <div className="tgb-lines">
+                {lines.length === 0
+                  ? <StateBadge state={{ kind: 'stopped' }} t={t} />
+                  : lines.map(line => <StateBadge key={line.id} state={line.state} line={line} t={t} />)}
+              </div>
               <p className="tgb-subtitle">{t('panelSubtitle')}</p>
               {chats !== undefined && chats.length > 0 && (
                 <input className="tgb-search" type="search" placeholder={t('search')} value={query}
@@ -141,6 +153,7 @@ export function createTelegramPanel(actions: PanelActions) {
                       </span>
                       <span className="tgb-chat-bottom">
                         <span className="tgb-chat-preview">{chat.lastText || '—'}</span>
+                        {lines.length > 1 && <span className="tgb-tag" data-channel={chat.channel}>{lineName(lines, chat)}</span>}
                         {chat.deniedOnly && <span className="tgb-tag" data-tone="error">{t('deniedTag')}</span>}
                       </span>
                     </span>
@@ -160,7 +173,7 @@ export function createTelegramPanel(actions: PanelActions) {
               ? <EmptyState t={t} onSettings={actions.openSettings} />
               : current === undefined
                 ? <Dashboard stats={stats} t={t} />
-                : <Thread key={current.chatId} chat={current} t={t} actions={actions} onBack={() => { setSelected(undefined) }} />}
+                : <Thread key={current.chatId} chat={current} line={lineName(lines, current)} t={t} actions={actions} onBack={() => { setSelected(undefined) }} />}
           </section>
         </div>
       </div>
@@ -177,11 +190,24 @@ function GearIcon(): ReactNode {
   )
 }
 
-function StateBadge({ state, t }: { state: BridgeState; t: T }): ReactNode {
-  const label = state.kind === 'running' ? `${t('stateRunning')} · @${state.username}`
+function StateBadge({ state, line, t }: { state: BridgeState; line?: LineStatus; t: T }): ReactNode {
+  const status = state.kind === 'running' ? `${line?.type === 'feishu' ? '' : '@'}${state.username}`
     : state.kind === 'connecting' ? t('stateConnecting')
       : state.kind === 'error' ? t('stateError') : t('stateStopped')
+  const label = line === undefined ? status : `${line.name} · ${status}`
   return <span className="tgb-state" data-kind={state.kind} title={state.kind === 'error' ? state.message : undefined}>{label}</span>
+}
+
+/** The display name of a chat's line. */
+function lineName(lines: readonly LineStatus[], chat: ChatSummary): string {
+  const id = chat.line ?? 'telegram'
+  return lines.find(line => line.id === id)?.name ?? id
+}
+
+/** The platform's own id inside a chat key. */
+function nativeId(key: string): string {
+  const at = key.indexOf(':')
+  return at < 0 ? key : key.slice(at + 1)
 }
 
 function EmptyState({ t, onSettings }: { t: T; onSettings: () => void }): ReactNode {
@@ -196,11 +222,11 @@ function EmptyState({ t, onSettings }: { t: T; onSettings: () => void }): ReactN
 }
 
 /** One chat's messages: newest page first, older pages on demand, polled for new entries. */
-function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions: PanelActions; onBack: () => void }): ReactNode {
+function Thread({ chat, line, t, actions, onBack }: { chat: ChatSummary; line: string; t: T; actions: PanelActions; onBack: () => void }): ReactNode {
   const [entries, setEntries] = useState<ChatEntry[] | undefined>(undefined)
   const [more, setMore] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
-  const [sender, setSender] = useState<number | undefined>(undefined)
+  const [sender, setSender] = useState<string | undefined>(undefined)
   const scroller = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true)
 
@@ -241,10 +267,11 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
   }, [chat.chatId, entries])
 
   const meta = [
+    line,
     chat.type === 'private' ? t('privateChat') : t('groupChat'),
     chat.username === undefined ? undefined : `@${chat.username}`,
     chat.model === undefined ? undefined : `🧠 ${chat.model}`,
-    `ID ${chat.chatId}`,
+    `ID ${nativeId(chat.chatId)}`,
     `${chat.count} ${t('messages')}`,
   ].filter(Boolean).join(' · ')
 
@@ -282,7 +309,7 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
         {chat.type !== 'private' && entries !== undefined && (
           <SenderChips entries={entries} selected={sender} onSelect={setSender} t={t} />
         )}
-        {(sender === undefined ? entries : entries?.filter(entry => entry.from?.id === sender))?.map((entry, index, shown) => (
+        {(sender === undefined ? entries : entries?.filter(entry => entry.from !== undefined && String(entry.from.id) === sender))?.map((entry, index, shown) => (
           <Fragment key={entry.id}>
             {(index === 0 || !sameDay(shown[index - 1]!.at, entry.at)) && <div className="tgb-day">{dayLabel(entry.at, t)}</div>}
             <Entry entry={entry} chat={chat} t={t} />
@@ -295,14 +322,15 @@ function Thread({ chat, t, actions, onBack }: { chat: ChatSummary; t: T; actions
 
 /** Per-member filter for group chats: who sent how much. */
 function SenderChips({ entries, selected, onSelect, t }: {
-  entries: ChatEntry[]; selected: number | undefined; onSelect: (id: number | undefined) => void; t: T
+  entries: ChatEntry[]; selected: string | undefined; onSelect: (id: string | undefined) => void; t: T
 }): ReactNode {
-  const counts = new Map<number, { name: string; count: number }>()
+  const counts = new Map<string, { name: string; count: number }>()
   for (const entry of entries) {
     if (entry.dir !== 'in' || entry.from === undefined) continue
-    const row = counts.get(entry.from.id) ?? { name: entry.from.name, count: 0 }
+    const id = String(entry.from.id)
+    const row = counts.get(id) ?? { name: entry.from.name, count: 0 }
     row.count++
-    counts.set(entry.from.id, row)
+    counts.set(id, row)
   }
   if (counts.size < 2) return null
   return (
@@ -439,8 +467,9 @@ function FileChip({ file }: { file: ChatAttachment }): ReactNode {
 
 const AVATAR_COLORS = ['#e17076', '#faa774', '#a695e7', '#7bc862', '#6ec9cb', '#65aadd', '#ee7aae']
 
-function Avatar({ id, name, size }: { id: number; name: string; size?: 'sm' | 'xs' }): ReactNode {
-  const color = AVATAR_COLORS[Math.abs(id) % AVATAR_COLORS.length]
+function Avatar({ id, name, size }: { id: string | number; name: string; size?: 'sm' | 'xs' }): ReactNode {
+  const hash = [...String(id)].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) % 1_000_003, 0)
+  const color = AVATAR_COLORS[hash % AVATAR_COLORS.length]
   const initial = [...name.trim()][0]?.toUpperCase() ?? '?'
   return <span className="tgb-avatar" data-size={size} style={{ background: color }} aria-hidden="true">{initial}</span>
 }
@@ -461,8 +490,8 @@ export function ConsoleIcon({ size }: { size: number }): ReactNode {
   )
 }
 
-function mediaUrl(chatId: number, name: string): string {
-  return `${API}/media?chat=${chatId}&name=${encodeURIComponent(name)}`
+function mediaUrl(chatId: string, name: string): string {
+  return `${API}/media?chat=${encodeURIComponent(chatId)}&name=${encodeURIComponent(name)}`
 }
 
 function clock(at: number): string {

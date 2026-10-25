@@ -68,7 +68,7 @@ export function incomingAttachments(message: TgMessage): IncomingAttachment[] {
  * @param attachment - incoming attachment.
  * @param data - its downloaded bytes.
  */
-export function promptImageType(attachment: IncomingAttachment, data: Uint8Array): string | undefined {
+export function promptImageType(attachment: { readonly mediaType?: string | undefined }, data: Uint8Array): string | undefined {
   if (attachment.mediaType === undefined || !IMAGE_TYPES.has(attachment.mediaType)) return undefined
   return sniffImageType(data)
 }

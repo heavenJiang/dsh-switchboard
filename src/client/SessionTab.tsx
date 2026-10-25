@@ -1,7 +1,7 @@
 /**
- * The Telegram tab inside a Session: which chats are linked to it, linking
- * another chat (bind to talk, or follow for notices), sending a message as
- * the bot, and the Session's Telegram activity. Data comes from the Host's
+ * The Switchboard tab inside a Session: which chats are linked to it, on any
+ * line, linking another chat (bind to talk, or follow for notices), sending a
+ * message as the bot, and the Session's chat activity. Data comes from the Host's
  * owner-only `/api/switchboard/session` route, polled while visible.
  */
 
@@ -13,9 +13,9 @@ type T = (key: TelegramBridgeLocaleKey) => string
 
 interface SessionView {
   connected: boolean
-  links: { chatId: number; mode: 'active' | 'watch'; title: string }[]
+  links: { chatId: string; mode: 'active' | 'watch'; title: string; line?: string }[]
   chats: ChatSummary[]
-  entries: (ChatEntry & { chatId: number })[]
+  entries: (ChatEntry & { chatId: string })[]
 }
 
 const POLL_MS = 4000
@@ -78,10 +78,13 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
       setBusy(false)
     }
   }
-  const link = (chatId: number, mode: 'active' | 'watch' | 'none'): Promise<void> => act(() => post('link', { chatId, sessionId, mode }))
+  const link = (chatId: string, mode: 'active' | 'watch' | 'none'): Promise<void> => act(() => post('link', { chatId, sessionId, mode }))
 
   if (view === undefined) return <div className="tgb-tab"><p className="tgb-status">{error ?? t('loading')}</p></div>
-  const titleOf = (chatId: number): string => view.chats.find(chat => chat.chatId === chatId)?.title ?? String(chatId)
+  const titleOf = (chatId: string): string => view.chats.find(chat => chat.chatId === String(chatId))?.title ?? String(chatId)
+  // Name the line only when chats come from more than one.
+  const severalLines = new Set(view.chats.map(chat => chat.line ?? 'telegram')).size > 1
+  const lineTag = (line: string | undefined): string => severalLines ? ` · ${line ?? 'telegram'}` : ''
   const bound = view.links.filter(item => item.mode === 'active')
   const linkable = view.chats.filter(chat => !view.links.some(item => item.chatId === chat.chatId))
 
@@ -98,7 +101,7 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
             <ul className="tgb-links">
               {view.links.map(item => (
                 <li key={item.chatId}>
-                  <span className="tgb-link-title">{item.title}</span>
+                  <span className="tgb-link-title">{item.title}{lineTag(item.line)}</span>
                   <span className="tgb-tag" data-tone={item.mode === 'active' ? 'success' : undefined}>{item.mode === 'active' ? t('tabActive') : t('tabWatch')}</span>
                   <button type="button" className="tgb-button" disabled={busy} onClick={() => { void link(item.chatId, 'none') }}>{t('tabUnlink')}</button>
                 </li>
@@ -112,13 +115,13 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
               <select className="tgb-select" aria-label={t('tabLinkTo')} value={picked} onChange={(event) => { setPicked(event.target.value) }}>
                 <option value="">{t('tabPickChat')}</option>
                 {linkable.map(chat => (
-                  <option key={chat.chatId} value={chat.chatId}>{chat.title}{chat.username === undefined ? '' : ` @${chat.username}`}</option>
+                  <option key={chat.chatId} value={chat.chatId}>{chat.title}{chat.username === undefined ? '' : ` @${chat.username}`}{lineTag(chat.line)}</option>
                 ))}
               </select>
               <button type="button" className="tgb-button tgb-button-primary" disabled={busy || picked === ''}
-                onClick={() => { void link(Number(picked), 'active').then(() => { setPicked('') }) }}>{t('tabBind')}</button>
+                onClick={() => { void link(picked, 'active').then(() => { setPicked('') }) }}>{t('tabBind')}</button>
               <button type="button" className="tgb-button" disabled={busy || picked === ''}
-                onClick={() => { void link(Number(picked), 'watch').then(() => { setPicked('') }) }}>{t('tabWatchBtn')}</button>
+                onClick={() => { void link(picked, 'watch').then(() => { setPicked('') }) }}>{t('tabWatchBtn')}</button>
             </div>
           )}
         <p className="tgb-muted tgb-small">{t('tabBindHint')}</p>

@@ -1,4 +1,6 @@
 autoInstallPeers: false
-# esbuild works from its platform package; its postinstall check is not needed.
+# Neither install script is needed: esbuild works from its platform package,
+# and protobufjs only checks its CLI version.
 allowBuilds:
   esbuild: false
+  protobufjs: false

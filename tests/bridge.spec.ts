@@ -4,12 +4,16 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BindingStore } from '../src/bindings.ts'
 import { ChatLog } from '../src/chatlog.ts'
-import { TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type PromptPart, type StagedFileInput } from '../src/bridge.ts'
+import { Switchboard, type BridgeSettings } from '../src/bridge.ts'
+import { FakeHarness } from './fakes.ts'
+import type { LineSettings } from '../src/lines.ts'
 import type { TgUpdate } from '../src/telegram.ts'
 
 const USER = { id: 42, is_bot: false, first_name: 'Ann', username: 'ann' }
 const STRANGER = { id: 7, is_bot: false, first_name: 'Eve' }
 const CHAT = { id: 1000, type: 'private' as const }
+/** CHAT's key: the legacy Telegram line keeps bare ids. */
+const KEY = String(CHAT.id)
 
 /** In-memory Bot API: records calls, serves queued updates, long-polls until aborted. */
 class FakeTelegram {
@@ -86,124 +90,29 @@ class FakeTelegram {
   }
 }
 
-class FakeHarness implements HarnessPort {
-  readonly prompts: { sessionId: string; parts: readonly PromptPart[]; mode: string }[] = []
-  readonly staged: (Omit<StagedFileInput, 'data'> & { sessionId: string; bytes: number })[] = []
-  readonly created: { cwd: string; agentPreset: string; permissionPreset: string; model?: ModelChoice }[] = []
-  readonly selected: { sessionId: string; choice: ModelChoice }[] = []
-  /** Sessions currently loaded, with their model. */
-  readonly loaded = new Map<string, ModelChoice>()
-  readonly cancelled: string[] = []
-  running = false
-
-  async createSession(cwd: string, agentPreset: string, permissionPreset: string, model?: ModelChoice): Promise<string> {
-    this.created.push({ cwd, agentPreset, permissionPreset, ...(model === undefined ? {} : { model }) })
-    return `s${this.created.length}`
-  }
-  async listModels() {
-    return {
-      default: { provider: 'local', model: 'small' },
-      groups: [
-        { provider: 'local', name: 'Local', models: [{ id: 'small', name: 'Small' }, { id: 'qwen-large', name: 'Qwen Large' }] },
-        { provider: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }, { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' }] },
-      ],
-    }
-  }
-  presets = new Map<string, string>()
-  inbox = new Map<string, { id: string; text: string }[]>()
-  transcript: string | Error = new Error('speech recognition is not installed')
-  listPresets() {
-    return [{ value: 'read-only', name: 'Read only' }, { value: 'workspace-write', name: 'Workspace write' }]
-  }
-  currentPreset(sessionId: string): string | undefined {
-    return this.loaded.has(sessionId) ? (this.presets.get(sessionId) ?? 'workspace-write') : undefined
-  }
-  selectPreset(sessionId: string, preset: string): boolean {
-    if (!this.listPresets().some(p => p.value === preset)) throw new Error(`unknown preset ${preset}`)
-    if (!this.loaded.has(sessionId)) return false
-    this.presets.set(sessionId, preset)
-    return true
-  }
-  queued(sessionId: string) {
-    return this.loaded.has(sessionId) ? [...(this.inbox.get(sessionId) ?? [])] : undefined
-  }
-  dropQueued(sessionId: string, ids: readonly string[] | 'all'): number {
-    const items = this.inbox.get(sessionId) ?? []
-    const keep = ids === 'all' ? [] : items.filter(item => !ids.includes(item.id))
-    this.inbox.set(sessionId, keep)
-    return items.length - keep.length
-  }
-  /** Harness commands this fake Session offers, and the lines it ran. */
-  commands = [
-    { name: 'compact', description: 'Compact the context', hint: '[focus]' },
-    { name: 'goal', description: 'Set a goal' },
-    { name: 'status', description: 'Harness status (shadowed by the bridge)' },
-    { name: 'export-log', description: 'Not a valid Telegram menu name' },
-    { name: 'telegram', description: 'Web-only' },
-  ]
-  readonly ran: { sessionId: string; line: string }[] = []
-  async listCommands(): Promise<{ name: string; description: string; hint?: string }[]> {
-    return this.commands
-  }
-  async runCommand(sessionId: string, line: string): Promise<{ kind: 'success' | 'error'; text?: string } | undefined> {
-    const name = line.slice(1).split(/\s/u)[0]
-    if (!this.commands.some(command => command.name === name)) return undefined
-    this.ran.push({ sessionId, line })
-    if (name === 'goal') return { kind: 'error', text: 'goal text required' }
-    return { kind: 'success', text: 'Compacted: 48k → 9k tokens' }
-  }
-  readonly workspaced: string[] = []
-  async ensureWorkspace(sessionId: string): Promise<void> {
-    if (!this.workspaced.includes(sessionId)) this.workspaced.push(sessionId)
-  }
-  changedFiles(): string[] | undefined {
-    return ['src/a.ts', 'README.md']
-  }
-  async transcribe(): Promise<string> {
-    if (this.transcript instanceof Error) throw this.transcript
-    return this.transcript
-  }
-  currentModel(sessionId: string): ModelChoice | undefined {
-    return this.loaded.get(sessionId)
-  }
-  async selectModel(sessionId: string, choice: ModelChoice): Promise<boolean> {
-    this.selected.push({ sessionId, choice })
-    if (!this.loaded.has(sessionId)) return false
-    this.loaded.set(sessionId, choice)
-    return true
-  }
-  async prompt(sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void> {
-    this.prompts.push({ sessionId, parts, mode })
-  }
-  async stageFile(sessionId: string, file: StagedFileInput): Promise<string> {
-    const { data, ...rest } = file
-    this.staged.push({ sessionId, bytes: data.byteLength, ...rest })
-    return `r${this.staged.length}`
-  }
-  cancel(sessionId: string): boolean {
-    this.cancelled.push(sessionId)
-    return true
-  }
-  live() {
-    return { running: this.running, cwd: '/tmp' }
-  }
-  async listSessions() {
-    return [{ sessionId: 's1', cwd: '/tmp', updatedAt: 1, running: false }]
-  }
-}
-
 const quiet = { info() {}, warn() {}, debug() {} }
 
 let dir: string
 let telegram: FakeTelegram
 let harness: FakeHarness
 let store: BindingStore
-let bridge: TelegramBridge
+let bridge: Switchboard
 let settings: BridgeSettings
 let chatLog: ChatLog
 
 function text(from: typeof USER | typeof STRANGER, body: string): Omit<TgUpdate, 'update_id'> {
   return { message: { message_id: 1, from, chat: CHAT, date: 0, text: body } }
+}
+
+const TELEGRAM_LINE: LineSettings = {
+  id: 'telegram', type: 'telegram', name: 'Telegram', enabled: true,
+  secret: 'TOKEN', apiBaseUrl: 'https://api.telegram.test', pollTimeoutSec: 1,
+  allowedUsers: ['42'], allowedChats: [], groupMentionOnly: true, workspacePath: '',
+}
+
+/** Settings with the Telegram line changed. */
+function withLine(patch: Partial<LineSettings>): BridgeSettings {
+  return { ...settings, lines: [{ ...TELEGRAM_LINE, ...patch }] }
 }
 
 /** Wait until a predicate holds (the poll loop runs asynchronously). */
@@ -219,12 +128,8 @@ beforeEach(async () => {
   store = new BindingStore(join(dir, 'state.json'))
   settings = {
     enabled: true,
-    botToken: 'TOKEN',
-    apiBaseUrl: 'https://api.telegram.test',
-    allowedUsers: ['42'],
-    allowedChats: [],
+    lines: [TELEGRAM_LINE],
     questionsViaTelegram: true,
-    groupMentionOnly: true,
     streamReplies: true,
     turnSummary: 'long',
     turnSummaryMinSec: 60,
@@ -237,12 +142,11 @@ beforeEach(async () => {
     approvalTimeoutSec: 60,
     notifyToolCalls: false,
     language: 'en',
-    pollTimeoutSec: 1,
     maxDownloadMb: 1,
     sendDeliverables: true,
   }
   chatLog = new ChatLog(join(dir, 'chats'), () => 2000)
-  bridge = new TelegramBridge(() => settings, harness, store, quiet, telegram.fetch, chatLog)
+  bridge = new Switchboard(() => settings, harness, store, quiet, { fetch: telegram.fetch }, chatLog)
   await bridge.reconcile()
   await until(() => bridge.state.kind === 'running')
 })
@@ -267,11 +171,11 @@ describe('TelegramBridge', () => {
     await until(() => harness.prompts.length === 1)
     expect(harness.created).toEqual([{ cwd: dir, agentPreset: 'standard', permissionPreset: 'workspace-write' }])
     expect(harness.prompts[0]).toEqual({ sessionId: 's1', parts: [{ type: 'text', text: 'run the tests' }], mode: 'queue' })
-    expect(store.get(CHAT.id).sessionId).toBe('s1')
+    expect(store.get(KEY).sessionId).toBe('s1')
   })
 
   it('mirrors committed assistant text to the bound chat', async () => {
-    await store.update(CHAT.id, { sessionId: 's9' })
+    await store.update(KEY, { sessionId: 's9' })
     bridge.onSessionEvent('s9', {
       type: 'assistant/message',
       data: { message: { content: [{ type: 'reasoning', text: 'hmm' }, { type: 'text', text: 'All green.' }] } },
@@ -283,7 +187,7 @@ describe('TelegramBridge', () => {
   })
 
   it('stops a running Session with /stop', async () => {
-    await store.update(CHAT.id, { sessionId: 's3' })
+    await store.update(KEY, { sessionId: 's3' })
     harness.running = true
     telegram.push(text(USER, '/stop'))
     await until(() => harness.cancelled.length === 1)
@@ -291,7 +195,7 @@ describe('TelegramBridge', () => {
   })
 
   it('steers with /steer and forwards unknown slash commands verbatim', async () => {
-    await store.update(CHAT.id, { sessionId: 's4' })
+    await store.update(KEY, { sessionId: 's4' })
     telegram.push(text(USER, '/steer focus on lint'))
     telegram.push(text(USER, '/plan refactor auth'))
     await until(() => harness.prompts.length === 2)
@@ -304,16 +208,16 @@ describe('TelegramBridge', () => {
   it('validates /cwd and uses it for /new', async () => {
     telegram.push(text(USER, '/cwd relative/path'))
     await until(() => telegram.sent().length === 1)
-    expect(store.get(CHAT.id).workspacePath).toBeUndefined()
+    expect(store.get(KEY).workspacePath).toBeUndefined()
     telegram.push(text(USER, `/cwd ${tmpdir()}`))
-    await until(() => store.get(CHAT.id).workspacePath === tmpdir())
+    await until(() => store.get(KEY).workspacePath === tmpdir())
     telegram.push(text(USER, '/new'))
     await until(() => harness.created.length === 1)
     expect(harness.created[0]?.cwd).toBe(tmpdir())
   })
 
   it('answers approvals from inline buttons', async () => {
-    await store.update(CHAT.id, { sessionId: 's5' })
+    await store.update(KEY, { sessionId: 's5' })
     bridge.onSessionEvent('s5', { type: 'tool/call', data: { callId: 'c1', name: 'bash', arguments: '{"command":"npm test"}' } })
     const outcome = bridge.requestApproval({ sessionId: 's5', toolName: 'bash', callId: 'c1' })
     await until(() => telegram.calls.some(c => c.method === 'sendMessage' && c.params['reply_markup'] !== undefined))
@@ -326,7 +230,7 @@ describe('TelegramBridge', () => {
   })
 
   it('ignores approval presses from strangers', async () => {
-    await store.update(CHAT.id, { sessionId: 's6' })
+    await store.update(KEY, { sessionId: 's6' })
     const outcome = bridge.requestApproval({ sessionId: 's6', toolName: 'bash' })
     await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
     const markup = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!.params['reply_markup'] as {
@@ -340,7 +244,7 @@ describe('TelegramBridge', () => {
 
   it('delegates approvals for unbound Sessions and withdraws on abort', async () => {
     await expect(bridge.requestApproval({ sessionId: 'unbound', toolName: 'bash' })).resolves.toBe('delegate')
-    await store.update(CHAT.id, { sessionId: 's7' })
+    await store.update(KEY, { sessionId: 's7' })
     const controller = new AbortController()
     const outcome = bridge.requestApproval({ sessionId: 's7', toolName: 'bash', signal: controller.signal })
     await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
@@ -354,14 +258,14 @@ describe('TelegramBridge', () => {
     await store.settled()
     const reloaded = new BindingStore(join(dir, 'state.json'))
     await reloaded.load()
-    expect(reloaded.get(CHAT.id).sessionId).toBe('s1')
-    expect(reloaded.offset).toBeGreaterThan(0)
+    expect(reloaded.get(KEY).sessionId).toBe('s1')
+    expect(reloaded.offset()).toBeGreaterThan(0)
   })
 })
 
 describe('turn end notices', () => {
   it('reports failures with their message and stays quiet on completion', async () => {
-    await store.update(CHAT.id, { sessionId: 's8' })
+    await store.update(KEY, { sessionId: 's8' })
     bridge.onSessionEvent('s8', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     bridge.onSessionEvent('s8', { type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { message: 'no model selected' } } } })
     await until(() => telegram.sent().length === 1)
@@ -441,7 +345,7 @@ describe('media', () => {
   })
 
   it('sends presented files back: images inline, others as documents', async () => {
-    await store.update(CHAT.id, { sessionId: 's10' })
+    await store.update(KEY, { sessionId: 's10' })
     await writeFile(join(dir, 'chart.png'), new Uint8Array(4))
     await writeFile(join(dir, 'report.csv'), 'a,b\n')
     bridge.onSessionEvent('s10', {
@@ -465,22 +369,22 @@ describe('chat history', () => {
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'All green.' }] } } })
     await until(() => telegram.sent().includes('All green.'))
     await chatLog.settled()
-    const { entries } = await chatLog.history(CHAT.id, undefined, 50)
+    const { entries } = await chatLog.history(KEY, undefined, 50)
     expect(entries.map(e => [e.dir, e.kind])).toEqual([
       ['in', 'text'], ['out', 'notice'], ['out', 'tool'], ['out', 'assistant'],
     ])
-    expect(entries[0]?.from).toEqual({ id: 42, name: 'Ann', username: 'ann' })
+    expect(entries[0]?.from).toEqual({ id: '42', name: 'Ann', username: 'ann' })
     expect(entries[3]?.sessionId).toBe('s1')
     const [summary] = await chatLog.chats()
-    expect(summary).toMatchObject({ chatId: CHAT.id, title: 'Ann', username: 'ann', sessionId: 's1', count: 4 })
+    expect(summary).toMatchObject({ chatId: KEY, title: 'Ann', username: 'ann', sessionId: 's1', count: 4 })
   })
 
   it('records blocked users without prompting', async () => {
     telegram.push(text(STRANGER, 'let me in'))
     await until(() => telegram.sent().length === 1)
     await chatLog.settled()
-    const { entries } = await chatLog.history(CHAT.id, undefined, 10)
-    expect(entries[0]).toMatchObject({ dir: 'in', kind: 'denied', text: 'let me in', from: { id: 7, name: 'Eve' } })
+    const { entries } = await chatLog.history(KEY, undefined, 10)
+    expect(entries[0]).toMatchObject({ dir: 'in', kind: 'denied', text: 'let me in', from: { id: '7', name: 'Eve' } })
   })
 
   it('keeps a viewable copy of received images', async () => {
@@ -488,15 +392,15 @@ describe('chat history', () => {
     telegram.push({ message: { message_id: 3, from: USER, chat: CHAT, date: 0, caption: 'look', photo: [{ file_id: 'jpg', file_unique_id: 'j', width: 1, height: 1 }] } })
     await until(() => harness.prompts.length === 1)
     await chatLog.settled()
-    const media = (await chatLog.history(CHAT.id, undefined, 10)).entries.find(e => e.kind === 'media')
+    const media = (await chatLog.history(KEY, undefined, 10)).entries.find(e => e.kind === 'media')
     expect(media?.text).toBe('look')
     const image = media?.attachments?.[0]
     expect(image).toMatchObject({ name: 'photo_3.jpg', kind: 'image', size: 4 })
-    expect(await chatLog.readMedia(CHAT.id, image!.media!)).toEqual(new Uint8Array([0xff, 0xd8, 0xff, 0]))
+    expect(await chatLog.readMedia(KEY, image!.media!)).toEqual(new Uint8Array([0xff, 0xd8, 0xff, 0]))
   })
 
   it('records approval outcomes with who answered', async () => {
-    await store.update(CHAT.id, { sessionId: 's5' })
+    await store.update(KEY, { sessionId: 's5' })
     const outcome = bridge.requestApproval({ sessionId: 's5', toolName: 'bash', reason: 'writes outside the workspace' })
     await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
     const markup = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!.params['reply_markup'] as {
@@ -505,7 +409,7 @@ describe('chat history', () => {
     telegram.push({ callback_query: { id: 'q', from: USER, data: markup.inline_keyboard[0]![1]!.callback_data } })
     await expect(outcome).resolves.toBe('rejected')
     await chatLog.settled()
-    const approval = (await chatLog.history(CHAT.id, undefined, 10)).entries.find(e => e.kind === 'approval')
+    const approval = (await chatLog.history(KEY, undefined, 10)).entries.find(e => e.kind === 'approval')
     expect(approval).toMatchObject({ text: 'writes outside the workspace', approval: { tool: 'bash', outcome: 'rejected', by: '@ann' } })
   })
 })
@@ -519,7 +423,7 @@ describe('models', () => {
   })
 
   it('lists models as buttons and switches the live Session from a press', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     harness.loaded.set('s1', { provider: 'local', model: 'small' })
     telegram.push(text(USER, '/model'))
     await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
@@ -535,7 +439,7 @@ describe('models', () => {
   })
 
   it('matches /model <name> and defers the choice for a cold Session', async () => {
-    await store.update(CHAT.id, { sessionId: 's2' })
+    await store.update(KEY, { sessionId: 's2' })
     telegram.push(text(USER, '/model qwen'))
     await until(() => harness.selected.length === 1)
     expect(harness.selected[0]).toEqual({ sessionId: 's2', choice: { provider: 'local', model: 'qwen-large' } })
@@ -547,7 +451,7 @@ describe('models', () => {
   })
 
   it('asks for detail when several models match, and reports unknown names', async () => {
-    await store.update(CHAT.id, { sessionId: 's3' })
+    await store.update(KEY, { sessionId: 's3' })
     telegram.push(text(USER, '/model deepseek'))
     telegram.push(text(USER, '/model gpt-9'))
     await until(() => telegram.sent().length === 2)
@@ -557,7 +461,7 @@ describe('models', () => {
   })
 
   it('shows the model in /status', async () => {
-    await store.update(CHAT.id, { sessionId: 's4' })
+    await store.update(KEY, { sessionId: 's4' })
     harness.loaded.set('s4', { provider: 'local', model: 'small', reasoningEffort: 'high' })
     telegram.push(text(USER, '/status'))
     await until(() => telegram.sent().length === 1)
@@ -567,7 +471,7 @@ describe('models', () => {
 
 describe('rendering and delivery', () => {
   it('renders Agent Markdown as Telegram HTML', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**Done**: run `npm test`' }] } } })
     await until(() => telegram.sent().length === 1)
     const call = telegram.calls.find(c => c.method === 'sendMessage')!
@@ -576,14 +480,14 @@ describe('rendering and delivery', () => {
   })
 
   it('falls back to plain text when Telegram rejects the markup', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.rejectHtml = 1
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**x**' }] } } })
     await until(() => telegram.sent().includes('**x**'))
   })
 
   it('retries after flood control', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.rateLimit = 2
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'after the wait' }] } } })
     await until(() => telegram.sent().includes('after the wait'))
@@ -591,7 +495,7 @@ describe('rendering and delivery', () => {
 
   it('batches a burst of tool calls into one message, flushed before the reply', async () => {
     settings = { ...settings, notifyToolCalls: true }
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     for (const [i, command] of ['ls', 'cat a', 'npm test'].entries()) {
       bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: `c${i}`, name: 'bash', arguments: JSON.stringify({ command }) } })
     }
@@ -603,7 +507,7 @@ describe('rendering and delivery', () => {
 
   it('edits one activity message as calls keep coming, and starts a new one after a reply', async () => {
     settings = { ...settings, notifyToolCalls: true }
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     const call = (i: number) => bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: `k${i}`, name: 'bash', arguments: JSON.stringify({ command: `step ${i}` }) } })
     call(1)
     await until(() => telegram.sent().length === 1, 3000)
@@ -619,7 +523,7 @@ describe('rendering and delivery', () => {
   })
 
   it('streams a draft and turns it into the final reply', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     bridge.onAssistantStream('s1', { type: 'start' })
     bridge.onAssistantStream('s1', { type: 'chunk', chunk: { type: 'text-delta', text: 'Working through the failing tests one by one now' } })
     await until(() => telegram.sent().length === 1, 3000)
@@ -632,7 +536,7 @@ describe('rendering and delivery', () => {
 
 describe('turn summaries and following', () => {
   it('summarizes long turns with changed files for bound chats', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     bridge.onSessionEvent('s1', { type: 'turn/start', time: 0 })
     bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c', name: 'edit', arguments: '{}' } })
     bridge.onSessionEvent('s1', { type: 'workspace/changes', seq: 9 })
@@ -645,7 +549,7 @@ describe('turn summaries and following', () => {
   })
 
   it('keeps short turns quiet in the bound chat', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     bridge.onSessionEvent('s1', { type: 'turn/start', time: 0 })
     bridge.onSessionEvent('s1', { type: 'turn/end', time: 5000, data: { reason: { kind: 'completed' } } })
     await new Promise(resolve => setTimeout(resolve, 30))
@@ -658,7 +562,7 @@ describe('turn summaries and following', () => {
     await until(() => telegram.sent().length === 1)
     telegram.push(text(USER, '/watch 1'))
     await until(() => telegram.sent().length === 2)
-    expect(store.watchersOf('s1')).toEqual([CHAT.id])
+    expect(store.watchersOf('s1')).toEqual([KEY])
     bridge.onSessionEvent('s1', { type: 'turn/start', time: 0 })
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Deployed to staging.' }] } } })
     bridge.onSessionEvent('s1', { type: 'turn/end', time: 3000, data: { reason: { kind: 'completed' } } })
@@ -675,18 +579,18 @@ describe('turn summaries and following', () => {
 
 describe('commands', () => {
   it('/mode switches a live Session and defers for a cold one', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     harness.loaded.set('s1', { provider: 'local', model: 'small' })
     telegram.push(text(USER, '/mode read'))
     await until(() => harness.presets.get('s1') === 'read-only')
-    await store.update(CHAT.id, { sessionId: 's9' })
+    await store.update(KEY, { sessionId: 's9' })
     telegram.push(text(USER, '/mode workspace'))
     await until(() => telegram.sent().length === 2)
     expect(bridge.takePending('s9')).toEqual({ preset: 'workspace-write' })
   })
 
   it('/mode lists presets as buttons', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     harness.loaded.set('s1', { provider: 'local', model: 'small' })
     telegram.push(text(USER, '/mode'))
     await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
@@ -713,7 +617,7 @@ describe('commands', () => {
   })
 
   it('/queue lists and /cancel drops queued prompts', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     harness.loaded.set('s1', { provider: 'local', model: 'small' })
     harness.inbox.set('s1', [{ id: 'm1', text: 'first' }, { id: 'm2', text: 'second' }])
     telegram.push(text(USER, '/queue'))
@@ -739,7 +643,7 @@ describe('access', () => {
   })
 
   it('admits every member of an allowed chat', async () => {
-    settings = { ...settings, allowedChats: [String(GROUP.id)] }
+    settings = withLine({ allowedChats: [String(GROUP.id)] })
     telegram.push({ message: { message_id: 1, from: STRANGER, chat: GROUP, date: 0, text: '/status' } })
     await until(() => telegram.sent().length === 1)
     expect(telegram.sent()[0]).toContain('Bot: @testbot')
@@ -786,15 +690,15 @@ describe('voice and schedules', () => {
 
 describe('web operations', () => {
   it('links a chat from the Web UI and sends as the bot', async () => {
-    await bridge.linkChat(CHAT.id, 's7', 'active')
-    expect(store.get(CHAT.id).sessionId).toBe('s7')
-    expect(bridge.linksOf('s7')).toEqual([{ chatId: CHAT.id, mode: 'active' }])
-    await bridge.linkChat(CHAT.id, 's7', 'watch')
-    expect(bridge.linksOf('s7')).toEqual([{ chatId: CHAT.id, mode: 'watch' }])
-    await bridge.sendFromWeb(CHAT.id, 'from the **web**')
+    await bridge.linkChat(KEY, 's7', 'active')
+    expect(store.get(KEY).sessionId).toBe('s7')
+    expect(bridge.linksOf('s7')).toEqual([{ chatId: KEY, mode: 'active' }])
+    await bridge.linkChat(KEY, 's7', 'watch')
+    expect(bridge.linksOf('s7')).toEqual([{ chatId: KEY, mode: 'watch' }])
+    await bridge.sendFromWeb(KEY, 'from the **web**')
     await until(() => telegram.sent().includes('from the <b>web</b>'))
     await chatLog.settled()
-    const kinds = (await chatLog.history(CHAT.id, undefined, 10)).entries.map(e => e.kind)
+    const kinds = (await chatLog.history(KEY, undefined, 10)).entries.map(e => e.kind)
     expect(kinds).toContain('web')
     const stats = await chatLog.stats()
     expect(stats.today.out).toBeGreaterThan(0)
@@ -810,7 +714,7 @@ describe('agent questions', () => {
   }
 
   it('answers a single-choice question from a button', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     const answer = ask([{ id: 'q1', question: 'Which branch?', options: [{ label: 'main' }, { label: 'dev' }] }])
     await until(() => telegram.sent().some(t => t.startsWith('❓')))
     expect(keyboard().map(row => row.map(b => b.text))).toEqual([['main'], ['dev'], ['Skip']])
@@ -820,7 +724,7 @@ describe('agent questions', () => {
   })
 
   it('takes plain text as a custom answer instead of a new prompt', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     const answer = ask([{ id: 'q1', question: 'Name the release?' }])
     await until(() => telegram.sent().some(t => t.startsWith('❓')))
     telegram.push(text(USER, 'v2.0 "Aurora"'))
@@ -829,7 +733,7 @@ describe('agent questions', () => {
   })
 
   it('collects multi-select answers until Done, across a batch', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     const answer = ask([
       { id: 'a', question: 'Targets?', multiSelect: true, options: [{ label: 'web' }, { label: 'ios' }, { label: 'android' }] },
       { id: 'b', question: 'Ship today?', options: [{ label: 'yes' }, { label: 'no' }] },
@@ -855,13 +759,13 @@ describe('web workspaces', () => {
     telegram.push(text(USER, '/watch session-def'))
     await until(() => harness.workspaced.length === 2)
     expect(harness.workspaced).toEqual(['session-abc', 'session-def'])
-    await bridge.linkChat(CHAT.id, 'session-ghi', 'active')
+    await bridge.linkChat(KEY, 'session-ghi', 'active')
     await until(() => harness.workspaced.includes('session-ghi'))
   })
 
   it('backfills every bound or followed Session at startup', async () => {
-    await store.update(CHAT.id, { sessionId: 's-bound' })
-    await store.setWatch(CHAT.id, 's-watched', true)
+    await store.update(KEY, { sessionId: 's-bound' })
+    await store.setWatch(KEY, 's-watched', true)
     await bridge.attachLinkedSessions()
     expect(harness.workspaced.sort()).toEqual(['s-bound', 's-watched'])
   })
@@ -869,7 +773,7 @@ describe('web workspaces', () => {
 
 describe('harness commands', () => {
   it('runs registered Harness commands on the Host and replies with their result', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/compact keep the API notes'))
     await until(() => telegram.sent().includes('Compacted: 48k → 9k tokens'))
     expect(harness.ran).toEqual([{ sessionId: 's1', line: '/compact keep the API notes' }])
@@ -877,14 +781,14 @@ describe('harness commands', () => {
   })
 
   it('reports a command error plainly', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/goal'))
     await until(() => telegram.sent().some(t => t.startsWith('⚠️ /goal')))
     expect(telegram.sent().at(-1)).toBe('⚠️ /goal: goal text required')
   })
 
   it('sends unregistered slash text to the Agent, and keeps the bridge\'s own commands', async () => {
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/review the auth module'))
     await until(() => harness.prompts.length === 1)
     expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: '/review the auth module' }])
@@ -896,7 +800,7 @@ describe('harness commands', () => {
   it('lists Harness commands in /help and in the bot menu', async () => {
     const menu = telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands'] as { command: string }[]
     expect(menu.map(c => c.command)).toEqual(['new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'help', 'compact', 'goal'])
-    await store.update(CHAT.id, { sessionId: 's1' })
+    await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/help'))
     await until(() => telegram.sent().length === 1)
     expect(telegram.sent()[0]).toContain('/compact [focus] — Compact the context')

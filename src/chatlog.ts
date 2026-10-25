@@ -1,5 +1,5 @@
 /**
- * Telegram chat history for the Web viewer. Each chat keeps an append-only
+ * Chat history for the Web viewer, across every line. Each chat keeps an append-only
  * JSONL file plus an index of chat summaries; received images are kept next
  * to it so the viewer can show them. Everything lives under the bridge's
  * state directory and never enters a Session.
@@ -12,6 +12,7 @@ import type { ChatEntry, ChatInfo, ChatPage, ChatStats, ChatSummary } from './hi
 export type * from './history-types.ts'
 
 const MEDIA_NAME = /^[\w.-]+$/u
+const CHAT_KEY = /^[\w.:-]{1,200}$/u
 /** Days of counters kept for the dashboard. */
 const STATS_DAYS = 30
 
@@ -22,7 +23,12 @@ interface DayCounters {
   allowed: number
   rejected: number
   denied: number
-  chats: number[]
+  chats: string[]
+}
+
+/** File-name form of a chat key; legacy Telegram ids are unchanged. */
+function fileKey(chat: string): string {
+  return chat.replace(/[^\w.-]/gu, '~')
 }
 
 /** Local calendar day of a timestamp, `YYYY-MM-DD`. */
@@ -33,8 +39,8 @@ function dayKey(at: number): string {
 
 /** Per-chat JSONL history with a summary index and bounded retention. */
 export class ChatLog {
-  private summaries = new Map<number, ChatSummary>()
-  private tails = new Map<number, Promise<void>>()
+  private summaries = new Map<string, ChatSummary>()
+  private tails = new Map<string, Promise<void>>()
   private indexTail: Promise<void> = Promise.resolve()
   private seq = 0
   private loaded: Promise<void> | undefined
@@ -43,7 +49,7 @@ export class ChatLog {
   private statsTail: Promise<void> = Promise.resolve()
 
   /**
-   * @param dir - directory holding `index.json`, `<chatId>.jsonl`, and `<chatId>/` media.
+   * @param dir - directory holding `index.json`, `<chat key>.jsonl`, and `<chat key>/` media.
    * @param limit - entries kept per chat; older ones and their media are dropped.
    */
   constructor(private readonly dir: string, private readonly limit: () => number) {}
@@ -53,7 +59,8 @@ export class ChatLog {
     this.loaded ??= (async () => {
       try {
         const rows = JSON.parse(await readFile(join(this.dir, 'index.json'), 'utf8')) as ChatSummary[]
-        for (const row of rows) this.summaries.set(row.chatId, row)
+        // Releases before lines stored Telegram chat ids as numbers.
+        for (const row of rows) this.summaries.set(String(row.chatId), { ...row, chatId: String(row.chatId) })
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
@@ -114,7 +121,7 @@ export class ChatLog {
   }
 
   /** Fold one entry into its day's counters and drop days past the window. */
-  private count(chatId: number, entry: ChatEntry): void {
+  private count(chatId: string, entry: ChatEntry): void {
     const key = dayKey(entry.at)
     const day = this.days[key] ??= { in: 0, out: 0, allowed: 0, rejected: 0, denied: 0, chats: [] }
     if (entry.kind === 'denied') day.denied++
@@ -122,7 +129,7 @@ export class ChatLog {
     else day.out++
     if (entry.approval?.outcome === 'allowed-once') day.allowed++
     if (entry.approval?.outcome === 'rejected') day.rejected++
-    if (entry.kind !== 'denied' && !day.chats.includes(chatId)) day.chats.push(chatId)
+    if (entry.kind !== 'denied' && !day.chats.map(String).includes(chatId)) day.chats.push(chatId)
     const keys = Object.keys(this.days).sort()
     for (const old of keys.slice(0, Math.max(0, keys.length - STATS_DAYS))) delete this.days[old]
     const snapshot = JSON.stringify(this.days)
@@ -138,7 +145,7 @@ export class ChatLog {
   async stats(now: number = Date.now()): Promise<ChatStats> {
     await this.load()
     const series: { day: string; in: number; out: number }[] = []
-    const week = { messages: 0, allowed: 0, rejected: 0, denied: 0, chats: new Set<number>() }
+    const week = { messages: 0, allowed: 0, rejected: 0, denied: 0, chats: new Set<string>() }
     for (let i = 13; i >= 0; i--) {
       const key = dayKey(now - i * 86_400_000)
       const day = this.days[key]
@@ -148,7 +155,7 @@ export class ChatLog {
         week.allowed += day.allowed
         week.rejected += day.rejected
         week.denied += day.denied
-        for (const chat of day.chats) week.chats.add(chat)
+        for (const chat of day.chats) week.chats.add(String(chat))
       }
     }
     const today = this.days[dayKey(now)]
@@ -165,8 +172,8 @@ export class ChatLog {
    * @param chatIds - chats to look in (those linked to it now or before).
    * @param limit - most entries returned.
    */
-  async sessionHistory(sessionId: string, chatIds: readonly number[], limit: number): Promise<(ChatEntry & { chatId: number })[]> {
-    const all: (ChatEntry & { chatId: number })[] = []
+  async sessionHistory(sessionId: string, chatIds: readonly string[], limit: number): Promise<(ChatEntry & { chatId: string })[]> {
+    const all: (ChatEntry & { chatId: string })[] = []
     for (const chatId of new Set(chatIds)) {
       await this.tails.get(chatId)
       for (const entry of await this.readAll(chatId)) if (entry.sessionId === sessionId) all.push({ ...entry, chatId })
@@ -175,11 +182,11 @@ export class ChatLog {
   }
 
   /** Remember the Session a chat is bound to, without adding an entry. */
-  bind(chatId: number, sessionId: string): Promise<void> {
+  bind(chatId: string, sessionId: string): Promise<void> {
     return this.track(this.writeBinding(chatId, sessionId))
   }
 
-  private async writeBinding(chatId: number, sessionId: string): Promise<void> {
+  private async writeBinding(chatId: string, sessionId: string): Promise<void> {
     await this.load()
     const summary = this.summaries.get(chatId)
     if (summary === undefined || summary.sessionId === sessionId) return
@@ -191,9 +198,9 @@ export class ChatLog {
    * Keep a copy of a received image for the viewer.
    * @returns the stored file name to put in {@link ChatAttachment.media}.
    */
-  async saveMedia(chatId: number, extension: string, data: Uint8Array): Promise<string> {
+  async saveMedia(chatId: string, extension: string, data: Uint8Array): Promise<string> {
     const name = `${Date.now().toString(36)}-${(this.seq++).toString(36)}${extension}`
-    const dir = join(this.dir, String(chatId))
+    const dir = join(this.dir, fileKey(chatId))
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, name), data, { mode: 0o600 })
     return name
@@ -203,10 +210,10 @@ export class ChatLog {
    * Read a stored media file.
    * @returns the bytes, or undefined for an unknown or malformed name.
    */
-  async readMedia(chatId: number, name: string): Promise<Uint8Array | undefined> {
-    if (!Number.isSafeInteger(chatId) || !MEDIA_NAME.test(name) || name.startsWith('.')) return undefined
+  async readMedia(chatId: string, name: string): Promise<Uint8Array | undefined> {
+    if (!CHAT_KEY.test(chatId) || !MEDIA_NAME.test(name) || name.startsWith('.')) return undefined
     try {
-      return new Uint8Array(await readFile(join(this.dir, String(chatId), name)))
+      return new Uint8Array(await readFile(join(this.dir, fileKey(chatId), name)))
     } catch {
       return undefined
     }
@@ -218,7 +225,7 @@ export class ChatLog {
    * @param before - return entries older than this entry id; newest page when omitted.
    * @param limit - page size.
    */
-  async history(chatId: number, before: string | undefined, limit: number): Promise<ChatPage> {
+  async history(chatId: string, before: string | undefined, limit: number): Promise<ChatPage> {
     await this.tails.get(chatId)
     const entries = await this.readAll(chatId)
     const end = before === undefined ? entries.length : entries.findIndex(entry => entry.id === before)
@@ -239,11 +246,11 @@ export class ChatLog {
     return work
   }
 
-  private file(chatId: number): string {
-    return join(this.dir, `${chatId}.jsonl`)
+  private file(chatId: string): string {
+    return join(this.dir, `${fileKey(chatId)}.jsonl`)
   }
 
-  private async readAll(chatId: number): Promise<ChatEntry[]> {
+  private async readAll(chatId: string): Promise<ChatEntry[]> {
     let text: string
     try {
       text = await readFile(this.file(chatId), 'utf8')
@@ -264,14 +271,14 @@ export class ChatLog {
   }
 
   /** Rewrite a chat's file with its newest entries and drop media nothing references. */
-  private async compact(chatId: number, summary: ChatSummary): Promise<void> {
+  private async compact(chatId: string, summary: ChatSummary): Promise<void> {
     const kept = (await this.readAll(chatId)).slice(-this.limit())
     const temp = `${this.file(chatId)}.${process.pid}.tmp`
     await writeFile(temp, kept.map(entry => `${JSON.stringify(entry)}\n`).join(''), { mode: 0o600 })
     await rename(temp, this.file(chatId))
     summary.count = kept.length
     const referenced = new Set(kept.flatMap(entry => entry.attachments ?? []).flatMap(a => a.media === undefined ? [] : [a.media]))
-    const mediaDir = join(this.dir, String(chatId))
+    const mediaDir = join(this.dir, fileKey(chatId))
     let names: string[] = []
     try {
       names = await readdir(mediaDir)
@@ -281,7 +288,7 @@ export class ChatLog {
     await Promise.all(names.filter(name => !referenced.has(name)).map(name => rm(join(mediaDir, name), { force: true })))
   }
 
-  private enqueue(chatId: number, write: () => Promise<void>): Promise<void> {
+  private enqueue(chatId: string, write: () => Promise<void>): Promise<void> {
     const next = (this.tails.get(chatId) ?? Promise.resolve()).catch(() => {}).then(write)
     this.tails.set(chatId, next)
     return next

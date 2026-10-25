@@ -4,24 +4,32 @@ English | [中文](README.zh.md)
 
 <img src="icon.svg" width="72" alt="" align="right">
 
-Command DeepSeek Harness Agents from your phone through a Telegram bot: send the Agent text, photos, files, and voice notes from your phone, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to Telegram.
+Command DeepSeek Harness Agents from your phone through Telegram and Feishu (Lark) bots: send the Agent text, photos, files, and voice notes, watch replies arrive as they are written, answer tool approvals and the Agent's questions, follow long tasks for completion notices, and browse every chat in the Web UI, where any Session can be linked to a chat.
 
-The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed. Sessions the bot creates go into the Web Workspace for their working directory (created on first use), listed with your other Sessions.
+The bots are other clients of the Web host. They create and prompt Sessions through `ctx.sessionController`, the same path the Web UI uses, so chat Sessions appear in the Web sidebar and Web Sessions can be taken over or followed. Sessions a bot creates go into the Web Workspace for their working directory (created on first use).
 
 ![Switchboard overview](docs/images/panel-dashboard.png)
 
+## Lines
+
+A **line** is one bot on one chat platform plus the people allowed to use it. Configure as many as you need, for example Telegram for yourself and Feishu for your team; each line has its own credentials, allowed users and chats, and default working directory. One Session can be linked to chats on several lines at once, and replies, approvals, and questions go to each of them. Chats are keyed `line:chat id` (for example `feishu:oc_xxx`); the original Telegram line (`telegram`) keeps bare ids, so bindings and history from earlier releases carry over. Supported: **Telegram** and **Feishu / Lark**.
+
 ## Quick start
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy its token.
-2. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-switchboard`, or
+1. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-switchboard`, or `dsh plugin --profile web add github:heavenJiang/dsh-switchboard`.
+2. Open **Plugins → Installed → Switchboard** (or **Plugin settings** in the sidebar panel), add a line under **Lines**, fill in its credentials and **Allowed users** (send `/whoami` to the bot for your id), set the **Default working directory**, and **Save**. Changes apply immediately.
 
-   ```sh
-   dsh plugin --profile web add github:heavenJiang/dsh-switchboard
-   ```
+**Telegram line**: create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`), then **+ Telegram line** and paste the token. Allowed users are Telegram ids or `@usernames`.
 
-3. Open **Plugins → Installed → Switchboard** (or **Plugin settings** in the sidebar's **Switchboard** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
+**Feishu line**: Feishu delivers events over the Open Platform's persistent connection, so no public URL is needed.
+1. On the [Feishu Open Platform](https://open.feishu.cn/app) (or [Lark](https://open.larksuite.com/app)) create a self-built app and add the **Bot** capability.
+2. Grant `im:message`, `im:message:send_as_bot`, and `im:resource`; optionally `contact:user.base:readonly` (names) and `im:chat:readonly` (group names).
+3. Under **Events and callbacks**, choose **Receive events through persistent connection** and add the event `im.message.receive_v1`; do the same for callbacks and add `card.action.trigger` (buttons need it).
+4. Publish a version, then **+ Feishu line** with the **App ID** (`cli_…`) and **App Secret**. Allowed users are open_ids (`ou_…`; user_id and union_id also match).
 
-## In Telegram
+Feishu has no typing indicator or command menu; everything else matches Telegram. Replies, drafts, tool activity, and messages with buttons are interactive cards updated in place; notices are text messages.
+
+## In the chat
 
 | Command | Effect |
 | --- | --- |
@@ -38,44 +46,40 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 | `/model [name]` | Show or switch the Session's model (buttons, fuzzy match; the Web default is untouched) |
 | `/mode [mode]` | Show or switch the Session's permission mode |
 | `/get <path>` | Fetch a file or list a directory inside the working directory (symlinks cannot escape it) |
-| `/status` | Session, model, directory, and run state |
+| `/status` | Session, model, directory, run state, and line |
 | `/whoami` | Your user and chat id (anyone) |
-| Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer, with the result sent back; `/help` and the bot menu list them |
+| Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer; `/help` lists them |
 | other `/xxx` | Not a command: sent to the Agent as text |
 
-- **Rendering**: Markdown replies become Telegram HTML (bold, italics, code, fenced code with language, links, headings, quotes, lists; tables as monospace blocks), split safely, with a plain-text fallback.
-- **Streaming**: a draft message is edited every couple of seconds and then replaced by the formatted reply.
-- **Tool activity**: all tool calls between two replies share one "🛠 Tool calls · N" message edited in place, so long runs do not flood the chat.
+- **Rendering**: Markdown becomes Telegram HTML (with a plain-text fallback) or a Feishu card's Markdown, split safely.
+- **Streaming**: a draft is edited every couple of seconds and then replaced by the formatted reply.
+- **Tool activity**: tool calls between two replies share one "🛠 Tool calls · N" message edited in place.
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
-- **Approvals and questions**: tool approvals get **Allow once / Reject** buttons; the Agent's questions (ask_user_question) get option buttons, multi-select with **Done**, and any plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
-- **Media**: photos and files are staged through `ctx.fileUploads`; images (detected by their bytes) reach the model as images. Voice notes are converted with ffmpeg and transcribed by the Harness speech service; without it they go as files. Files the Agent presents are sent back.
-- **Groups**: by default the bot answers only commands, @mentions, and replies to it. Authorize individual users or whole chats.
-- **Security**: only allowed users (or members of allowed chats) can use the bot; strangers are told at most once an hour. The token lives in the Harness credentials store (`TELEGRAM_BOT_TOKEN`, or an environment variable of that name), never in the profile file or the browser; a legacy literal token migrates on the next save.
+- **Approvals and questions**: **Allow once / Reject** buttons; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
+- **Media**: photos and files are staged through `ctx.fileUploads`; images reach the model as images. Voice notes are transcribed by the Harness speech service via ffmpeg. Files the Agent presents are sent back.
+- **Groups**: by default only commands, @mentions, and replies to the bot are answered. Authorize users or whole chats per line.
+- **Security**: only a line's allowed users (or members of its allowed chats) can use its bot. Secrets live in the Harness credentials store (`TELEGRAM_BOT_TOKEN`, `FEISHU_APP_SECRET`, or environment variables of those names), never in the profile file or the browser.
 
 ## In the Web UI
 
-- **Switchboard panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
-- **Switchboard tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
-- **`/telegram` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session; runs on the Host, never reaches the model.
-- **Channel note**: Sessions bound to a chat get a short `ctx.systemPrompt.context()` note asking for phone-friendly replies.
+- **Switchboard panel** (sidebar): chats of every line with search and per-line status, an overview with a 14-day chart, and full threads with **Open Session**.
+- **Switchboard tab in every Session**: linked chats on any line, bind or follow another chat, send as the bot, and the Session's chat activity.
+- **`/switchboard` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session.
+- **Channel note**: Sessions bound to a chat get a short note asking for phone-friendly replies.
 
 ![Chat thread](docs/images/panel-thread.png)
 
 ## Models
 
-A `/model` choice for the Session > the plugin page's **Bot default model** for Sessions the bot creates > the Web default. Neither changes the Web default; choices for cold Sessions persist and apply when the Session next loads.
-
-## Scheduled tasks
-
-Chats listed in **Scheduled task chats** receive the replies and summaries of Harness scheduled tasks.
-
-## Version and updates
-
-The plugin page's **Version** section checks GitHub (the default branch's `package.json` version) or npm, and **Update to vX.Y.Z** reinstalls in place through the plugin manager. Bump `version` with every release.
+A `/model` choice for the Session > the plugin page's **Bot default model** for Sessions a bot creates > the Web default. Neither changes the Web default.
 
 ## Configuration
 
-See the full table in [README.zh.md](README.zh.md#配置项). Every user-facing field is live-editable; `pollTimeoutSec` and `stateFile` live in the profile's `cordis.patch.yml`. Set `HTTPS_PROXY` before launching `dsh` if Telegram is not directly reachable.
+See the full tables in [README.zh.md](README.zh.md#配置项). `lines` holds the lines; while it is empty, the Telegram fields of earlier releases (`botTokenRef`, `allowedUsers`, …) run as the `telegram` line, and the plugin page writes them to `lines` on its next save. `pollTimeoutSec` and `stateFile` live in the profile's `cordis.patch.yml`. Set `HTTPS_PROXY` before launching `dsh` if the platforms are not directly reachable. Migrating from `dsh-telegram-bridge`: see [docs/PUBLISHING.md](docs/PUBLISHING.md).
+
+## Adding a channel
+
+Implement the `Channel` interface in `src/channels/types.ts`, register the type in `lines.ts` and in `startLine` in `bridge.ts`, and give it credential fields in the settings page's line editor.
 
 ## Development
 

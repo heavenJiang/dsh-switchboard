@@ -6,8 +6,9 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { LEGACY_LINE } from './lines.ts'
 
-/** What the bridge remembers per Telegram chat. */
+/** What the bridge remembers per chat, keyed by chat key (see lines.ts). */
 export interface ChatBinding {
   /** Session the chat currently talks to. */
   sessionId?: string
@@ -31,6 +32,8 @@ interface BindingsFile {
   chats: Record<string, ChatBinding>
   /** Choices applied when their Session next loads, by Session id. */
   pending?: Record<string, PendingChoice>
+  /** getUpdates offsets of Telegram lines other than the legacy one. */
+  offsets?: Record<string, number>
 }
 
 /**
@@ -92,29 +95,32 @@ export class BindingStore {
     this.data = {
       version: 1, offset: Number(parsed.offset) || 0, chats: parsed.chats,
       ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
+      ...(parsed.offsets === undefined ? {} : { offsets: parsed.offsets }),
     }
   }
 
-  /** @returns the next getUpdates offset. */
-  get offset(): number {
-    return this.data.offset
+  /**
+   * The next getUpdates offset of a Telegram line. The legacy line keeps the
+   * top-level `offset` of files written before lines existed.
+   */
+  offset(line: string = LEGACY_LINE): number {
+    return line === LEGACY_LINE ? this.data.offset : this.data.offsets?.[line] ?? 0
   }
 
   /** @returns the chat's binding; an empty object when none is stored. */
-  get(chatId: number): Readonly<ChatBinding> {
-    return this.data.chats[String(chatId)] ?? {}
+  get(chat: string): Readonly<ChatBinding> {
+    return this.data.chats[chat] ?? {}
   }
 
   /** @returns every chat that follows a Session without being bound to it. */
-  watchersOf(sessionId: string): number[] {
+  watchersOf(sessionId: string): string[] {
     return Object.entries(this.data.chats)
       .filter(([, binding]) => binding.sessionId !== sessionId && binding.watch?.includes(sessionId) === true)
-      .map(([chatId]) => Number(chatId))
+      .map(([chat]) => chat)
   }
 
   /** Start or stop following a Session from a chat. */
-  setWatch(chatId: number, sessionId: string, on: boolean): Promise<void> {
-    const key = String(chatId)
+  setWatch(key: string, sessionId: string, on: boolean): Promise<void> {
     const binding: ChatBinding = { ...this.data.chats[key] }
     const list = new Set(binding.watch ?? [])
     if (on) list.add(sessionId)
@@ -158,19 +164,18 @@ export class BindingStore {
   }
 
   /** @returns every chat bound to a Session id. */
-  chatsFor(sessionId: string): number[] {
+  chatsFor(sessionId: string): string[] {
     return Object.entries(this.data.chats)
       .filter(([, binding]) => binding.sessionId === sessionId)
-      .map(([chatId]) => Number(chatId))
+      .map(([chat]) => chat)
   }
 
   /**
    * Merge fields into one chat's binding and persist.
-   * @param chatId - Telegram chat id.
+   * @param key - chat key.
    * @param patch - fields to set; `undefined` removes a field.
    */
-  update(chatId: number, patch: Partial<Record<'sessionId' | 'workspacePath', string | undefined>>): Promise<void> {
-    const key = String(chatId)
+  update(key: string, patch: Partial<Record<'sessionId' | 'workspacePath', string | undefined>>): Promise<void> {
     const next: ChatBinding = { ...this.data.chats[key] }
     for (const [field, value] of Object.entries(patch) as ['sessionId' | 'workspacePath', string | undefined][]) {
       if (value === undefined) delete next[field]
@@ -180,10 +185,11 @@ export class BindingStore {
     return this.flush()
   }
 
-  /** Record the next update offset and persist. */
-  setOffset(offset: number): Promise<void> {
-    if (offset <= this.data.offset) return this.writing
-    this.data.offset = offset
+  /** Record a Telegram line's next update offset and persist. */
+  setOffset(line: string, offset: number): Promise<void> {
+    if (offset <= this.offset(line)) return this.writing
+    if (line === LEGACY_LINE) this.data.offset = offset
+    else this.data.offsets = { ...this.data.offsets, [line]: offset }
     return this.flush()
   }
 
