@@ -212,6 +212,7 @@ export function apply(ctx: Context, config: Config): void {
     speech?: Context['speechToText']
     changes?: Context['workspaceChanges']
     workspaces?: Context['workspaceRegistry']
+    commands?: Context['commands']
   } = {}
   ctx.inject(['workspaceRegistry'], (scope) => {
     optional.workspaces = scope.workspaceRegistry
@@ -225,6 +226,19 @@ export function apply(ctx: Context, config: Config): void {
     optional.changes = scope.workspaceChanges
     scope.effect(() => () => { delete optional.changes }, 'telegram-bridge: workspace changes')
   })
+
+  ctx.inject(['commands'], (scope) => {
+    optional.commands = scope.commands
+    scope.effect(() => () => { delete optional.commands }, 'telegram-bridge: command registry')
+  })
+
+  /** The Session's live Agent, resumed through the Session controller like any other Host API domain. */
+  const resolveAgent = async (sessionId: string) => {
+    const live = agents.get(sessionId as SessionId)
+    if (live !== undefined) return live
+    const resolved = await sessionController.resolveAgent(sessionId as SessionId)
+    return 'agent' in resolved ? resolved.agent : undefined
+  }
 
   /** The token the bridge connects with: the literal field when set, else the credential reference. */
   let resolvedToken: string | undefined
@@ -436,6 +450,29 @@ export function apply(ctx: Context, config: Config): void {
       const workspace = await registry.create(cwd)
       await workspace.attachSession(sessionId as SessionId)
       logger.info(`telegram-bridge: added ${sessionId} to Web workspace ${workspace.path}`)
+    },
+    async listCommands(sessionId) {
+      const commands = optional.commands
+      if (commands === undefined) return []
+      const agent = sessionId === undefined
+        ? agents.roots()[0]
+        : await resolveAgent(sessionId)
+      if (agent === undefined) return []
+      return commands.list(agent).map(descriptor => ({
+        name: descriptor.name,
+        description: descriptor.description,
+        ...(descriptor.input === undefined ? {} : { hint: descriptor.input.hint }),
+      }))
+    },
+    async runCommand(sessionId, line) {
+      const commands = optional.commands
+      if (commands === undefined) return undefined
+      const agent = await resolveAgent(sessionId)
+      if (agent === undefined) return undefined
+      const execution = await commands.execute(agent, line, [], new AbortController().signal)
+      if (execution === undefined) return undefined
+      const { result } = execution
+      return { kind: result.kind, ...(result.text === undefined ? {} : { text: result.text }) }
     },
     changedFiles(sessionId, seq) {
       const summary = optional.changes?.summary(sessionId as SessionId, seq as never)

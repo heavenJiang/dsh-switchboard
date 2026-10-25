@@ -86,6 +86,16 @@ export interface PresetOption {
   readonly description?: string
 }
 
+/** One Harness slash command available to a Session. */
+export interface HarnessCommand {
+  readonly name: string
+  readonly description: string
+  readonly hint?: string
+}
+
+/** What a Harness command answered. */
+export type HarnessCommandResult = { readonly kind: 'success' | 'error'; readonly text?: string }
+
 /** One queued prompt of a live Session. */
 export interface QueuedItem {
   readonly id: string
@@ -155,6 +165,17 @@ export interface HarnessPort {
    * the sidebar with the user's other Sessions. Archived Sessions are left alone.
    */
   ensureWorkspace(sessionId: string): Promise<void>
+  /**
+   * Harness slash commands (`/compact`, `/plan`, …) the Session can run; the
+   * Session is resumed when needed. With no Session, any live top-level Agent's view.
+   */
+  listCommands(sessionId: string | undefined): Promise<HarnessCommand[]>
+  /**
+   * Run one slash-command line the way the Web composer does: on the Host,
+   * outside the model conversation.
+   * @returns the command's result, or undefined when no Harness command has that name.
+   */
+  runCommand(sessionId: string, line: string): Promise<HarnessCommandResult | undefined>
   /** Prompts waiting in a live Session's inbox; undefined when it is not loaded. */
   queued(sessionId: string): QueuedItem[] | undefined
   /** Drop queued prompts by id, or all; returns how many were dropped. */
@@ -260,6 +281,16 @@ export type BridgeState =
   | { readonly kind: 'running'; readonly username: string }
   | { readonly kind: 'error'; readonly message: string }
 
+/** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
+const BRIDGE_COMMANDS = new Set([
+  'start', 'help', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
+  'status', 'model', 'mode', 'get', 'whoami',
+])
+/** Harness commands that only make sense in the Web composer (`/telegram` links a Web Session to a chat). */
+const WEB_ONLY_COMMANDS = new Set(['telegram'])
+/** Telegram's command-name rule for the bot menu. */
+const MENU_NAME = /^[a-z0-9_]{1,32}$/u
+
 /** Images up to this size are copied into the history for the viewer. */
 const VIEWER_IMAGE_LIMIT = 5 * 1024 * 1024
 const IMAGE_EXTENSIONS: Record<string, string> = {
@@ -309,6 +340,8 @@ export class TelegramBridge {
   private readonly listings = new Map<number, string[]>()
   private readonly deniedReplies = new Map<number, number>()
   private readonly lifetime = new AbortController()
+  /** Whether the bot menu already lists Harness commands (it is filled once a Session can list them). */
+  private menuHasHarness = false
 
   constructor(
     private readonly settings: () => BridgeSettings,
@@ -426,8 +459,14 @@ export class TelegramBridge {
     }
   }
 
-  private async registerCommands(client: TelegramClient): Promise<void> {
+  /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
+  private async registerCommands(client: TelegramClient, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
     const t = this.t
+    const extra = (harnessCommands ?? await this.harness.listCommands(undefined).catch(() => []))
+      .filter(command => MENU_NAME.test(command.name) && !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
+      .slice(0, 20)
+      .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
+    this.menuHasHarness = extra.length > 0
     await client.setMyCommands([
       { command: 'new', description: t.cmdNew },
       { command: 'stop', description: t.cmdStop },
@@ -437,6 +476,7 @@ export class TelegramBridge {
       { command: 'get', description: t.cmdGet },
       { command: 'status', description: t.cmdStatus },
       { command: 'help', description: t.cmdHelp },
+      ...extra,
     ]).catch((error: unknown) => {
       this.logger.debug(`telegram-bridge: setMyCommands failed: ${describe(error)}`)
     })
@@ -629,8 +669,13 @@ export class TelegramBridge {
     const binding = this.store.get(chatId)
     switch (name) {
       case 'start':
-      case 'help':
-        return this.reply(chatId, t.help)
+      case 'help': {
+        const commands = (await this.harness.listCommands(binding.sessionId).catch(() => []))
+          .filter(command => !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
+        if (commands.length > 0 && !this.menuHasHarness && this.client !== undefined) void this.registerCommands(this.client, commands)
+        const lines = commands.map(command => `/${command.name}${command.hint === undefined ? '' : ` ${command.hint}`} — ${command.description}`)
+        return this.reply(chatId, lines.length === 0 ? t.help : `${t.help}\n\n${t.harnessCommands}\n${lines.join('\n')}`)
+      }
       case 'new': {
         const cwd = args === '' ? this.defaultWorkspace(chatId) : args
         if (cwd === undefined) return this.reply(chatId, t.noWorkspace)
@@ -717,9 +762,19 @@ export class TelegramBridge {
         return this.modeCommand(chatId, binding.sessionId, args)
       case 'get':
         return this.getCommand(chatId, binding.sessionId, args)
-      default:
-        // Unknown slash commands go to the Agent verbatim (skills such as /plan are commands there too).
-        return this.promptFromChat(chatId, [{ type: 'text', text: `/${name}${args === '' ? '' : ` ${args}`}` }], 'queue')
+      default: {
+        const line = `/${name}${args === '' ? '' : ` ${args}`}`
+        // Harness commands run on the Host as in the Web composer; anything else is text for the Agent.
+        if (binding.sessionId !== undefined) {
+          const result = await this.harness.runCommand(binding.sessionId, line)
+          if (result !== undefined) {
+            return this.reply(chatId, result.kind === 'error'
+              ? t.commandFailed(name, result.text ?? '')
+              : result.text === undefined || result.text.trim() === '' ? t.commandDone(name) : result.text)
+          }
+        }
+        return this.promptFromChat(chatId, [{ type: 'text', text: line }], 'queue')
+      }
     }
   }
 

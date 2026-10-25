@@ -40,7 +40,8 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 | `/get <path>` | Fetch a file or list a directory inside the working directory (symlinks cannot escape it) |
 | `/status` | Session, model, directory, and run state |
 | `/whoami` | Your user and chat id (anyone) |
-| other `/xxx` | Passed to the Agent verbatim |
+| Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer, with the result sent back; `/help` and the bot menu list them |
+| other `/xxx` | Not a command: sent to the Agent as text |
 
 - **Rendering**: Markdown replies become Telegram HTML (bold, italics, code, fenced code with language, links, headings, quotes, lists; tables as monospace blocks), split safely, with a plain-text fallback.
 - **Streaming**: a draft message is edited every couple of seconds and then replaced by the formatted reply.

@@ -133,6 +133,25 @@ class FakeHarness implements HarnessPort {
     this.inbox.set(sessionId, keep)
     return items.length - keep.length
   }
+  /** Harness commands this fake Session offers, and the lines it ran. */
+  commands = [
+    { name: 'compact', description: 'Compact the context', hint: '[focus]' },
+    { name: 'goal', description: 'Set a goal' },
+    { name: 'status', description: 'Harness status (shadowed by the bridge)' },
+    { name: 'export-log', description: 'Not a valid Telegram menu name' },
+    { name: 'telegram', description: 'Web-only' },
+  ]
+  readonly ran: { sessionId: string; line: string }[] = []
+  async listCommands(): Promise<{ name: string; description: string; hint?: string }[]> {
+    return this.commands
+  }
+  async runCommand(sessionId: string, line: string): Promise<{ kind: 'success' | 'error'; text?: string } | undefined> {
+    const name = line.slice(1).split(/\s/u)[0]
+    if (!this.commands.some(command => command.name === name)) return undefined
+    this.ran.push({ sessionId, line })
+    if (name === 'goal') return { kind: 'error', text: 'goal text required' }
+    return { kind: 'success', text: 'Compacted: 48k → 9k tokens' }
+  }
   readonly workspaced: string[] = []
   async ensureWorkspace(sessionId: string): Promise<void> {
     if (!this.workspaced.includes(sessionId)) this.workspaced.push(sessionId)
@@ -845,5 +864,42 @@ describe('web workspaces', () => {
     await store.setWatch(CHAT.id, 's-watched', true)
     await bridge.attachLinkedSessions()
     expect(harness.workspaced.sort()).toEqual(['s-bound', 's-watched'])
+  })
+})
+
+describe('harness commands', () => {
+  it('runs registered Harness commands on the Host and replies with their result', async () => {
+    await store.update(CHAT.id, { sessionId: 's1' })
+    telegram.push(text(USER, '/compact keep the API notes'))
+    await until(() => telegram.sent().includes('Compacted: 48k → 9k tokens'))
+    expect(harness.ran).toEqual([{ sessionId: 's1', line: '/compact keep the API notes' }])
+    expect(harness.prompts).toEqual([])
+  })
+
+  it('reports a command error plainly', async () => {
+    await store.update(CHAT.id, { sessionId: 's1' })
+    telegram.push(text(USER, '/goal'))
+    await until(() => telegram.sent().some(t => t.startsWith('⚠️ /goal')))
+    expect(telegram.sent().at(-1)).toBe('⚠️ /goal: goal text required')
+  })
+
+  it('sends unregistered slash text to the Agent, and keeps the bridge\'s own commands', async () => {
+    await store.update(CHAT.id, { sessionId: 's1' })
+    telegram.push(text(USER, '/review the auth module'))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: '/review the auth module' }])
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(harness.ran).toEqual([])
+  })
+
+  it('lists Harness commands in /help and in the bot menu', async () => {
+    const menu = telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands'] as { command: string }[]
+    expect(menu.map(c => c.command)).toEqual(['new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'help', 'compact', 'goal'])
+    await store.update(CHAT.id, { sessionId: 's1' })
+    telegram.push(text(USER, '/help'))
+    await until(() => telegram.sent().length === 1)
+    expect(telegram.sent()[0]).toContain('/compact [focus] — Compact the context')
+    expect(telegram.sent()[0]).not.toContain('Harness status (shadowed')
   })
 })
