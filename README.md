@@ -23,9 +23,10 @@ A **line** is one bot on one chat platform plus the people allowed to use it. Co
 
 **Feishu line**: Feishu delivers events over the Open Platform's persistent connection, so no public URL is needed.
 1. On the [Feishu Open Platform](https://open.feishu.cn/app) (or [Lark](https://open.larksuite.com/app)) create a self-built app and add the **Bot** capability.
-2. Grant `im:message`, `im:message:send_as_bot`, and `im:resource`; optionally `contact:user.base:readonly` (names) and `im:chat:readonly` (group names).
-3. Under **Events and callbacks**, choose **Receive events through persistent connection** and add the event `im.message.receive_v1`; do the same for callbacks and add `card.action.trigger` (buttons need it).
-4. Publish a version, then **+ Feishu line** with the **App ID** (`cli_…`) and **App Secret**. Allowed users are open_ids (`ou_…`; user_id and union_id also match).
+2. Grant `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`, `im:message:send_as_bot`, and `im:resource`; optionally `contact:user.base:readonly` (names) and `im:chat:readonly` (group names).
+3. Add **+ Feishu line** with the **App ID** (`cli_…`) and **App Secret** and save: Feishu lets you pick the persistent connection only while a client is connected.
+4. Under **Events and callbacks**, choose **Receive events through persistent connection** and add the event `im.message.receive_v1`; do the same for callbacks and add `card.action.trigger` (buttons need it).
+5. Publish a version, message the bot `/whoami`, and add the open_id it replies with (`ou_…`, per app; user_id and union_id also match) to the line's allowed users.
 
 Feishu has no typing indicator or command menu; everything else matches Telegram. Replies, drafts, tool activity, and messages with buttons are interactive cards updated in place; notices are text messages.
 
