@@ -1,5 +1,5 @@
 /**
- * Feishu (Lark) line: receives events over the Open Platform's long
+ * Feishu (Lark) line: receives events over the Open Platform's persistent
  * connection, so no public callback URL is needed. Plain notices go out as
  * text messages; replies, drafts, and anything with buttons go out as
  * interactive cards, the only message kind Feishu lets a bot edit freely.
@@ -37,6 +37,9 @@ export interface FeishuCardActionEvent {
   readonly operator?: { readonly open_id?: string; readonly user_id?: string; readonly union_id?: string }
   readonly action?: { readonly value?: { readonly d?: string } | string }
   readonly context?: { readonly open_message_id?: string; readonly open_chat_id?: string }
+  /** Older callbacks carry these at the top level. */
+  readonly open_message_id?: string
+  readonly open_chat_id?: string
 }
 
 /** What a card action may answer within Feishu's three seconds. */
@@ -190,7 +193,8 @@ export class FeishuChannel implements Channel {
     const value = event.action?.value
     const data = typeof value === 'string' ? value : value?.d ?? ''
     const openId = event.operator?.open_id ?? ''
-    const chatId = event.context?.open_chat_id
+    const chatId = event.context?.open_chat_id ?? event.open_chat_id
+    const messageId = event.context?.open_message_id ?? event.open_message_id
     const id = `a${++this.actionSeq}`
     const reply = Promise.withResolvers<FeishuCardResponse | undefined>()
     const timer = setTimeout(() => { settle() }, ACTION_REPLY_MS)
@@ -206,7 +210,7 @@ export class FeishuChannel implements Channel {
       from: { id: openId, name: name ?? openId, ...(aliases.length === 0 ? {} : { aliases }) },
       data,
       ...(chatId === undefined ? {} : { chat: { id: chatId, type: this.chatTypes.get(chatId) ?? 'group' } }),
-      ...(event.context?.open_message_id === undefined ? {} : { messageId: event.context.open_message_id }),
+      ...(messageId === undefined ? {} : { messageId }),
     })).catch((error: unknown) => {
       this.options.logger.warn(`card action failed: ${describe(error)}`)
     }).finally(() => { settle() })

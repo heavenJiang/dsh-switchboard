@@ -18,7 +18,7 @@ import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { BindingStore, PendingChoice } from './bindings.ts'
 import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
-import { createFeishuApi } from './channels/feishu-sdk.ts'
+import { createFeishuApi } from './channels/feishu-api.ts'
 import { TelegramChannel } from './channels/telegram.ts'
 import type {
   Button, Channel, ChannelChat, ChannelSink, ChannelUser, InboundAction, InboundAttachment, InboundMessage, LineState,
@@ -416,7 +416,10 @@ export class Switchboard {
       debug: (message: string) => { this.logger.debug(`switchboard [${line.id}]: ${message}`) },
     }
     const channel: Channel = line.type === 'feishu'
-      ? new FeishuChannel(line, { api: (this.channelOptions.feishu ?? (l => createFeishuApi(l, logger)))(line), logger })
+      ? new FeishuChannel(line, {
+        api: this.channelOptions.feishu?.(line) ?? createFeishuApi(line, logger, this.channelOptions.fetch === undefined ? {} : { fetch: this.channelOptions.fetch }),
+        logger,
+      })
       : new TelegramChannel(line, {
         cursor: { get: () => this.store.offset(line.id), set: offset => this.store.setOffset(line.id, offset) },
         logger,

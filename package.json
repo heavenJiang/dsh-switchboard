@@ -103,8 +103,5 @@
     "@deepseek-ai/dsh-workspace": {
       "optional": true
     }
-  },
-  "dependencies": {
-    "@larksuiteoapi/node-sdk": "1.74.0"
   }
 }

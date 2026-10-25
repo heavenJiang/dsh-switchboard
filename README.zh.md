@@ -218,7 +218,8 @@ src/lines.ts                线路模型与聊天键
 src/channels/types.ts       渠道接口：入站消息 / 按钮、发送 / 编辑 / 文件 / 下载
 src/channels/telegram.ts    Telegram：长轮询、相册合并、@ 识别、HTML 渲染与回退
 src/channels/feishu.ts      飞书：长连接事件、消息解析（文本 / 富文本 / 图片 / 文件 / 语音）、消息卡片
-src/channels/feishu-sdk.ts  飞书开放平台接口（官方 Node SDK，按需加载）
+src/channels/feishu-api.ts  飞书开放平台接口：REST（fetch）与长连接（WebSocket），协议与官方 SDK 一致
+src/channels/feishu-frame.ts 长连接帧（protobuf）编解码
 src/markdown.ts             Markdown → Telegram HTML 与安全分段
 src/telegram.ts             精简 Bot API 客户端（Node fetch，429 退避、文件下载、multipart 上传）
 src/media.ts                附件提取、图片类型识别、回传方式选择
