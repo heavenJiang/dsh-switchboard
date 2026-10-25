@@ -681,7 +681,8 @@ describe('voice and schedules', () => {
   it('reports scheduled runs to the schedule chats', async () => {
     settings = { ...settings, scheduleChats: ['777'] }
     bridge.onSessionEvent('s5', { type: 'turn/start', time: 0 })
-    bridge.onSessionEvent('s5', { type: 'user/message', data: { message: { source: { kind: 'schedule' } } } })
+    // Shaped like a committed reminder: the message is the event's data.
+    bridge.onSessionEvent('s5', { type: 'user/message', data: { role: 'user', id: 'm1', content: [{ type: 'text', text: '[SCHEDULE REMINDER BATCH]' }], source: { kind: 'schedule' } } })
     bridge.onSessionEvent('s5', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Nightly report: green' }] } } })
     await until(() => telegram.calls.some(c => c.method === 'sendMessage' && c.params['chat_id'] === 777))
     expect(telegram.calls.find(c => c.params['chat_id'] === 777)?.params['text']).toBe('Nightly report: green')

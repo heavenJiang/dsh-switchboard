@@ -1007,7 +1007,8 @@ export class Switchboard {
       return
     }
     if (event.type === 'user/message') {
-      const source = (event.data as { message?: { source?: { kind?: string } } }).message?.source?.kind
+      // The event's data is the committed message itself.
+      const source = (event.data as { source?: { kind?: string } } | undefined)?.source?.kind
       const turn = this.turns.get(sessionId)
       if (source === 'schedule' && turn !== undefined) turn.scheduled = true
       return
