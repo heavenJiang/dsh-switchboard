@@ -1,1 +1,4 @@
 autoInstallPeers: false
+# esbuild works from its platform package; its postinstall check is not needed.
+allowBuilds:
+  esbuild: false
