@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4
+- 项目更名为 `dsh-switchboard`（英文名 Switchboard，中文名仍为「掌上指挥台」），为接入飞书等更多渠道做准备。GitHub 仓库改为 `heavenJiang/dsh-switchboard`，旧地址自动跳转。
+- 插件行 id 改为 `switchboard`，Web 接口改为 `/api/switchboard/*`。
+- 首次启动时，`$DSH_HOME/telegram-bridge/` 自动移到 `$DSH_HOME/switchboard/`，绑定、聊天记录与媒体保留。迁移步骤见 docs/PUBLISHING.md。
+
 ## 0.5.3
 - Harness 斜杠命令（`/compact`、`/plan`、`/goal`、`/permission`、`/export` 等）在 Telegram 中与 Web 输入框一样直接在宿主上执行，结果发回聊天；会话不在内存时先恢复。此前它们被当作普通文字发给了 Agent。
 - `/help` 与机器人命令菜单列出当前可用的 Harness 命令；插件自身的命令优先，Web 专用的 `/telegram` 不出现在 Telegram 中。

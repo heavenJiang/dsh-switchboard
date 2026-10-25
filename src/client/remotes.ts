@@ -41,10 +41,10 @@ export const remotes: { pluginManager?: PluginManagerRemote; credentials?: Crede
 export function trackRemotes(ctx: ClientContext): void {
   ctx.inject(['remote', 'remote.pluginManager'], (scope) => {
     remotes.pluginManager = (scope as unknown as { remote: { pluginManager: PluginManagerRemote } }).remote.pluginManager
-    scope.effect(() => () => { delete remotes.pluginManager }, 'telegram-bridge: plugin manager remote')
+    scope.effect(() => () => { delete remotes.pluginManager }, 'switchboard: plugin manager remote')
   })
   ctx.inject(['remote', 'remote.credentials'], (scope) => {
     remotes.credentials = (scope as unknown as { remote: { credentials: CredentialsRemote } }).remote.credentials
-    scope.effect(() => () => { delete remotes.credentials }, 'telegram-bridge: credentials remote')
+    scope.effect(() => () => { delete remotes.credentials }, 'switchboard: credentials remote')
   })
 }

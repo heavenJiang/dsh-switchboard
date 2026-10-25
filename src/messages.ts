@@ -127,7 +127,7 @@ const zh = {
 
 const en: typeof zh = {
   help: [
-    'Pocket Console · DeepSeek Harness',
+    'Switchboard · DeepSeek Harness',
     '',
     'Send text, photos, or files: the current Session\'s Agent gets them',
     '/new [dir] — start a new Session (optionally in a directory)',

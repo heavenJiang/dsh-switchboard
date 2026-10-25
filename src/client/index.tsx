@@ -1,10 +1,10 @@
 /**
- * Pocket Console browser half: the sidebar panel showing Telegram
+ * Switchboard browser half: the sidebar panel showing Telegram
  * conversation history (see TelegramPanel.tsx), the Session tab, and the settings page.
  *
  * Settings page: Registers the bundle's own
  * configuration into the Plugins page's `plugins.bundle.config` slot while
- * the Host serves the `telegram-bridge` entry, and edits that entry's
+ * the Host serves the `switchboard` entry, and edits that entry's
  * volatile Config through the shared configuration form, so a save is one
  * revision-fenced, Host-validated profile patch write that the running
  * bridge picks up without a restart.
@@ -51,11 +51,11 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 /** Dictionary namespace owned by this page. */
 const NS = 'telegramBridge'
 /** Bundle package name: the `plugins.bundle.config` key. */
-const PACKAGE = 'dsh-telegram-bridge'
+const PACKAGE = 'dsh-switchboard'
 /** Profile entry id the bundle patch gives the bridge row: the settings namespace. */
-const ENTRY = 'telegram-bridge'
+const ENTRY = 'switchboard'
 /** Main panel id the sidebar entry selects. */
-const PANEL_ID = 'telegram-bridge' as MainPanelId
+const PANEL_ID = 'switchboard' as MainPanelId
 
 /** The Config fields this page edits, as the Host resolves them (the token is redacted). */
 interface BridgeValues {
@@ -212,23 +212,23 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const off = [ctx.locale.register(NS, 'en', en), ctx.locale.register(NS, 'zh', zh)]
     return () => { for (const dispose of off) dispose() }
-  }, 'telegram-bridge: dictionaries')
+  }, 'switchboard: dictionaries')
   const form = ctx.configForms.get<BridgeValues>(ENTRY)
   const describe = ctx.configForms.describe()
   const Page = createPage(form, describe, ctx)
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
     name: 'plugins.bundle.config', key: PACKAGE, locale: NS,
-  }, Page))), 'telegram-bridge: page')
+  }, Page))), 'switchboard: page')
 
   trackRemotes(ctx)
 
   ctx.effect(() => {
     const style = document.createElement('style')
-    style.dataset['pluginCss'] = 'dsh-telegram-bridge/panel.css'
+    style.dataset['pluginCss'] = 'dsh-switchboard/panel.css'
     style.textContent = panelCss
     document.head.appendChild(style)
     return () => { style.remove() }
-  }, 'telegram-bridge: panel styles')
+  }, 'switchboard: panel styles')
   // Navigation services belong to other plugins; read them when used so the
   // panel still renders in a composition without them.
   const Panel = createTelegramPanel({
@@ -255,11 +255,11 @@ export function apply(ctx: ClientContext): void {
       offEntry()
       offMain()
     }
-  })), 'telegram-bridge: history panel')
+  })), 'switchboard: history panel')
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => whileOn(form, 'showSessionTab', () => ctx.slots.inject('conversation.view', () => ctx.slots.register({
-    name: 'conversation.view', id: 'telegram-bridge', order: 40, locale: NS, label: () => ctx.locale.bind(NS)('tabTitle'),
+    name: 'conversation.view', id: 'switchboard', order: 40, locale: NS, label: () => ctx.locale.bind(NS)('tabTitle'),
   }, (props: { sessionId: string; t: (key: TelegramBridgeLocaleKey) => string }) => <SessionTab sessionId={props.sessionId} t={props.t} />)))),
-  'telegram-bridge: session tab')
+  'switchboard: session tab')
 }
 
 /**
@@ -394,7 +394,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     useEffect(() => {
       if (props.view !== 'page') return
       let live = true
-      void fetch('api/telegram-bridge/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      void fetch('api/switchboard/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
         .then(async response => response.ok ? await response.json() as Catalog : undefined)
         .then((value) => { if (live && value?.groups !== undefined) setCatalog(value) }, () => {})
       return () => { live = false }

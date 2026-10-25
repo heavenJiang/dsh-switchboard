@@ -28,8 +28,8 @@ describe.skipIf(!enabled)('real Loader composition', () => {
     const configPath = join(root, 'cordis.yml')
     await writeFile(configPath, [
       '- name: fixture-services',
-      '- id: telegram-bridge',
-      '  name: dsh-telegram-bridge',
+      '- id: switchboard',
+      '  name: dsh-switchboard',
       '  config:',
       `    stateFile: ${JSON.stringify(join(root, 'state', 'state.json'))}`,
       '',
@@ -61,7 +61,7 @@ describe.skipIf(!enabled)('real Loader composition', () => {
     context.baseUrl = pathToFileURL(root).href + '/'
     await context.plugin(Loader)
     context.loader.builtins.include = Include
-    const modules = new Map<string, unknown>([['fixture-services', services], ['dsh-telegram-bridge', bridge]])
+    const modules = new Map<string, unknown>([['fixture-services', services], ['dsh-switchboard', bridge]])
     context.loader.internal = {
       version: 'v2',
       async import(specifier: string) {
@@ -74,11 +74,11 @@ describe.skipIf(!enabled)('real Loader composition', () => {
 
     expect([...context.loader.entries()].filter(entry => entry.fiber === undefined && !entry.disabled)).toEqual([])
     expect([...routes.keys()].sort()).toEqual([
-      '/api/telegram-bridge/history', '/api/telegram-bridge/link', '/api/telegram-bridge/media',
-      '/api/telegram-bridge/models', '/api/telegram-bridge/overview', '/api/telegram-bridge/send',
-      '/api/telegram-bridge/session', '/api/telegram-bridge/update-check',
+      '/api/switchboard/history', '/api/switchboard/link', '/api/switchboard/media',
+      '/api/switchboard/models', '/api/switchboard/overview', '/api/switchboard/send',
+      '/api/switchboard/session', '/api/switchboard/update-check',
     ])
-    const overview = await (await routes.get('/api/telegram-bridge/overview')!(new Request('http://x/', { method: 'POST' }))).json() as {
+    const overview = await (await routes.get('/api/switchboard/overview')!(new Request('http://x/', { method: 'POST' }))).json() as {
       state: { kind: string }; chats: unknown[]; stats: { series: unknown[] }
     }
     // No token configured: the bridge stays stopped and the viewer still answers.

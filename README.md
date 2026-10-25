@@ -1,4 +1,4 @@
-# Pocket Console (dsh-telegram-bridge)
+# Switchboard (dsh-switchboard)
 
 English | [中文](README.zh.md)
 
@@ -8,18 +8,18 @@ Command DeepSeek Harness Agents from your phone through a Telegram bot: send the
 
 The bot is another client of the Web host. It creates and prompts Sessions through `ctx.sessionController`, the same path the Web UI uses, so Telegram Sessions appear in the Web sidebar and Web Sessions can be taken over or followed. Sessions the bot creates go into the Web Workspace for their working directory (created on first use), listed with your other Sessions.
 
-![Pocket Console overview](docs/images/panel-dashboard.png)
+![Switchboard overview](docs/images/panel-dashboard.png)
 
 ## Quick start
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy its token.
-2. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-telegram-bridge`, or
+2. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-switchboard`, or
 
    ```sh
-   dsh plugin --profile web add github:heavenJiang/dsh-telegram-bridge
+   dsh plugin --profile web add github:heavenJiang/dsh-switchboard
    ```
 
-3. Open **Plugins → Installed → Pocket Console** (or **Plugin settings** in the sidebar's **Pocket Console** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
+3. Open **Plugins → Installed → Switchboard** (or **Plugin settings** in the sidebar's **Switchboard** panel), fill in the **Bot token**, **Allowed users** (send `/whoami` to the bot for your id), and **Default working directory**, then **Save**. Changes apply immediately.
 
 ## In Telegram
 
@@ -54,8 +54,8 @@ The bot is another client of the Web host. It creates and prompts Sessions throu
 
 ## In the Web UI
 
-- **Pocket Console panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
-- **Pocket Console tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
+- **Switchboard panel** (sidebar): chats with search and bot status; an overview with today's messages, active chats, approvals, blocks, and a 14-day chart; full threads with images, file cards, tool and approval cards, per-member filters in groups, and **Open Session**. **Plugin settings** and a **New** badge sit in the header.
+- **Switchboard tab in every Session**: linked chats, bind or follow another chat, send a message as the bot, and the Session's Telegram activity.
 - **`/telegram` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session; runs on the Host, never reaches the model.
 - **Channel note**: Sessions bound to a chat get a short `ctx.systemPrompt.context()` note asking for phone-friendly replies.
 

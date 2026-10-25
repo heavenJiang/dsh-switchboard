@@ -11,7 +11,7 @@ import type { ChatLog } from './chatlog.ts'
 import type { UpdateChecker } from './updates.ts'
 
 /** Route prefix; the browser half calls these relative to the page. */
-export const API_PREFIX = '/api/telegram-bridge'
+export const API_PREFIX = '/api/switchboard'
 
 const MEDIA_TYPES: Record<string, string> = {
   '.jpg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
@@ -53,7 +53,7 @@ export function registerHistoryRoutes(
       })
       return json({ state: bridge.state, chats, stats: await log.stats() })
     },
-  }), 'telegram-bridge: overview route')
+  }), 'switchboard: overview route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/models`,
@@ -66,7 +66,7 @@ export function registerHistoryRoutes(
         return json({ error: error instanceof Error ? error.message : String(error) }, 503)
       }
     },
-  }), 'telegram-bridge: models route')
+  }), 'switchboard: models route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/update-check`,
@@ -76,7 +76,7 @@ export function registerHistoryRoutes(
       const { source, force } = await body(request)
       return json(await updates.check(typeof source === 'string' ? source : undefined, force === true))
     },
-  }), 'telegram-bridge: update check route')
+  }), 'switchboard: update check route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/session`,
@@ -93,7 +93,7 @@ export function registerHistoryRoutes(
       const entries = await log.sessionHistory(sessionId, lookIn, 60)
       return json({ connected: bridge.state.kind === 'running', links: titled, chats, entries })
     },
-  }), 'telegram-bridge: session route')
+  }), 'switchboard: session route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/link`,
@@ -107,7 +107,7 @@ export function registerHistoryRoutes(
       await bridge.linkChat(chatId, sessionId, mode as 'active' | 'watch' | 'none')
       return json({ ok: true })
     },
-  }), 'telegram-bridge: link route')
+  }), 'switchboard: link route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/send`,
@@ -123,7 +123,7 @@ export function registerHistoryRoutes(
         return json({ error: error instanceof Error ? error.message : String(error) }, 409)
       }
     },
-  }), 'telegram-bridge: send route')
+  }), 'switchboard: send route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/history`,
@@ -135,7 +135,7 @@ export function registerHistoryRoutes(
       const size = typeof limit === 'number' && limit > 0 ? Math.min(Math.floor(limit), 500) : 100
       return json(await log.history(chatId, typeof before === 'string' ? before : undefined, size))
     },
-  }), 'telegram-bridge: history route')
+  }), 'switchboard: history route')
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/media`,
@@ -156,5 +156,5 @@ export function registerHistoryRoutes(
         },
       })
     },
-  }), 'telegram-bridge: media route')
+  }), 'switchboard: media route')
 }

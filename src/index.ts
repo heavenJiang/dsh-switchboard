@@ -16,7 +16,7 @@
  * `speechToText`, `workspaceChanges`) are picked up while they exist; the
  * bridge runs without any of them.
  *
- * @module dsh-telegram-bridge
+ * @module dsh-switchboard
  */
 
 import type { Context, Volatile } from '@deepseek-ai/cordis'
@@ -43,7 +43,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-user-questions'
 import type {} from '@deepseek-ai/dsh-workspace-changes'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
-import { BindingStore, defaultStateFile } from './bindings.ts'
+import { BindingStore, defaultStateFile, migrateLegacyStateDir } from './bindings.ts'
 import {
   TelegramBridge, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
 } from './bridge.ts'
@@ -56,7 +56,7 @@ import { UpdateChecker } from './updates.ts'
 export { TelegramBridge } from './bridge.ts'
 export type { BridgeSettings, HarnessPort } from './bridge.ts'
 
-export const name = 'telegram-bridge'
+export const name = 'switchboard'
 /** The Web host's Session controller drives Sessions exactly as the Web UI does. */
 export const inject = ['agents', 'sessionController', 'permissionPresets', 'fileUploads', 'llm']
 
@@ -134,7 +134,7 @@ export interface Config {
   showSessionTab: Volatile<boolean>
   /** Long-poll wait in seconds. */
   pollTimeoutSec: number
-  /** Chat-to-Session binding file; defaults to `$DSH_HOME/telegram-bridge/state.json`. */
+  /** Chat-to-Session binding file; defaults to `$DSH_HOME/switchboard/state.json`. */
   stateFile?: string
 }
 
@@ -216,20 +216,20 @@ export function apply(ctx: Context, config: Config): void {
   } = {}
   ctx.inject(['workspaceRegistry'], (scope) => {
     optional.workspaces = scope.workspaceRegistry
-    scope.effect(() => () => { delete optional.workspaces }, 'telegram-bridge: workspace registry')
+    scope.effect(() => () => { delete optional.workspaces }, 'switchboard: workspace registry')
   })
   ctx.inject(['speechToText'], (scope) => {
     optional.speech = scope.speechToText
-    scope.effect(() => () => { delete optional.speech }, 'telegram-bridge: speech service')
+    scope.effect(() => () => { delete optional.speech }, 'switchboard: speech service')
   })
   ctx.inject(['workspaceChanges'], (scope) => {
     optional.changes = scope.workspaceChanges
-    scope.effect(() => () => { delete optional.changes }, 'telegram-bridge: workspace changes')
+    scope.effect(() => () => { delete optional.changes }, 'switchboard: workspace changes')
   })
 
   ctx.inject(['commands'], (scope) => {
     optional.commands = scope.commands
-    scope.effect(() => () => { delete optional.commands }, 'telegram-bridge: command registry')
+    scope.effect(() => () => { delete optional.commands }, 'switchboard: command registry')
   })
 
   /** The Session's live Agent, resumed through the Session controller like any other Host API domain. */
@@ -317,7 +317,7 @@ export function apply(ctx: Context, config: Config): void {
       // Create inside the directory's Web Workspace (made on first use), the
       // way the Web composer does, so the Session lists in the sidebar.
       const workspace = await optional.workspaces?.create(cwd).catch((error: unknown) => {
-        logger.warn(`telegram-bridge: no Web workspace for ${cwd}: ${String(error)}`)
+        logger.warn(`switchboard: no Web workspace for ${cwd}: ${String(error)}`)
         return undefined
       })
       const { sessionId } = await sessionController.create({
@@ -352,7 +352,7 @@ export function apply(ctx: Context, config: Config): void {
           return receiptId
         } catch (error: unknown) {
           // Unaccepted types and oversized images still reach the Agent as files.
-          logger.debug(`telegram-bridge: ${file.name} staged as a file: ${String(error)}`)
+          logger.debug(`switchboard: ${file.name} staged as a file: ${String(error)}`)
         }
       }
       const { receiptId } = await fileUploads.uploadStream({ sessionId: sessionId as SessionId, data: data(), name: file.name })
@@ -449,7 +449,7 @@ export function apply(ctx: Context, config: Config): void {
       if (cwd === undefined) return
       const workspace = await registry.create(cwd)
       await workspace.attachSession(sessionId as SessionId)
-      logger.info(`telegram-bridge: added ${sessionId} to Web workspace ${workspace.path}`)
+      logger.info(`switchboard: added ${sessionId} to Web workspace ${workspace.path}`)
     },
     async listCommands(sessionId) {
       const commands = optional.commands
@@ -495,13 +495,13 @@ export function apply(ctx: Context, config: Config): void {
 
   const restart = (): void => {
     void refreshToken().then(() => bridge.reconcile()).catch((error: unknown) => {
-      logger.warn(`telegram-bridge: restart failed: ${String(error)}`)
+      logger.warn(`switchboard: restart failed: ${String(error)}`)
     })
   }
 
   ctx.inject(['credentials'], (scope) => {
     optional.credentials = scope.credentials
-    scope.effect(() => () => { delete optional.credentials }, 'telegram-bridge: credentials')
+    scope.effect(() => () => { delete optional.credentials }, 'switchboard: credentials')
     // A token written on the plugin page lands in the credentials store; reconnect with it.
     scope.on('credentials/reference-updated', (ref) => {
       if (ref === config.botTokenRef.get().trim()) restart()
@@ -522,7 +522,7 @@ export function apply(ctx: Context, config: Config): void {
   // Sessions linked to a chat learn that their replies are read on a phone.
   ctx.inject(['systemPrompt'], (scope) => {
     scope.effect(() => scope.systemPrompt.context({
-      name: 'telegram-bridge:channel',
+      name: 'switchboard:channel',
       order: 950,
       interpolate: false,
       text: (assembly) => {
@@ -531,7 +531,7 @@ export function apply(ctx: Context, config: Config): void {
         if (store.chatsFor(agent.session.header.id).length === 0) return ''
         return config.channelPromptText.get().trim() || CHANNEL_PROMPT
       },
-    }), 'telegram-bridge: channel prompt')
+    }), 'switchboard: channel prompt')
   })
 
   ctx.on('session/event', (session, event) => {
@@ -553,7 +553,7 @@ export function apply(ctx: Context, config: Config): void {
       try {
         permissionPresets.set(agent.session, pending.preset)
       } catch (error: unknown) {
-        logger.warn(`telegram-bridge: pending permission mode ${pending.preset} not applied: ${String(error)}`)
+        logger.warn(`switchboard: pending permission mode ${pending.preset} not applied: ${String(error)}`)
       }
     }
     return undefined
@@ -593,11 +593,15 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('loader/volatile-update', restart)
 
   ctx.effect(() => {
-    const started = store.load().then(() => refreshToken()).then(() => bridge.reconcile()).then(async () => {
+    const migrated = config.stateFile === undefined ? migrateLegacyStateDir() : Promise.resolve(false)
+    const started = migrated.then((moved) => {
+      if (moved) logger.info('switchboard: moved data from the telegram-bridge directory')
+      return store.load()
+    }).then(() => refreshToken()).then(() => bridge.reconcile()).then(async () => {
       // Sessions linked before workspaces were attached join theirs now.
       await bridge.attachLinkedSessions()
     }).catch((error: unknown) => {
-      logger.warn(`telegram-bridge: failed to start: ${String(error)}`)
+      logger.warn(`switchboard: failed to start: ${String(error)}`)
     })
     return async () => {
       await started
@@ -605,5 +609,5 @@ export function apply(ctx: Context, config: Config): void {
       await store.settled()
       await chatLog.settled()
     }
-  }, 'telegram-bridge: polling')
+  }, 'switchboard: polling')
 }

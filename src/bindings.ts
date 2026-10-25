@@ -3,7 +3,7 @@
  * restart resumes each chat's conversation instead of starting a new one.
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -34,12 +34,39 @@ interface BindingsFile {
 }
 
 /**
- * Default state file location: `$DSH_HOME/telegram-bridge/state.json`,
+ * Default state file location: `$DSH_HOME/switchboard/state.json`,
  * with `$DSH_HOME` defaulting to `~/.dsh` like the launcher.
  */
 export function defaultStateFile(): string {
-  const home = process.env['DSH_HOME'] ?? join(homedir(), '.dsh')
-  return join(home, 'telegram-bridge', 'state.json')
+  return join(dshHome(), 'switchboard', 'state.json')
+}
+
+function dshHome(): string {
+  return process.env['DSH_HOME'] ?? join(homedir(), '.dsh')
+}
+
+/**
+ * Move the data directory of releases named dsh-telegram-bridge
+ * (`$DSH_HOME/telegram-bridge`) to `$DSH_HOME/switchboard`, keeping bindings,
+ * chat history, and media. Does nothing once the new directory exists.
+ * @returns whether a directory was moved.
+ */
+export async function migrateLegacyStateDir(): Promise<boolean> {
+  const target = join(dshHome(), 'switchboard')
+  const legacy = join(dshHome(), 'telegram-bridge')
+  if (await exists(target) || !await exists(legacy)) return false
+  await rename(legacy, target)
+  return true
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
 }
 
 /** Serialized read-modify-write store over one JSON file. */
@@ -60,7 +87,7 @@ export class BindingStore {
     }
     const parsed = JSON.parse(text) as Partial<BindingsFile>
     if (parsed.version !== 1 || typeof parsed.chats !== 'object' || parsed.chats === null) {
-      throw new Error(`telegram-bridge: unrecognized state file ${this.path}`)
+      throw new Error(`switchboard: unrecognized state file ${this.path}`)
     }
     this.data = {
       version: 1, offset: Number(parsed.offset) || 0, chats: parsed.chats,

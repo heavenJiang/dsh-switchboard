@@ -1,19 +1,19 @@
 # 发布到 npm（准备说明）
 
-当前插件从 GitHub 安装（`github:heavenJiang/dsh-telegram-bridge`），插件页的「版本」区块用 GitHub 检查与更新。发布到 npm 后，用户可以在 **添加插件** 里直接搜索安装，插件页原生的版本区块与一键更新也会可用。
+当前插件从 GitHub 安装（`github:heavenJiang/dsh-switchboard`），插件页的「版本」区块用 GitHub 检查与更新。发布到 npm 后，用户可以在 **添加插件** 里直接搜索安装，插件页原生的版本区块与一键更新也会可用。
 
 ## 需要先决定的事
 
-1. **包名**：npm 上的 `dsh-telegram-bridge` 已被另一位作者占用，需要改用带作用域的名字，例如 `@heavenjiang/dsh-telegram-bridge`。
-2. **迁移影响**：改名后，已从 GitHub 安装的用户需要卸载旧包、按新名字重新安装。配置（profile 中 `telegram-bridge` 行）和数据（`$DSH_HOME/telegram-bridge/`、凭据库里的 Token）都会保留，因为它们不依赖包名。
-3. **账号**：发布需要你的 npm 账号与作用域权限，公开发布后不可撤回同一版本号。
+1. **包名**：`dsh-switchboard` 在 npm 上尚未被占用，可以直接以不带作用域的名字发布（旧名 `dsh-telegram-bridge` 属于另一位作者）。
+2. **账号**：发布需要你的 npm 账号；公开发布后，同一版本号不能再次发布。
 
-## 改名时需要同步修改的地方
+## 从 dsh-telegram-bridge 迁移
 
-- `package.json`：`name`，并加 `"publishConfig": { "access": "public" }`。
-- `cordis.patch.yml`：`name: dsh-telegram-bridge` 改为新包名（行 `id: telegram-bridge` 保持不变，配置因此得以保留）。
-- `src/client/index.tsx`：`PACKAGE` 常量（插件页的配置区按包名挂载）。
-- README 中的安装命令。
+0.5.4 起包名为 `dsh-switchboard`，插件行 id 为 `switchboard`。已安装旧包的 profile：
+
+1. 在 profile 的 `cordis.patch.yml` 中把 `id: telegram-bridge` / `name: dsh-telegram-bridge` 改为 `id: switchboard` / `name: dsh-switchboard`，其余配置不变。
+2. 卸载 `dsh-telegram-bridge`，安装 `github:heavenJiang/dsh-switchboard`。
+3. 首次启动时，`$DSH_HOME/telegram-bridge/` 会自动移到 `$DSH_HOME/switchboard/`，绑定、聊天记录与媒体都会保留。凭据库里的 Token（`TELEGRAM_BOT_TOKEN`）不依赖包名，无需改动。
 
 ## 发布步骤
 

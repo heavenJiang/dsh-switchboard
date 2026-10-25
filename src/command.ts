@@ -122,5 +122,5 @@ export function registerWebCommand(ctx: Context, bridge: TelegramBridge, log: Ch
           return { kind: 'error', text: t.usage }
       }
     },
-  }), 'telegram-bridge: /telegram command')
+  }), 'switchboard: /telegram command')
 }

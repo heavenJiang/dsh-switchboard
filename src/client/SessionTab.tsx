@@ -2,7 +2,7 @@
  * The Telegram tab inside a Session: which chats are linked to it, linking
  * another chat (bind to talk, or follow for notices), sending a message as
  * the bot, and the Session's Telegram activity. Data comes from the Host's
- * owner-only `/api/telegram-bridge/session` route, polled while visible.
+ * owner-only `/api/switchboard/session` route, polled while visible.
  */
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
@@ -21,7 +21,7 @@ interface SessionView {
 const POLL_MS = 4000
 
 async function post<V>(path: string, body: object): Promise<V> {
-  const response = await fetch(`api/telegram-bridge/${path}`, {
+  const response = await fetch(`api/switchboard/${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   })
   const value = await response.json() as V & { error?: string }

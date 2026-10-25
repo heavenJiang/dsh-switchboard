@@ -1,4 +1,4 @@
-# 掌上指挥台（dsh-telegram-bridge）
+# 掌上指挥台（Switchboard · dsh-switchboard）
 
 [English](README.md) | 中文
 
@@ -13,10 +13,10 @@
 ## 快速开始
 
 1. 在 Telegram 找 [@BotFather](https://t.me/BotFather)，发送 `/newbot` 创建机器人，复制 Token。
-2. 安装到 Web profile：在 Web 侧栏 **插件 → 添加插件** 中填 `github:heavenJiang/dsh-telegram-bridge`，或用命令行：
+2. 安装到 Web profile：在 Web 侧栏 **插件 → 添加插件** 中填 `github:heavenJiang/dsh-switchboard`，或用命令行：
 
    ```sh
-   dsh plugin --profile web add github:heavenJiang/dsh-telegram-bridge
+   dsh plugin --profile web add github:heavenJiang/dsh-switchboard
    ```
 
 3. 打开侧栏 **插件 → 已安装插件 → 掌上指挥台**（也可以点侧栏 **掌上指挥台** 右上角的 **插件设置**），填写 **Bot Token**、**允许的用户**（先给机器人发 `/whoami` 查看自己的 ID）和 **默认工作目录**，点 **保存**，即时生效。
@@ -164,7 +164,7 @@
 | 界面与记录 | `showPanel` / `showSessionTab` | `true` | 侧栏掌上指挥台入口 / 会话内标签页 |
 | | `historyLimit` | `2000` | 每个聊天保留的记录条数 |
 | （文件） | `pollTimeoutSec` | `30` | 长轮询等待秒数 |
-| （文件） | `stateFile` | `$DSH_HOME/telegram-bridge/state.json` | 绑定、订阅、待生效选择与轮询进度 |
+| （文件） | `stateFile` | `$DSH_HOME/switchboard/state.json` | 绑定、订阅、待生效选择与轮询进度 |
 
 网络受限时，在启动 `dsh` 前设置 `HTTPS_PROXY` 即可，Harness 的出站代理策略会自动覆盖机器人的请求。
 
@@ -185,7 +185,7 @@ src/command.ts     Web 输入框的 /telegram 命令（ctx.commands）
 src/updates.ts     版本检查（GitHub / npm，经宿主代理）
 src/version.ts     安装来源解析与版本比较（宿主与浏览器共用）
 src/client/        浏览器半侧：掌上指挥台面板、会话标签页、设置页（分组）、版本区块
-cordis.patch.yml   组合包层：插入 id 为 telegram-bridge 的插件行
+cordis.patch.yml   组合包层：插入 id 为 switchboard 的插件行
 ```
 
 用到的扩展点：

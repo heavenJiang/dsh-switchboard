@@ -366,7 +366,7 @@ export class TelegramBridge {
     if (this.chatLog === undefined) return
     const session = sessionId ?? this.store.get(chat.chatId).sessionId
     void this.chatLog.record(chat, { ...entry, ...(session === undefined ? {} : { sessionId: session }) }).catch((error: unknown) => {
-      this.logger.warn(`telegram-bridge: chat history write failed: ${describe(error)}`)
+      this.logger.warn(`switchboard: chat history write failed: ${describe(error)}`)
     })
   }
 
@@ -431,7 +431,7 @@ export class TelegramBridge {
           const me = await client.getMe(signal)
           this.botUsername = me.username
           this.state = { kind: 'running', username: me.username ?? String(me.id) }
-          this.logger.info(`telegram-bridge: connected as @${this.state.username}`)
+          this.logger.info(`switchboard: connected as @${this.state.username}`)
           await this.registerCommands(client)
         }
         const updates = await client.getUpdates(this.store.offset, this.settings().pollTimeoutSec, signal)
@@ -440,18 +440,18 @@ export class TelegramBridge {
           // Advance first: an update that crashes the handler is not replayed forever.
           await this.store.setOffset(update.update_id + 1)
           await this.handleUpdate(update).catch((error: unknown) => {
-            this.logger.warn(`telegram-bridge: update ${update.update_id} failed: ${describe(error)}`)
+            this.logger.warn(`switchboard: update ${update.update_id} failed: ${describe(error)}`)
           })
         }
       } catch (error: unknown) {
         if (signal.aborted) break
         if (error instanceof TelegramApiError && error.code === 401) {
           this.state = { kind: 'error', message: 'bot token rejected (401)' }
-          this.logger.warn('telegram-bridge: bot token rejected; fix it on the plugin page')
+          this.logger.warn('switchboard: bot token rejected; fix it on the plugin page')
           return
         }
         this.state = { kind: 'error', message: describe(error) }
-        this.logger.warn(`telegram-bridge: polling failed, retrying in ${backoff / 1000}s: ${describe(error)}`)
+        this.logger.warn(`switchboard: polling failed, retrying in ${backoff / 1000}s: ${describe(error)}`)
         await sleep(backoff, signal)
         backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
         if (!signal.aborted) this.state = { kind: 'connecting' }
@@ -478,7 +478,7 @@ export class TelegramBridge {
       { command: 'help', description: t.cmdHelp },
       ...extra,
     ]).catch((error: unknown) => {
-      this.logger.debug(`telegram-bridge: setMyCommands failed: ${describe(error)}`)
+      this.logger.debug(`switchboard: setMyCommands failed: ${describe(error)}`)
     })
   }
 
@@ -781,7 +781,7 @@ export class TelegramBridge {
   /** Put a linked Session into its directory's Web Workspace; a failure is logged, never shown in Telegram. */
   private attachToWorkspace(sessionId: string): void {
     void this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
-      this.logger.warn(`telegram-bridge: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
+      this.logger.warn(`switchboard: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
     })
   }
 
@@ -789,7 +789,7 @@ export class TelegramBridge {
   async attachLinkedSessions(): Promise<void> {
     for (const sessionId of this.store.linkedSessions()) {
       await this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
-        this.logger.warn(`telegram-bridge: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
+        this.logger.warn(`switchboard: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
       })
     }
   }
@@ -1307,7 +1307,7 @@ export class TelegramBridge {
     if (client === undefined) return Promise.resolve()
     const previous = this.sendTails.get(chatId) ?? Promise.resolve()
     const next = previous.then(() => send(client)).catch((error: unknown) => {
-      this.logger.warn(`telegram-bridge: send to chat ${chatId} failed: ${describe(error)}`)
+      this.logger.warn(`switchboard: send to chat ${chatId} failed: ${describe(error)}`)
     })
     this.sendTails.set(chatId, next)
     void next.then(() => {

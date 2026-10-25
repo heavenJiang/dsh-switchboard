@@ -4,15 +4,15 @@ import { compareVersions, parseSource } from '../src/version.ts'
 
 describe('parseSource', () => {
   it('recognizes GitHub specs in their common spellings', () => {
-    expect(parseSource('github:heavenJiang/dsh-telegram-bridge', 'x')).toEqual({ kind: 'github', owner: 'heavenJiang', repo: 'dsh-telegram-bridge' })
+    expect(parseSource('github:heavenJiang/dsh-switchboard', 'x')).toEqual({ kind: 'github', owner: 'heavenJiang', repo: 'dsh-switchboard' })
     expect(parseSource('github:a/b#abc123', 'x')).toEqual({ kind: 'github', owner: 'a', repo: 'b', ref: 'abc123' })
     expect(parseSource('git+https://github.com/a/b.git', 'x')).toEqual({ kind: 'github', owner: 'a', repo: 'b' })
   })
 
   it('treats links and tarballs as local, everything else as npm', () => {
-    expect(parseSource('link:/Users/me/dsh-telegram-bridge', 'x').kind).toBe('local')
+    expect(parseSource('link:/Users/me/dsh-switchboard', 'x').kind).toBe('local')
     expect(parseSource('./pkg-0.1.0.tgz', 'x').kind).toBe('local')
-    expect(parseSource('^0.3.0', 'dsh-telegram-bridge')).toEqual({ kind: 'npm', name: 'dsh-telegram-bridge' })
+    expect(parseSource('^0.3.0', 'dsh-switchboard')).toEqual({ kind: 'npm', name: 'dsh-switchboard' })
     expect(parseSource(undefined, 'n')).toEqual({ kind: 'unknown' })
     expect(parseSource('https://example.com/x', 'n')).toEqual({ kind: 'unknown' })
   })
@@ -47,9 +47,9 @@ describe('UpdateChecker', () => {
   })
 
   it('falls back to the next npm registry', async () => {
-    const checker = new UpdateChecker(respond({ 'https://registry.npmmirror.com/dsh-telegram-bridge/latest': { version: '0.0.1' } }))
+    const checker = new UpdateChecker(respond({ 'https://registry.npmmirror.com/dsh-switchboard/latest': { version: '0.0.1' } }))
     const result = await checker.check('^0.0.1')
-    expect(result.latest?.spec).toBe('dsh-telegram-bridge@0.0.1')
+    expect(result.latest?.spec).toBe('dsh-switchboard@0.0.1')
     expect(result.newer).toBe(false)
   })
 

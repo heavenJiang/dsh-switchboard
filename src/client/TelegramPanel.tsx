@@ -1,6 +1,6 @@
 /**
  * The Telegram history viewer: a chat list beside the selected chat's
- * messages, read from the Host's owner-only `/api/telegram-bridge/*` routes
+ * messages, read from the Host's owner-only `/api/switchboard/*` routes
  * and refreshed by polling while the page is open and visible.
  */
 
@@ -25,7 +25,7 @@ export interface PanelActions {
 
 type T = (key: TelegramBridgeLocaleKey) => string
 
-const API = 'api/telegram-bridge'
+const API = 'api/switchboard'
 const POLL_MS = 3000
 const PAGE = 100
 
@@ -148,7 +148,7 @@ export function createTelegramPanel(actions: PanelActions) {
                 ))}
             </div>
             <footer className="tgb-info">
-              <span>{t('pluginInfo')}: dsh-telegram-bridge{update === undefined ? '' : ` v${update.installed}`}</span>
+              <span>{t('pluginInfo')}: dsh-switchboard{update === undefined ? '' : ` v${update.installed}`}</span>
               {update?.source.kind === 'github' && (
                 <>· <a href={`https://github.com/${update.source.owner}/${update.source.repo}`} target="_blank" rel="noreferrer">GitHub</a></>
               )}
@@ -446,7 +446,7 @@ function Avatar({ id, name, size }: { id: number; name: string; size?: 'sm' | 'x
 }
 
 /**
- * Pocket Console mark: a chat bubble holding a command prompt, drawn in the
+ * Switchboard mark: a chat bubble holding a command prompt, drawn in the
  * current text color for the sidebar entry, the Session tab, and empty states.
  * @param props.size - icon edge in pixels.
  */

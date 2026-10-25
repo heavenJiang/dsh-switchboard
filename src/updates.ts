@@ -66,7 +66,7 @@ export class UpdateChecker {
   /** The default branch head, and the version its package.json declares. */
   private async github(owner: string, repo: string): Promise<LatestRelease> {
     const api = `https://api.github.com/repos/${owner}/${repo}`
-    const headers = { accept: 'application/vnd.github+json', 'user-agent': 'dsh-telegram-bridge' }
+    const headers = { accept: 'application/vnd.github+json', 'user-agent': 'dsh-switchboard' }
     const head = await this.json<{ sha: string; commit: { message: string; committer?: { date?: string } } }>(`${api}/commits/HEAD`, headers)
     const manifest = await this.json<{ version?: string }>(`https://raw.githubusercontent.com/${owner}/${repo}/${head.sha}/package.json`)
     if (typeof manifest.version !== 'string') throw new Error('the repository package.json declares no version')

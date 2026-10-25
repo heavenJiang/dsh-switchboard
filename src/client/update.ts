@@ -44,7 +44,7 @@ export function checkForUpdate(ctx: ClientContext, name: string, force = false):
     const manager = pluginManager(ctx)
     const listed = await manager?.listBundles().catch(() => undefined)
     const source = listed?.ok === true ? listed.value.find(bundle => bundle.name === name)?.source : undefined
-    const response = await fetch('api/telegram-bridge/update-check', {
+    const response = await fetch('api/switchboard/update-check', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ ...(source === undefined ? {} : { source }), force }),
