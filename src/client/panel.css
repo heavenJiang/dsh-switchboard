@@ -750,3 +750,14 @@ a.tgb-button { text-decoration: none; }
 }
 
 .tgb-line-card code { font-size: 12px; }
+
+.tgb-line-error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+  color: var(--dsw-alias-state-error-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
+}

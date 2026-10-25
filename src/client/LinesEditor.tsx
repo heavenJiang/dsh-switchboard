@@ -126,6 +126,7 @@ export function LinesEditor(props: {
                 {t('lineRemove')}
               </button>
             </header>
+            {state?.kind === 'error' && <p className="tgb-line-error" role="alert">{state.message}</p>}
             <p className="tgb-muted tgb-small">
               {t('lineId')}: <code>{v.id}</code>{bad.id === true ? ` — ${t('lineInvalidId')}` : ''}
             </p>
