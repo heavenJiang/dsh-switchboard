@@ -4,9 +4,10 @@
  * and refreshed by polling while the page is open and visible.
  */
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import type { ChatAttachment, ChatEntry, ChatPage, ChatStats, ChatSummary } from '../history-types.ts'
 import type { TelegramBridgeLocaleKey } from './locales.ts'
+import { pendingRequests } from './MembersView.tsx'
 import type { UpdateCheck } from './update.ts'
 
 /** Connection state as the Host reports it. */
@@ -31,6 +32,22 @@ export interface PanelActions {
   openSettings(): void
   /** Hook: the shared update check (installed version, source, newer release). */
   useUpdate(): UpdateCheck | undefined
+  /** The Lines, Settings, and Members tabs, rendered over the shared settings form. */
+  Lines: ComponentType<{ t: T }>
+  Settings: ComponentType<{ t: T }>
+  Members: ComponentType<{ t: T; chats: readonly ChatSummary[] | undefined }>
+}
+
+type Tab = 'chats' | 'lines' | 'members' | 'settings'
+const TAB_KEY = 'dsh-switchboard:tab'
+
+function readTab(): Tab {
+  try {
+    const value = localStorage.getItem(TAB_KEY)
+    return value === 'lines' || value === 'members' || value === 'settings' ? value : 'chats'
+  } catch {
+    return 'chats'
+  }
 }
 
 type T = (key: TelegramBridgeLocaleKey) => string
@@ -89,6 +106,11 @@ export function createTelegramPanel(actions: PanelActions) {
     const [selected, setSelected] = useState<string | undefined>(undefined)
     const [query, setQuery] = useState('')
     const [stats, setStats] = useState<ChatStats | undefined>(undefined)
+    const [tab, setTabState] = useState<Tab>(readTab)
+    const setTab = (next: Tab): void => {
+      setTabState(next)
+      try { localStorage.setItem(TAB_KEY, next) } catch { /* the tab is a convenience */ }
+    }
     const update = actions.useUpdate()
 
     usePolling(async () => {
@@ -110,25 +132,57 @@ export function createTelegramPanel(actions: PanelActions) {
         .some(value => value.toLowerCase().includes(needle)))
     }, [chats, query])
     const current = chats?.find(chat => chat.chatId === selected)
+    const pending = pendingRequests(chats ?? []).length
+    const lineTrouble = lines.some(line => line.state.kind === 'error') || lines.some(line => (line.queued ?? 0) > 0)
+    const tabs: [Tab, TelegramBridgeLocaleKey, ReactNode][] = [
+      ['chats', 'tabChats', null],
+      ['lines', 'tabLines', lineTrouble ? <i className="tgb-dot" data-tone="error" /> : null],
+      ['members', 'tabMembers', pending > 0 ? <span className="tgb-count">{pending}</span> : null],
+      ['settings', 'tabSettings', null],
+    ]
 
     return (
       <div className="tgb-container">
+        <nav className="tgb-tabs" role="tablist" aria-label={t('panel')}>
+          <span className="tgb-tabs-title"><ConsoleIcon size={18} /> {t('panel')}</span>
+          {tabs.map(([id, label, badge]) => (
+            <button key={id} type="button" role="tab" className="tgb-tabbtn" aria-selected={tab === id} onClick={() => { setTab(id) }}>
+              {t(label)}{badge}
+            </button>
+          ))}
+          <span className="tgb-tabs-end">
+            {update?.newer === true && update.latest !== undefined && (
+              <button type="button" className="tgb-new-badge" title={`${t('newVersion')} v${update.latest.version}`} onClick={actions.openSettings}>
+                {t('newBadge')} ↑ v{update.latest.version}
+              </button>
+            )}
+          </span>
+        </nav>
+        {tab !== 'chats'
+          ? (
+            <div className="tgb-page">
+              <div className="tgb-page-inner">
+                {tab === 'lines' && <actions.Lines t={t} />}
+                {tab === 'members' && <actions.Members t={t} chats={chats} />}
+                {tab === 'settings' && (
+                  <>
+                    <actions.Settings t={t} />
+                    <footer className="tgb-info tgb-info-page">
+                      <span>{t('pluginInfo')}: dsh-switchboard{update === undefined ? '' : ` v${update.installed}`}</span>
+                      {update?.source.kind === 'github' && (
+                        <>· <a href={`https://github.com/${update.source.owner}/${update.source.repo}`} target="_blank" rel="noreferrer">GitHub</a></>
+                      )}
+                      · <button type="button" onClick={actions.openSettings}>{t('pluginPage')}</button>
+                    </footer>
+                  </>
+                )}
+              </div>
+            </div>
+          )
+          : (
         <div className="tgb-root" data-view={current === undefined ? 'list' : 'thread'}>
           <aside className="tgb-list">
             <div className="tgb-list-head">
-              <div className="tgb-title-row">
-                <h1 className="tgb-title">{t('panel')}</h1>
-                <div className="tgb-head-actions">
-                  {update?.newer === true && update.latest !== undefined && (
-                    <button type="button" className="tgb-new-badge" title={`${t('newVersion')} v${update.latest.version}`} onClick={actions.openSettings}>
-                      {t('newBadge')} ↑ v{update.latest.version}
-                    </button>
-                  )}
-                  <button type="button" className="tgb-button" title={t('pluginSettings')} aria-label={t('pluginSettings')} onClick={actions.openSettings}>
-                    <GearIcon /> {t('pluginSettings')}
-                  </button>
-                </div>
-              </div>
               <div className="tgb-lines">
                 {lines.length === 0
                   ? <StateBadge state={{ kind: 'stopped' }} t={t} />
@@ -139,7 +193,6 @@ export function createTelegramPanel(actions: PanelActions) {
                     </Fragment>
                   ))}
               </div>
-              <p className="tgb-subtitle">{t('panelSubtitle')}</p>
               {chats !== undefined && chats.length > 0 && (
                 <input className="tgb-search" type="search" placeholder={t('search')} value={query}
                   onChange={(event) => { setQuery(event.target.value) }} />
@@ -167,34 +220,19 @@ export function createTelegramPanel(actions: PanelActions) {
                   </button>
                 ))}
             </div>
-            <footer className="tgb-info">
-              <span>{t('pluginInfo')}: dsh-switchboard{update === undefined ? '' : ` v${update.installed}`}</span>
-              {update?.source.kind === 'github' && (
-                <>· <a href={`https://github.com/${update.source.owner}/${update.source.repo}`} target="_blank" rel="noreferrer">GitHub</a></>
-              )}
-              · <button type="button" onClick={actions.openSettings}>{t('pluginSettings')}</button>
-            </footer>
           </aside>
           <section className="tgb-thread">
             {chats !== undefined && chats.length === 0
-              ? <EmptyState t={t} onSettings={actions.openSettings} />
+              ? <EmptyState t={t} onSettings={() => { setTab('lines') }} />
               : current === undefined
                 ? <Dashboard stats={stats} t={t} />
                 : <Thread key={current.chatId} chat={current} line={lineName(lines, current)} t={t} actions={actions} onBack={() => { setSelected(undefined) }} />}
           </section>
         </div>
+          )}
       </div>
     )
   }
-}
-
-function GearIcon(): ReactNode {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-    </svg>
-  )
 }
 
 function StateBadge({ state, line, t }: { state: BridgeState; line?: LineStatus; t: T }): ReactNode {

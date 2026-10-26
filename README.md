@@ -68,7 +68,7 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 
 ## In the Web UI
 
-- **Switchboard panel** (sidebar): chats of every line with search and per-line status, an overview with a 14-day chart, and full threads with **Open Session**.
+- **Switchboard console** (sidebar), four tabs: **Chats** (every line's chats, an overview with a 14-day chart, full threads with **Open Session**); **Lines** (one-line summaries that open for editing, Feishu added by QR); **Members** (people waiting for approval, allowed with one click and told so, and everyone allowed per line); **Settings** (common options first, the rest under **Advanced**).
 - **Switchboard tab in every Session**: linked chats on any line, bind or follow another chat, send as the bot, and the Session's chat activity.
 - **`/switchboard` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session.
 - **Channel note**: Sessions bound to a chat get a short note asking for phone-friendly replies.

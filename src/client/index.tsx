@@ -34,7 +34,9 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
+import type { ChatSummary } from '../history-types.ts'
 import { LinesEditor, lineOf, registeredRow, rowOf, rowsValid, type LineRow, type LineState, type LineValue } from './LinesEditor.tsx'
+import { MembersView } from './MembersView.tsx'
 import panelCss from './panel.css'
 import { ConsoleIcon, createTelegramPanel } from './TelegramPanel.tsx'
 import { remotes, trackRemotes } from './remotes.ts'
@@ -212,7 +214,8 @@ export function apply(ctx: ClientContext): void {
   }, 'switchboard: dictionaries')
   const form = ctx.configForms.get<BridgeValues>(ENTRY)
   const describe = ctx.configForms.describe()
-  const Page = createPage(form, describe, ctx)
+  const Page = createSettings(form, describe, ctx)
+  const Members = createMembers(form)
   ctx.effect(() => ctx.configForms.whileServed([ENTRY], () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
     name: 'plugins.bundle.config', key: PACKAGE, locale: NS,
   }, Page))), 'switchboard: page')
@@ -240,6 +243,9 @@ export function apply(ctx: ClientContext): void {
       navigation?.openBundle(PACKAGE)
     },
     useUpdate: () => useUpdateCheck(ctx, PACKAGE),
+    Lines: ({ t }) => <Page t={t} view="page" section="lines" />,
+    Settings: ({ t }) => <Page t={t} view="page" section="settings" />,
+    Members,
   })
   // The panel and the Session tab appear only while the Host serves the
   // bridge, and each follows its own switch on the settings page.
@@ -375,15 +381,59 @@ function userHas(user: unknown, field: string): boolean {
   return user !== null && typeof user === 'object' && Object.hasOwn(user, field)
 }
 
+/** What one settings view shows: everything (the Plugins page), or one console tab. */
+type SettingsSection = 'all' | 'lines' | 'settings'
+
 /**
- * Build the page component over one entry's shared form.
+ * The Members tab over the shared form: allowing a stranger or removing a
+ * member writes the line's allow-list at once.
+ * @param form - the bridge entry's configuration form.
+ */
+export function createMembers(form: ConfigForm<BridgeValues>) {
+  return function Members({ t, chats }: { t: (key: TelegramBridgeLocaleKey) => string; chats: readonly ChatSummary[] | undefined }) {
+    const snapshot = useSyncExternalStore(form.subscribe.bind(form), form.getSnapshot.bind(form))
+    const [busy, setBusy] = useState(false)
+    const lines = storedLines(snapshot.value ?? {})
+    const write = (next: LineValue[]): Promise<boolean> => {
+      setBusy(true)
+      return form.mutate([{ op: 'set', path: ['lines'], value: next as unknown as PathValue }], snapshot.revision)
+        .catch(() => false).finally(() => { setBusy(false) })
+    }
+    return (
+      <MembersView t={t} lines={lines} chats={chats} busy={busy || !snapshot.writable}
+        onAllow={(chat) => {
+          const lineId = chat.line ?? 'telegram'
+          const id = String(chat.sender?.id ?? '')
+          if (id === '') return
+          void write(lines.map(line => line.id === lineId && !line.allowedUsers.includes(id) ? { ...line, allowedUsers: [...line.allowedUsers, id] } : line))
+            .then((accepted) => {
+              // Tell the person they can start; a failure here only costs the greeting.
+              if (accepted) {
+                void fetch('api/switchboard/send', {
+                  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chatId: chat.chatId, text: t('membersWelcome') }),
+                }).catch(() => {})
+              }
+            })
+        }}
+        onRemove={(lineId, userId) => {
+          void write(lines.map(line => line.id === lineId ? { ...line, allowedUsers: line.allowedUsers.filter(id => id !== userId) } : line))
+        }} />
+    )
+  }
+}
+
+/**
+ * Build the settings component over one entry's shared form.
  * @param form - the bridge entry's configuration form.
  * @param describe - the settings mirror, read for the token's configured state.
- * @returns the slot component.
+ * @returns the slot component; `section` narrows it to one console tab.
  */
-function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFace, ctx: ClientContext) {
-  return function TelegramBridgePage(props: { t: (key: TelegramBridgeLocaleKey) => string; view: 'summary' | 'page' }) {
+export function createSettings(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFace, ctx: ClientContext) {
+  return function SwitchboardSettings(props: { t: (key: TelegramBridgeLocaleKey) => string; view: 'summary' | 'page'; section?: SettingsSection }) {
     const { t } = props
+    const section = props.section ?? 'all'
+    const withLines = props.view === 'page' && section !== 'settings'
+    const withSettings = props.view === 'page' && section !== 'lines'
     const snapshot = useSyncExternalStore(form.subscribe.bind(form), form.getSnapshot.bind(form))
     const literalToken = useSyncExternalStore(describe.subscribe.bind(describe), () => tokenConfigured(describe))
     const [lineRows, setLineRows] = useState<LineRow[] | undefined>(undefined)
@@ -392,20 +442,20 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     const [storedRefs, setStoredRefs] = useState<Record<string, boolean>>({})
     const [credentialTick, setCredentialTick] = useState(0)
     useEffect(() => {
-      if (props.view !== 'page' || refs.length === 0) return
+      if (!withLines || refs.length === 0) return
       let live = true
       void remotes.credentials?.describe(refs).then((answer) => {
         if (live && answer.ok) setStoredRefs(Object.fromEntries(refs.map(ref => [ref, answer.value[ref]?.configured ?? false])))
       }, () => {})
       return () => { live = false }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [props.view, refs.join('\n'), credentialTick])
+    }, [withLines, refs.join('\n'), credentialTick])
     const configured = Object.fromEntries(rows.map(row => [row.value.id,
       storedRefs[row.value.secretRef.trim()] === true || (row.value.id === 'telegram' && literalToken)]))
     const [lineStates, setLineStates] = useState<Record<string, LineState>>({})
     const [lineQueued, setLineQueued] = useState<Record<string, number>>({})
     useEffect(() => {
-      if (props.view !== 'page') return
+      if (!withLines) return
       let live = true
       const poll = (): void => {
         void fetch('api/switchboard/overview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -419,20 +469,20 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
       poll()
       const timer = setInterval(poll, 5000)
       return () => { live = false; clearInterval(timer) }
-    }, [props.view])
+    }, [withLines])
     const [drafts, setDrafts] = useState<Partial<Record<TextField | ToggleField, Draft>>>({})
     const [saving, setSaving] = useState(false)
     const [failed, setFailed] = useState(false)
     const [modelDraft, setModelDraft] = useState<ModelDraft | undefined>(undefined)
     const [catalog, setCatalog] = useState<Catalog | undefined>(undefined)
     useEffect(() => {
-      if (props.view !== 'page') return
+      if (!withSettings) return
       let live = true
       void fetch('api/switchboard/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
         .then(async response => response.ok ? await response.json() as Catalog : undefined)
         .then((value) => { if (live && value?.groups !== undefined) setCatalog(value) }, () => {})
       return () => { live = false }
-    }, [props.view])
+    }, [withSettings])
 
     if (props.view === 'summary') return <>{t('summary')}</>
 
@@ -538,7 +588,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
       />
     )
     const toggle = (field: ToggleField) => (
-      <div style={styles.feature}>
+      <div style={styles.feature} key={field}>
         <label style={styles.toggle}>
           <span>{t(field)}</span>
           <Switch checked={toggleOn(field)} label={t(field)} disabled={disabled}
@@ -548,45 +598,39 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
       </div>
     )
 
-    return (
+    const linesEditor = (
+      <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} queued={lineQueued} disabled={disabled}
+        onChange={(next) => { setFailed(false); setLineRows(next) }}
+        onRegistered={(index, result) => {
+          // The Host already stored the secret; save the line right away so it connects.
+          const next = rows.map((row, i) => i === index ? registeredRow(row, result) : row)
+          setLineRows(next)
+          if (!rowsValid(next)) return
+          setSaving(true)
+          void form.mutate([{ op: 'set', path: ['lines'], value: next.map(lineOf) as unknown as PathValue }], snapshot.revision)
+            .then((accepted) => {
+              setCredentialTick(n => n + 1)
+              if (accepted) setLineRows(undefined)
+              setFailed(!accepted)
+            }, () => { setFailed(true) })
+            .finally(() => { setSaving(false) })
+        }} />
+    )
+    const general = (
       <>
-      <VersionSection ctx={ctx} name={PACKAGE} t={t} />
-      <SettingsForm
-        labels={{ unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') }}
-        state={{ available: snapshot.status !== 'unavailable', writable: snapshot.writable, dirty, invalid, saving, failed }}
-        onSave={save}
-        onDiscard={() => { setDrafts({}); setLineRows(undefined); setModelDraft(undefined) }}
-      >
         <h3 style={styles.firstSection}>{t('groupGeneral')}</h3>
         {toggle('enabled')}
         {toggle('englishReplies')}
-
-        <h3 style={styles.section}>{t('groupLines')}</h3>
-        <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} queued={lineQueued} disabled={disabled}
-          onChange={(next) => { setFailed(false); setLineRows(next) }}
-          onRegistered={(index, result) => {
-            // The Host already stored the secret; save the line right away so it connects.
-            const next = rows.map((row, i) => i === index ? registeredRow(row, result) : row)
-            setLineRows(next)
-            if (!rowsValid(next)) return
-            setSaving(true)
-            void form.mutate([{ op: 'set', path: ['lines'], value: next.map(lineOf) as unknown as PathValue }], snapshot.revision)
-              .then((accepted) => {
-                setCredentialTick(n => n + 1)
-                if (accepted) setLineRows(undefined)
-                setFailed(!accepted)
-              }, () => { setFailed(true) })
-              .finally(() => { setSaving(false) })
-          }} />
-
+      </>
+    )
+    const settingsGroups = (
+      <>
         <h3 style={styles.section}>{t('groupSession')}</h3>
         {valueField('workspacePath', 'workspace', { placeholder: '/Users/me/projects/app' })}
         <ModelPicker t={t} catalog={catalog} value={shownModel} disabled={disabled}
           onChange={(next) => { setFailed(false); setModelDraft(next) }} />
-        {valueField('agentPreset', 'agent-preset')}
         {valueField('permissionPreset', 'permission-preset')}
-        {toggle('channelPrompt')}
-        {valueField('channelPromptText', 'channel-prompt')}
+        {valueField('agentPreset', 'agent-preset')}
 
         <h3 style={styles.section}>{t('groupMessages')}</h3>
         {toggle('streamReplies')}
@@ -595,7 +639,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
           value={textState('turnSummary').text}
           options={[['off', t('turnSummaryOff')], ['long', t('turnSummaryLong')], ['always', t('turnSummaryAlways')]]}
           onChange={(value) => { stage('turnSummary', { kind: 'text', text: value }) }} />
-        {valueField('turnSummaryMinSec', 'summary-min', { numeric: true })}
+        {textState('turnSummary').text === 'long' && valueField('turnSummaryMinSec', 'summary-min', { numeric: true })}
         {valueField('scheduleChats', 'schedule-chats', { placeholder: '123456789' })}
         {valueField('alertChats', 'alert-chats', { placeholder: '123456789, feishu:oc_xxx' })}
         {valueField('alertAfterMin', 'alert-after', { numeric: true })}
@@ -603,20 +647,48 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         <h3 style={styles.section}>{t('groupApproval')}</h3>
         {toggle('approvalViaTelegram')}
         {toggle('questionsViaTelegram')}
-        {valueField('approvalTimeoutSec', 'approval-timeout', { numeric: true })}
+        {(toggleOn('approvalViaTelegram') || toggleOn('questionsViaTelegram')) && valueField('approvalTimeoutSec', 'approval-timeout', { numeric: true })}
 
-        <h3 style={styles.section}>{t('groupMedia')}</h3>
-        {toggle('sendDeliverables')}
-        {valueField('maxDownloadMb', 'max-download', { numeric: true })}
-        {toggle('transcribeVoice')}
-        {valueField('ffmpegPath', 'ffmpeg', { placeholder: 'ffmpeg' })}
-
-        <h3 style={styles.section}>{t('groupInterface')}</h3>
-        {toggle('showPanel')}
-        {toggle('showSessionTab')}
-        {valueField('historyLimit', 'history-limit', { numeric: true })}
-      </SettingsForm>
+        <details className="tgb-more tgb-advanced">
+          <summary>{t('groupAdvanced')}</summary>
+          <div className="tgb-more-body">
+            {toggle('channelPrompt')}
+            {toggleOn('channelPrompt') && valueField('channelPromptText', 'channel-prompt')}
+            {toggle('sendDeliverables')}
+            {valueField('maxDownloadMb', 'max-download', { numeric: true })}
+            {toggle('transcribeVoice')}
+            {toggleOn('transcribeVoice') && valueField('ffmpegPath', 'ffmpeg', { placeholder: 'ffmpeg' })}
+            {toggle('showPanel')}
+            {toggle('showSessionTab')}
+            {valueField('historyLimit', 'history-limit', { numeric: true })}
+          </div>
+        </details>
       </>
+    )
+
+    return (
+      <div className="tgb-settings" data-section={section}>
+        {section === 'all' && <VersionSection ctx={ctx} name={PACKAGE} t={t} />}
+        <SettingsForm
+          labels={{ unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') }}
+          state={{ available: snapshot.status !== 'unavailable', writable: snapshot.writable, dirty, invalid, saving, failed }}
+          onSave={save}
+          onDiscard={() => { setDrafts({}); setLineRows(undefined); setModelDraft(undefined) }}
+        >
+          {section === 'lines' ? linesEditor : (
+            <>
+              {general}
+              {section === 'all' && (
+                <>
+                  <h3 style={styles.section}>{t('groupLines')}</h3>
+                  {linesEditor}
+                </>
+              )}
+              {settingsGroups}
+            </>
+          )}
+        </SettingsForm>
+      </div>
     )
   }
 }

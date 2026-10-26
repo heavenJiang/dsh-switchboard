@@ -423,6 +423,12 @@ export class Switchboard {
     }))
   }
 
+  /** Whether a user id may use a line now (the access lists change without a restart). */
+  isAllowedUser(lineId: string, userId: string | number): boolean {
+    const line = this.settings().lines.find(candidate => candidate.id === lineId)
+    return line !== undefined && isAllowed(line.allowedUsers, userId)
+  }
+
   private get t(): Messages {
     return MESSAGES[this.settings().language]
   }

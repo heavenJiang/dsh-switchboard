@@ -56,8 +56,10 @@ export interface ChatSummary {
   lastAt: number
   lastText: string
   count: number
-  /** True while every message so far came from users outside the allow-list. */
+  /** True while every message so far came from users outside the allow-list (cleared by the overview once the sender is allowed). */
   deniedOnly: boolean
+  /** Who sent the latest incoming message. */
+  sender?: ChatSender
   /** The bound Session's model (`provider/model`), when known; added by the overview route, never stored. */
   model?: string
   /** The chat's line and its platform; added by the overview route, never stored. */

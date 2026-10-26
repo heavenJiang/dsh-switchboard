@@ -54,7 +54,10 @@ export function registerHistoryRoutes(
   /** The chat's line, platform, and bound Session's model, which the index does not store. */
   const describeChat = (chat: ChatSummary): ChatSummary => {
     const model = chat.sessionId === undefined ? undefined : bridge.modelOf(chat.sessionId)
-    return { ...chat, ...lineOf(chat.chatId), ...(model === undefined ? {} : { model: modelLabel(model) }) }
+    const line = lineOf(chat.chatId)
+    // A stranger allowed since their last message is no longer one.
+    const allowedNow = chat.deniedOnly && chat.sender !== undefined && bridge.isAllowedUser(line.line, chat.sender.id)
+    return { ...chat, ...line, ...(allowedNow ? { deniedOnly: false } : {}), ...(model === undefined ? {} : { model: modelLabel(model) }) }
   }
   const lineOf = (key: string): { line: string; channel?: string } => {
     const { line } = splitChatKey(key)
@@ -101,7 +104,7 @@ export function registerHistoryRoutes(
     fetch: async (request) => {
       const { sessionId } = await body(request)
       if (typeof sessionId !== 'string' || sessionId === '') return json({ error: 'sessionId required' }, 400)
-      const chats = (await log.chats()).filter(chat => !chat.deniedOnly).map(chat => describeChat(chat))
+      const chats = (await log.chats()).map(chat => describeChat(chat)).filter(chat => !chat.deniedOnly)
       const links = bridge.linksOf(sessionId)
       const titled = links.map(link => ({ ...link, title: chats.find(chat => chat.chatId === link.chatId)?.title ?? link.chatId, ...lineOf(link.chatId) }))
       // Chats that were bound to the Session before still hold its history.

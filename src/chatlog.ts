@@ -109,6 +109,8 @@ export class ChatLog {
     if (username !== undefined) summary.username = username
     const sessionId = entry.sessionId ?? previous?.sessionId
     if (sessionId !== undefined) summary.sessionId = sessionId
+    const sender = stored.dir === 'in' ? stored.from : undefined
+    if (sender !== undefined || previous?.sender !== undefined) summary.sender = sender ?? previous!.sender!
     this.summaries.set(chat.chatId, summary)
     await this.enqueue(chat.chatId, async () => {
       await mkdir(this.dir, { recursive: true })
