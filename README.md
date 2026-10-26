@@ -58,6 +58,7 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
 - **Approvals and questions**: **Allow once / Reject** buttons; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
 - **Media**: photos and files are staged through `ctx.fileUploads`; images reach the model as images. Voice notes are transcribed by the Harness speech service via ffmpeg. Files the Agent presents are sent back.
+- **Nothing lost**: replies, turn notices, and presented files that cannot be sent (line down, or a send that certainly failed) wait in an outbox and go out, marked late, once the line is back; sends with an unknown outcome are not repeated. After a plugin restart, the final reply of each turn that ended meanwhile is sent (up to 3 per Session). A line down longer than **Outage alert after** (5 min) is reported to the **Line outage alert chats** through another line.
 - **Groups**: by default only commands, @mentions, and replies to the bot are answered. Authorize users or whole chats per line.
 - **Security**: only a line's allowed users (or members of its allowed chats) can use its bot. Secrets live in the Harness credentials store (`TELEGRAM_BOT_TOKEN`, `FEISHU_APP_SECRET`, or environment variables of those names), never in the profile file or the browser.
 

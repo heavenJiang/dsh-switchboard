@@ -19,6 +19,8 @@ interface LineStatus {
   type: 'telegram' | 'feishu'
   name: string
   state: BridgeState
+  /** Messages waiting for the line to come back. */
+  queued?: number
 }
 
 /** What the page asks of the rest of the Web client. */
@@ -130,7 +132,12 @@ export function createTelegramPanel(actions: PanelActions) {
               <div className="tgb-lines">
                 {lines.length === 0
                   ? <StateBadge state={{ kind: 'stopped' }} t={t} />
-                  : lines.map(line => <StateBadge key={line.id} state={line.state} line={line} t={t} />)}
+                  : lines.map(line => (
+                    <Fragment key={line.id}>
+                      <StateBadge state={line.state} line={line} t={t} />
+                      {(line.queued ?? 0) > 0 && <span className="tgb-tag" data-tone="warn">{t('lineQueued').replace('{n}', String(line.queued))}</span>}
+                    </Fragment>
+                  ))}
               </div>
               <p className="tgb-subtitle">{t('panelSubtitle')}</p>
               {chats !== undefined && chats.length > 0 && (

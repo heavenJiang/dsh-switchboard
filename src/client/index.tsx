@@ -86,6 +86,8 @@ interface BridgeValues {
   turnSummary?: 'off' | 'long' | 'always'
   turnSummaryMinSec?: number
   scheduleChats?: string[]
+  alertChats?: string[]
+  alertAfterMin?: number
   transcribeVoice?: boolean
   ffmpegPath?: string
   showPanel?: boolean
@@ -104,7 +106,7 @@ interface ModelDraft { provider?: string; model?: string; effort?: string }
 
 type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
-  | 'scheduleChats' | 'ffmpegPath'
+  | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
   | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
@@ -123,6 +125,8 @@ const intField = (read: (v: BridgeValues) => number | undefined, min: number, ma
 /** How a text field renders and parses; `undefined` from parse marks the draft invalid. */
 const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; parse: (text: string) => string | string[] | number | undefined }> = {
   scheduleChats: listField(v => v.scheduleChats),
+  alertChats: listField(v => v.alertChats),
+  alertAfterMin: intField(v => v.alertAfterMin, 0, 1440),
   turnSummaryMinSec: intField(v => v.turnSummaryMinSec, 0, 86400),
   turnSummary: { format: v => v.turnSummary ?? 'long', parse: text => ['off', 'long', 'always'].includes(text) ? text : undefined },
   channelPromptText: { format: v => v.channelPromptText ?? '', parse: text => text.trim() },
@@ -399,13 +403,18 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
     const configured = Object.fromEntries(rows.map(row => [row.value.id,
       storedRefs[row.value.secretRef.trim()] === true || (row.value.id === 'telegram' && literalToken)]))
     const [lineStates, setLineStates] = useState<Record<string, LineState>>({})
+    const [lineQueued, setLineQueued] = useState<Record<string, number>>({})
     useEffect(() => {
       if (props.view !== 'page') return
       let live = true
       const poll = (): void => {
         void fetch('api/switchboard/overview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-          .then(async response => response.ok ? await response.json() as { lines?: { id: string; state: LineState }[] } : undefined)
-          .then((value) => { if (live && value?.lines !== undefined) setLineStates(Object.fromEntries(value.lines.map(line => [line.id, line.state]))) }, () => {})
+          .then(async response => response.ok ? await response.json() as { lines?: { id: string; state: LineState; queued?: number }[] } : undefined)
+          .then((value) => {
+            if (!live || value?.lines === undefined) return
+            setLineStates(Object.fromEntries(value.lines.map(line => [line.id, line.state])))
+            setLineQueued(Object.fromEntries(value.lines.map(line => [line.id, line.queued ?? 0])))
+          }, () => {})
       }
       poll()
       const timer = setInterval(poll, 5000)
@@ -553,7 +562,7 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
         {toggle('englishReplies')}
 
         <h3 style={styles.section}>{t('groupLines')}</h3>
-        <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} disabled={disabled}
+        <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} queued={lineQueued} disabled={disabled}
           onChange={(next) => { setFailed(false); setLineRows(next) }} />
 
         <h3 style={styles.section}>{t('groupSession')}</h3>
@@ -574,6 +583,8 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
           onChange={(value) => { stage('turnSummary', { kind: 'text', text: value }) }} />
         {valueField('turnSummaryMinSec', 'summary-min', { numeric: true })}
         {valueField('scheduleChats', 'schedule-chats', { placeholder: '123456789' })}
+        {valueField('alertChats', 'alert-chats', { placeholder: '123456789, feishu:oc_xxx' })}
+        {valueField('alertAfterMin', 'alert-after', { numeric: true })}
 
         <h3 style={styles.section}>{t('groupApproval')}</h3>
         {toggle('approvalViaTelegram')}

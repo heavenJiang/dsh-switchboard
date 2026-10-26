@@ -76,6 +76,11 @@ export class FakeHarness implements HarnessPort {
   changedFiles(): string[] | undefined {
     return ['src/a.ts', 'README.md']
   }
+  /** Committed events eventsSince serves; undefined leaves the method unavailable. */
+  events: { type: string; seq: number; time: number; data?: unknown }[] | undefined
+  async eventsSince(_sessionId: string, afterSeq: number) {
+    return this.events?.filter(event => event.seq > afterSeq)
+  }
   async transcribe(): Promise<string> {
     if (this.transcript instanceof Error) throw this.transcript
     return this.transcript

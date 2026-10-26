@@ -34,6 +34,8 @@ interface BindingsFile {
   pending?: Record<string, PendingChoice>
   /** getUpdates offsets of Telegram lines other than the legacy one. */
   offsets?: Record<string, number>
+  /** Last Session event seq the bridge mirrored, per linked Session, so a restart can catch up. */
+  cursors?: Record<string, number>
 }
 
 /**
@@ -96,6 +98,7 @@ export class BindingStore {
       version: 1, offset: Number(parsed.offset) || 0, chats: parsed.chats,
       ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
       ...(parsed.offsets === undefined ? {} : { offsets: parsed.offsets }),
+      ...(parsed.cursors === undefined ? {} : { cursors: parsed.cursors }),
     }
   }
 
@@ -190,6 +193,18 @@ export class BindingStore {
     if (offset <= this.offset(line)) return this.writing
     if (line === LEGACY_LINE) this.data.offset = offset
     else this.data.offsets = { ...this.data.offsets, [line]: offset }
+    return this.flush()
+  }
+
+  /** Last mirrored event seq of a Session, if it was ever linked. */
+  cursor(sessionId: string): number | undefined {
+    return this.data.cursors?.[sessionId]
+  }
+
+  /** Advance a Session's mirrored seq and persist. */
+  setCursor(sessionId: string, seq: number): Promise<void> {
+    if (seq <= (this.data.cursors?.[sessionId] ?? -1)) return this.writing
+    this.data.cursors = { ...this.data.cursors, [sessionId]: seq }
     return this.flush()
   }
 

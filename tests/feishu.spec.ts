@@ -36,6 +36,11 @@ class FakeFeishu implements FeishuApi {
     return this.handlers !== undefined
   }
 
+  /** Report the connection dropping or coming back. */
+  status(state: 'ready' | 'reconnecting'): void {
+    this.handlers!.status(state)
+  }
+
   deliver(event: FeishuMessageEvent): void {
     this.handlers!.message(event)
   }
@@ -149,7 +154,7 @@ afterEach(async () => {
 describe('Feishu line', () => {
   it('connects and reports the bot name', () => {
     expect(bridge.state).toEqual({ kind: 'running', username: BOT.name })
-    expect(bridge.lineStates()).toEqual([{ id: 'feishu', type: 'feishu', name: '飞书', state: { kind: 'running', username: BOT.name } }])
+    expect(bridge.lineStates()).toEqual([{ id: 'feishu', type: 'feishu', name: '飞书', state: { kind: 'running', username: BOT.name }, queued: 0 }])
   })
 
   it('prompts a Session from a private message and replies with a Markdown card', async () => {

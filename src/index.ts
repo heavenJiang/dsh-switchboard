@@ -49,6 +49,7 @@ import {
   Switchboard, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
 } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
+import { Outbox } from './outbox.ts'
 import { registerWebCommand } from './command.ts'
 import { LEGACY_LINE, LINE_ID, type ChannelType, type LineSettings } from './lines.ts'
 import type { BotLanguage } from './messages.ts'
@@ -163,6 +164,10 @@ export interface Config {
   turnSummaryMinSec: Volatile<number>
   /** Chat ids that receive scheduled-run results. */
   scheduleChats: Volatile<string[]>
+  /** Chat keys told when a line stays down; the schedule chats when empty. */
+  alertChats: Volatile<string[]>
+  /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
+  alertAfterMin: Volatile<number>
   /** Transcribe voice notes when speech recognition is composed. */
   transcribeVoice: Volatile<boolean>
   /** ffmpeg used to turn Telegram's Ogg/Opus voice notes into WAV for recognition. */
@@ -211,6 +216,8 @@ export const Config: Schema<Config> = Schema.object({
   turnSummary: Schema.union(['off', 'long', 'always'] as const).default('long').volatile(),
   turnSummaryMinSec: Schema.natural().max(86400).default(60).volatile(),
   scheduleChats: Schema.array(Schema.string()).default([]).volatile(),
+  alertChats: Schema.array(Schema.string()).default([]).volatile(),
+  alertAfterMin: Schema.natural().max(1440).default(5).volatile(),
   transcribeVoice: Schema.boolean().default(true).volatile(),
   ffmpegPath: Schema.string().default('ffmpeg').volatile(),
   language: Schema.union(['zh', 'en'] as const).default('zh').volatile(),
@@ -395,6 +402,8 @@ export function apply(ctx: Context, config: Config): void {
       turnSummaryMinSec: config.turnSummaryMinSec.get(),
       transcribeVoice: config.transcribeVoice.get(),
       scheduleChats: config.scheduleChats.get(),
+      alertChats: config.alertChats.get(),
+      alertAfterMin: config.alertAfterMin.get(),
       language: config.language.get(),
       maxDownloadMb: config.maxDownloadMb.get(),
       sendDeliverables: config.sendDeliverables.get(),
@@ -569,6 +578,29 @@ export function apply(ctx: Context, config: Config): void {
       const summary = optional.changes?.summary(sessionId as SessionId, seq as never)
       return summary?.files.map(file => file.display)
     },
+    async eventsSince(sessionId, afterSeq) {
+      const signal = AbortSignal.timeout(15_000)
+      const projections = await sessionController.projections({ sessionId: sessionId as SessionId }, signal)
+      if (projections === null || projections.kind !== 'sequenced') return undefined
+      if (projections.asOfSeq <= afterSeq) return []
+      // Read backwards page by page until the cursor, keeping only newer events.
+      const events = new Map<number, { type: string; seq: number; time: number; data?: unknown }>()
+      let before: number | undefined
+      for (let page = 0; page < 8; page++) {
+        const result = await sessionController.page({
+          address: { kind: 'session', sessionId: sessionId as SessionId },
+          throughSeq: projections.asOfSeq,
+          maxMessages: 50,
+          ...(before === undefined ? {} : { beforeSeq: before }),
+        }, signal)
+        const read = result.records.map(record => record.event)
+        for (const event of read) if (event.seq > afterSeq) events.set(event.seq, event)
+        const first = read[0]
+        if (!result.hasMore || first === undefined || first.seq <= afterSeq || first.seq === before) break
+        before = first.seq
+      }
+      return [...events.values()].sort((a, b) => a.seq - b.seq)
+    },
     async transcribe(audio, signal) {
       const speech = optional.speech
       if (speech === undefined) throw new Error('speech recognition is not installed (voice input plugin)')
@@ -581,7 +613,8 @@ export function apply(ctx: Context, config: Config): void {
   const stateFile = config.stateFile ?? defaultStateFile()
   const store = new BindingStore(stateFile)
   const chatLog = new ChatLog(join(dirname(stateFile), 'chats'), () => config.historyLimit.get())
-  const bridge = new Switchboard(settings, harness, store, logger, {}, chatLog)
+  const outbox = new Outbox(join(dirname(stateFile), 'outbox.json'))
+  const bridge = new Switchboard(settings, harness, store, logger, {}, chatLog, outbox)
   const updates = new UpdateChecker()
 
   const restart = (): void => {
@@ -687,8 +720,10 @@ export function apply(ctx: Context, config: Config): void {
     const migrated = config.stateFile === undefined ? migrateLegacyStateDir() : Promise.resolve(false)
     const started = migrated.then((moved) => {
       if (moved) logger.info('switchboard: moved data from the telegram-bridge directory')
-      return store.load()
+      return Promise.all([store.load(), outbox.load()])
     }).then(() => refreshToken()).then(() => bridge.reconcile()).then(async () => {
+      // Replies that finished while the plugin was not running go out now (or once their line connects).
+      await bridge.catchUp().catch((error: unknown) => { logger.warn(`switchboard: catch-up failed: ${String(error)}`) })
       // Sessions linked before workspaces were attached join theirs now.
       await bridge.attachLinkedSessions()
     }).catch((error: unknown) => {

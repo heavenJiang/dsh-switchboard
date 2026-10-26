@@ -20,13 +20,16 @@ import type { BindingStore, PendingChoice } from './bindings.ts'
 import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
 import { createFeishuApi } from './channels/feishu-api.ts'
 import { TelegramChannel } from './channels/telegram.ts'
-import type {
-  Button, Channel, ChannelChat, ChannelSink, ChannelUser, InboundAction, InboundAttachment, InboundMessage, LineState,
+import {
+  undelivered,
+  type Button, type Channel, type ChannelChat, type ChannelSink, type ChannelUser, type InboundAction, type InboundAttachment,
+  type InboundMessage, type LineState,
 } from './channels/types.ts'
 import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
 import { chatKey, splitChatKey, type LineSettings } from './lines.ts'
 import { outgoingKind, promptImageType, sniffImageType } from './media.ts'
 import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
+import type { Outbox, OutboxPayload } from './outbox.ts'
 import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
 
 export type { LineState } from './channels/types.ts'
@@ -62,6 +65,10 @@ export interface BridgeSettings {
   readonly maxDownloadMb: number
   /** Send files the Agent presents back to the chat. */
   readonly sendDeliverables: boolean
+  /** Chat keys told when a line stays down; the schedule chats when empty. */
+  readonly alertChats?: readonly string[]
+  /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
+  readonly alertAfterMin?: number
   /** Model for Sessions the bot creates; the Web default when undefined. */
   readonly model?: ModelChoice
 }
@@ -188,6 +195,19 @@ export interface HarnessPort {
    * @throws with a short reason when transcription is unavailable.
    */
   transcribe(audio: Uint8Array, signal: AbortSignal): Promise<string>
+  /**
+   * Committed events of a Session after a seq, oldest first, read without
+   * loading the Session; undefined when its log cannot be read.
+   */
+  eventsSince?(sessionId: string, afterSeq: number): Promise<readonly SessionLogEvent[] | undefined>
+}
+
+/** One committed Session event as the log stores it. */
+export interface SessionLogEvent {
+  readonly type: string
+  readonly seq: number
+  readonly time: number
+  readonly data?: unknown
 }
 
 /** Minimal logger face. */
@@ -295,6 +315,10 @@ interface LiveLine {
   state: LineState
   /** Whether the line's menu already lists Harness commands (filled once a Session can list them). */
   menuHasHarness: boolean
+  /** Since when the line has not been running; undefined while it runs. */
+  downSince: number | undefined
+  /** Whether the alert chats were told that it is down. */
+  alerted: boolean
 }
 
 /** Observable connection state for `/status` and logs. */
@@ -332,6 +356,10 @@ const PICKER_TTL_MS = 10 * 60 * 1000
 const DENIED_REPLY_INTERVAL_MS = 60 * 60 * 1000
 const DIRECTORY_LIST_LIMIT = 50
 const EXCERPT_LENGTH = 400
+/** How often queued messages are retried and line outages checked. */
+const OUTBOX_INTERVAL_MS = 30_000
+/** Turns sent after a restart, newest last; older ones stay in the Web UI. */
+const CATCH_UP_TURNS = 3
 
 /** The bridge core. One instance lives for the plugin's lifetime; lines restart when their settings change. */
 export class Switchboard {
@@ -350,6 +378,9 @@ export class Switchboard {
   private readonly listings = new Map<string, string[]>()
   private readonly deniedReplies = new Map<string, number>()
   private readonly lifetime = new AbortController()
+  /** Outbox items being sent now. */
+  private readonly sending = new Set<string>()
+  private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(
     private readonly settings: () => BridgeSettings,
@@ -358,7 +389,18 @@ export class Switchboard {
     private readonly logger: BridgeLogger,
     private readonly channelOptions: ChannelOptions = {},
     private readonly chatLog?: ChatLog,
+    private readonly outbox?: Outbox,
   ) {}
+
+  /** Messages waiting for each line, by line id. */
+  queuedByLine(): Map<string, number> {
+    const counts = new Map<string, number>()
+    for (const [chat, count] of this.outbox?.counts() ?? []) {
+      const line = splitChatKey(chat).line
+      counts.set(line, (counts.get(line) ?? 0) + count)
+    }
+    return counts
+  }
 
   /** State of the first line, for callers that know only one. */
   get state(): BridgeState {
@@ -372,10 +414,12 @@ export class Switchboard {
   }
 
   /** Every configured line with its connection state. */
-  lineStates(): { id: string; type: LineSettings['type']; name: string; state: LineState }[] {
+  lineStates(): { id: string; type: LineSettings['type']; name: string; state: LineState; queued: number }[] {
+    const queued = this.queuedByLine()
     return this.settings().lines.map(line => ({
       id: line.id, type: line.type, name: line.name,
       state: this.live.get(line.id)?.state ?? { kind: 'stopped' },
+      queued: queued.get(line.id) ?? 0,
     }))
   }
 
@@ -407,6 +451,10 @@ export class Switchboard {
     for (const [id, line] of wanted) {
       if (!this.live.has(id)) this.startLine(line)
     }
+    this.timer ??= setInterval(() => {
+      this.checkOutages()
+      void this.flushOutbox()
+    }, OUTBOX_INTERVAL_MS)
   }
 
   private startLine(line: LineSettings): void {
@@ -426,14 +474,25 @@ export class Switchboard {
         ...(this.channelOptions.fetch === undefined ? {} : { fetch: this.channelOptions.fetch }),
       })
     const controller = new AbortController()
-    const entry: LiveLine = { line, channel, controller, done: Promise.resolve(), key: lineKey(line), state: { kind: 'connecting' }, menuHasHarness: false }
+    const entry: LiveLine = {
+      line, channel, controller, done: Promise.resolve(), key: lineKey(line), state: { kind: 'connecting' },
+      menuHasHarness: false, downSince: Date.now(), alerted: false,
+    }
     const sink: ChannelSink = {
       state: (state) => {
         const connected = state.kind === 'running' && entry.state.kind !== 'running'
+        if (state.kind !== 'running' && entry.downSince === undefined) entry.downSince = Date.now()
         entry.state = state
         if (connected) {
           logger.info(`connected as ${line.type === 'telegram' ? '@' : ''}${state.username}`)
           void this.registerCommands(entry)
+          entry.downSince = undefined
+          if (entry.alerted) {
+            entry.alerted = false
+            const queued = this.queuedByLine().get(line.id) ?? 0
+            for (const key of this.alertChats(line.id)) void this.reply(key, this.t.lineBack(this.settingsOf(entry).name, queued))
+          }
+          void this.flushOutbox()
         }
       },
       message: message => this.handleMessage(entry, message),
@@ -470,7 +529,132 @@ export class Switchboard {
   /** Stop for good: also abort in-flight transcriptions. */
   async dispose(): Promise<void> {
     this.lifetime.abort()
+    clearInterval(this.timer)
+    this.timer = undefined
     await this.stop()
+    await this.outbox?.settled()
+  }
+
+  // ─── delivery that survives outages ─────────────────────────────────────
+
+  /**
+   * Send a message that must reach its chat: a reply, a turn notice, or a
+   * presented file. While the chat's line is down, or when a send certainly
+   * failed, it waits in the outbox and goes out once the line is back.
+   * @param replaceId - a draft message the first piece replaces.
+   */
+  private durable(key: string, payload: OutboxPayload, sessionId?: string, replaceId?: string): Promise<void> {
+    const line = this.live.get(splitChatKey(key).line)
+    if (line?.state.kind !== 'running' && this.outbox !== undefined && this.lineConfigured(key)) {
+      return this.outbox.add(key, payload, sessionId === undefined ? {} : { sessionId })
+    }
+    return this.enqueue(key, (channel, chat) => this.sendPayload(channel, chat, key, payload, sessionId, replaceId), (error) => {
+      if (this.outbox !== undefined && undelivered(error)) void this.outbox.add(key, payload, { attempts: 1, ...(sessionId === undefined ? {} : { sessionId }) })
+    })
+  }
+
+  /** Whether a chat belongs to a configured, enabled line (a removed line's chats are not queued for). */
+  private lineConfigured(key: string): boolean {
+    const s = this.settings()
+    return s.enabled && s.lines.some(line => line.id === splitChatKey(key).line && line.enabled)
+  }
+
+  private async sendPayload(
+    channel: Channel, chat: string, key: string, payload: OutboxPayload, sessionId?: string, replaceId?: string, note?: string,
+  ): Promise<void> {
+    if (payload.kind === 'file') return this.sendLocalFileNow(channel, chat, key, payload.path, payload.description, note)
+    const text = note === undefined ? payload.text : `${note}\n\n${payload.text}`
+    if (payload.kind === 'markdown') {
+      await channel.sendMarkdown(chat, text, replaceId)
+      this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text: payload.text }, sessionId)
+      return
+    }
+    for (const chunk of chunkText(text)) await channel.send(chat, { text: chunk })
+    this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: payload.text }, sessionId)
+  }
+
+  /** Send queued messages whose line is connected, oldest first, each in order with its chat. */
+  async flushOutbox(): Promise<void> {
+    const outbox = this.outbox
+    if (outbox === undefined) return
+    const due = outbox.due(key => this.live.get(splitChatKey(key).line)?.state.kind === 'running')
+    await Promise.all(due.filter(item => !this.sending.has(item.id)).map((item) => {
+      this.sending.add(item.id)
+      let sent = false
+      return this.enqueue(item.chat, async (channel, chat) => {
+        await this.sendPayload(channel, chat, item.chat, item.payload, item.sessionId, undefined, this.t.late(clock(item.at)))
+        sent = true
+      }, (error) => { void outbox.failed(item.id, undelivered(error)) }).then(async () => {
+        if (sent) await outbox.remove(item.id)
+      }).finally(() => { this.sending.delete(item.id) })
+    }))
+  }
+
+  /** Chats told about a line's outage: on other connected lines only. */
+  private alertChats(lineId: string): string[] {
+    const s = this.settings()
+    const chats = (s.alertChats ?? []).length > 0 ? s.alertChats ?? [] : s.scheduleChats
+    return chats.map(chat => chat.trim()).filter(chat => chat !== '' && splitChatKey(chat).line !== lineId)
+  }
+
+  /** Tell the alert chats once about each line down longer than the threshold. */
+  checkOutages(now: number = Date.now()): void {
+    const minutes = this.settings().alertAfterMin ?? 5
+    if (minutes <= 0) return
+    for (const entry of this.live.values()) {
+      if (entry.downSince === undefined || entry.alerted || now - entry.downSince < minutes * 60_000) continue
+      const chats = this.alertChats(entry.line.id)
+      if (chats.length === 0) continue
+      entry.alerted = true
+      const reason = entry.state.kind === 'error' ? entry.state.message : entry.state.kind
+      const down = Math.round((now - entry.downSince) / 60_000)
+      for (const key of chats) void this.reply(key, this.t.lineDown(this.settingsOf(entry).name, down, reason))
+    }
+  }
+
+  /**
+   * Send what linked Sessions said while the plugin was not running: the
+   * final reply (or failure) of each turn that ended after the last mirrored
+   * event, at most {@link CATCH_UP_TURNS} per Session. Runs once at startup.
+   */
+  async catchUp(): Promise<void> {
+    const read = this.harness.eventsSince?.bind(this.harness)
+    if (read === undefined) return
+    for (const sessionId of this.store.linkedSessions()) {
+      const cursor = this.store.cursor(sessionId)
+      if (cursor === undefined) continue
+      const events = await read(sessionId, cursor).catch(() => undefined)
+      if (events === undefined || events.length === 0) continue
+      const ended: { text: string; kind: string; error?: string; at: number }[] = []
+      let text = ''
+      for (const event of events) {
+        if (event.type === 'assistant/message') {
+          const next = assistantText(event.data)
+          if (next !== '') text = next
+        } else if (event.type === 'turn/end') {
+          const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } } | undefined)?.reason
+          ended.push({ text, kind: reason?.kind ?? 'completed', at: event.time, ...(reason?.error?.message === undefined ? {} : { error: reason.error.message }) })
+          text = ''
+        } else if (event.type === 'turn/start') {
+          text = ''
+        }
+      }
+      const t = this.t
+      const chats = this.store.chatsFor(sessionId)
+      const watchers = this.store.watchersOf(sessionId)
+      for (const turn of ended.slice(-CATCH_UP_TURNS)) {
+        const time = clock(turn.at)
+        if (turn.kind === 'completed' && turn.text !== '') {
+          for (const key of chats) void this.durable(key, { kind: 'markdown', text: `${t.caughtUp(time)}\n\n${turn.text}` }, sessionId)
+          const excerpt = `${t.caughtUp(time)}\n${shortId(sessionId)}: ${truncate(turn.text, EXCERPT_LENGTH)}`
+          for (const key of watchers) void this.durable(key, { kind: 'text', text: excerpt }, sessionId)
+        } else if (turn.kind !== 'completed' && turn.kind !== 'aborted') {
+          const message = t.caughtUpFailed(time, turn.error ?? turn.kind)
+          for (const key of [...chats, ...watchers]) void this.durable(key, { kind: 'text', text: message }, sessionId)
+        }
+      }
+      await this.store.setCursor(sessionId, events.at(-1)!.seq)
+    }
   }
 
   /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
@@ -1002,6 +1186,11 @@ export class Switchboard {
    */
   onSessionEvent(sessionId: string, event: { type: string; data?: unknown; seq?: number; time?: number }, cwd?: string): void {
     if (this.live.size === 0) return
+    // A restart catches up from the last reply or turn end seen here.
+    if ((event.type === 'assistant/message' || event.type === 'turn/end') && event.seq !== undefined
+      && (this.store.chatsFor(sessionId).length > 0 || this.store.watchersOf(sessionId).length > 0)) {
+      void this.store.setCursor(sessionId, event.seq)
+    }
     if (event.type === 'turn/start') {
       this.turns.set(sessionId, { startedAt: event.time ?? Date.now(), tools: 0, scheduled: false })
       return
@@ -1037,7 +1226,7 @@ export class Switchboard {
       const files = (event.data as { files?: readonly { path: string; description?: string }[] }).files ?? []
       for (const file of files) {
         const path = isAbsolute(file.path) || cwd === undefined ? file.path : resolve(cwd, file.path)
-        for (const key of chats) void this.sendLocalFile(key, path, file.description)
+        for (const key of chats) void this.durable(key, { kind: 'file', path, ...(file.description === undefined ? {} : { description: file.description }) }, sessionId)
       }
     } else if (event.type === 'turn/end') {
       this.flushTools(sessionId)
@@ -1057,9 +1246,9 @@ export class Switchboard {
     const title = shortId(sessionId)
     if (kind !== 'completed') {
       const message = t.turnEnded(kind, error)
-      for (const key of chats) void this.reply(key, message)
+      for (const key of chats) void this.durable(key, { kind: 'text', text: message }, sessionId)
       const watchMessage = kind === 'aborted' ? t.watchAborted(title) : t.watchFailed(title, error ?? kind)
-      for (const key of watchers) void this.reply(key, watchMessage)
+      for (const key of watchers) void this.durable(key, { kind: 'text', text: watchMessage }, sessionId)
       return
     }
     if (turn === undefined) return
@@ -1067,11 +1256,11 @@ export class Switchboard {
     const s = this.settings()
     const summary = { seconds, tools: turn.tools, files: turn.files ?? [] }
     const wanted = s.turnSummary === 'always' || (s.turnSummary === 'long' && seconds >= s.turnSummaryMinSec)
-    if (wanted) for (const key of chats) void this.reply(key, t.turnDone(summary))
+    if (wanted) for (const key of chats) void this.durable(key, { kind: 'text', text: t.turnDone(summary) }, sessionId)
     if (watchers.length > 0) {
       const excerpt = turn.lastText === undefined ? undefined : truncate(turn.lastText, EXCERPT_LENGTH)
       const message = t.turnDone({ ...summary, title, ...(excerpt === undefined ? {} : { excerpt }) })
-      for (const key of watchers) void this.reply(key, message)
+      for (const key of watchers) void this.durable(key, { kind: 'text', text: message }, sessionId)
     }
   }
 
@@ -1185,11 +1374,7 @@ export class Switchboard {
       clearTimeout(draft.timer)
       await draft.pending
     }
-    for (const key of chats) {
-      void this.deliverMarkdown(key, text, draft?.messages.get(key)).then(() => {
-        this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text }, sessionId)
-      })
-    }
+    for (const key of chats) void this.durable(key, { kind: 'markdown', text }, sessionId, draft?.messages.get(key))
   }
 
   /**
@@ -1235,24 +1420,27 @@ export class Switchboard {
 
   /** Send one local file to a chat, in order with its text messages. */
   private sendLocalFile(key: string, path: string, description?: string): Promise<void> {
-    return this.enqueue(key, async (channel, chat) => {
-      const info = await stat(path)
-      if (!info.isFile()) throw new Error(`${path} is not a file`)
-      if (info.size > channel.sendLimitBytes) {
-        const notice = this.t.deliverableTooLarge(path)
-        await channel.send(chat, { text: notice })
-        this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: notice })
-        return
-      }
-      const data = new Uint8Array(await readFile(path))
-      const caption = description === undefined ? basename(path) : `${basename(path)}\n${description}`.slice(0, 1024)
-      const photo = outgoingKind(path, info.size) === 'photo'
-      await channel.sendFile(chat, { data, name: basename(path), photo }, caption)
-      const attachment = await this.viewerAttachment(key, basename(path), data, photo ? sniffImageType(data) : undefined)
-      this.log({ chatId: key }, {
-        dir: 'out', kind: 'file', attachments: [{ ...attachment, path }],
-        ...(description === undefined ? {} : { text: description }),
-      })
+    return this.enqueue(key, (channel, chat) => this.sendLocalFileNow(channel, chat, key, path, description))
+  }
+
+  private async sendLocalFileNow(channel: Channel, chat: string, key: string, path: string, description?: string, note?: string): Promise<void> {
+    const info = await stat(path)
+    if (!info.isFile()) throw new Error(`${path} is not a file`)
+    if (info.size > channel.sendLimitBytes) {
+      const notice = this.t.deliverableTooLarge(path)
+      await channel.send(chat, { text: notice })
+      this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: notice })
+      return
+    }
+    const data = new Uint8Array(await readFile(path))
+    const label = description === undefined ? basename(path) : `${basename(path)}\n${description}`
+    const caption = (note === undefined ? label : `${note}\n${label}`).slice(0, 1024)
+    const photo = outgoingKind(path, info.size) === 'photo'
+    await channel.sendFile(chat, { data, name: basename(path), photo }, caption)
+    const attachment = await this.viewerAttachment(key, basename(path), data, photo ? sniffImageType(data) : undefined)
+    this.log({ chatId: key }, {
+      dir: 'out', kind: 'file', attachments: [{ ...attachment, path }],
+      ...(description === undefined ? {} : { text: description }),
     })
   }
 
@@ -1269,14 +1457,18 @@ export class Switchboard {
     return this.live.get(splitChatKey(key).line)?.channel
   }
 
-  /** Run one send operation after the chat's earlier ones, containing its failure. */
-  private enqueue(key: string, send: (channel: Channel, chat: string) => Promise<void>): Promise<void> {
+  /**
+   * Run one send operation after the chat's earlier ones, containing its failure.
+   * @param failed - told about a failure after it is logged.
+   */
+  private enqueue(key: string, send: (channel: Channel, chat: string) => Promise<void>, failed?: (error: unknown) => void): Promise<void> {
     const channel = this.channelOf(key)
     if (channel === undefined) return Promise.resolve()
     const { chat } = splitChatKey(key)
     const previous = this.sendTails.get(key) ?? Promise.resolve()
     const next = previous.then(() => send(channel, chat)).catch((error: unknown) => {
       this.logger.warn(`switchboard: send to chat ${key} failed: ${describe(error)}`)
+      failed?.(error)
     })
     this.sendTails.set(key, next)
     void next.then(() => {
@@ -1545,6 +1737,12 @@ export function modelLabel(choice: ModelChoice): string {
 function shortId(sessionId: string): string {
   const core = sessionId.replace(/^session-/u, '')
   return core.length > 8 ? core.slice(0, 8) : core
+}
+
+/** Local wall-clock time of a timestamp, for notes about late messages. */
+function clock(at: number): string {
+  const d = new Date(at)
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 /** The tail of a reply in progress, sized for one message. */

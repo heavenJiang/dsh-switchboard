@@ -86,6 +86,8 @@ export function LinesEditor(props: {
   /** Whether each line's secret is stored, by line id. */
   configured: Readonly<Record<string, boolean>>
   states: Readonly<Record<string, LineState>>
+  /** Messages waiting for each line to come back, by line id. */
+  queued: Readonly<Record<string, number>>
   disabled: boolean
   onChange: (rows: LineRow[]) => void
 }): ReactNode {
@@ -116,6 +118,7 @@ export function LinesEditor(props: {
               <input className="tgb-input tgb-line-name" value={v.name} placeholder={t('lineNamePlaceholder')} aria-label={t('lineName')}
                 disabled={disabled} onChange={(event) => { update(index, { value: { name: event.target.value } }) }} />
               {state !== undefined && <LineStateTag state={state} type={v.type} t={t} />}
+              {(props.queued[v.id] ?? 0) > 0 && <span className="tgb-tag" data-tone="warn">{t('lineQueued').replace('{n}', String(props.queued[v.id]))}</span>}
               <label className="tgb-line-switch">
                 <span>{t('lineEnabled')}</span>
                 <Switch checked={v.enabled} label={t('lineEnabled')} disabled={disabled}

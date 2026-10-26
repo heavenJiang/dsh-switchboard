@@ -84,7 +84,7 @@ describe.skipIf(!enabled)('real Loader composition', () => {
     // No token configured: the bridge stays stopped and the viewer still answers.
     expect(overview.state.kind).toBe('stopped')
     // A profile without lines runs its Telegram fields as the legacy line.
-    expect(overview.lines).toEqual([{ id: 'telegram', type: 'telegram', name: 'Telegram', state: { kind: 'stopped' } }])
+    expect(overview.lines).toEqual([{ id: 'telegram', type: 'telegram', name: 'Telegram', state: { kind: 'stopped' }, queued: 0 }])
     expect(overview.chats).toEqual([])
     expect(overview.stats.series).toHaveLength(14)
   })

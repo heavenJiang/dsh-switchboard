@@ -51,6 +51,11 @@ const zh = {
   deliverableTooLarge: (path: string) => `文件超过此渠道的上传上限，未发送：${path}`,
   failed: (detail: string) => `出错了：${detail}`,
   toolCall: (name: string, preview: string) => `🔧 ${name}${preview === '' ? '' : `\n${preview}`}`,
+  late: (time: string) => `⏳ 补发：原定 ${time} 发送，当时线路未连接。`,
+  caughtUp: (time: string) => `⏳ 插件重启期间完成的回复（${time}）：`,
+  caughtUpFailed: (time: string, detail: string) => `⏳ 插件重启期间，这一轮在 ${time} 以失败结束：${detail}`,
+  lineDown: (name: string, minutes: number, reason: string) => `⚠️ 线路「${name}」已断开 ${minutes} 分钟：${reason}\n期间的回复会在恢复后补发。`,
+  lineBack: (name: string, queued: number) => `✅ 线路「${name}」已恢复${queued > 0 ? `，正在补发 ${queued} 条消息` : ''}。`,
   turnEnded: (kind: string, detail?: string) => kind === 'aborted' ? '⏹ 已中止'
     : kind === 'blocked' ? '⛔ 本轮被阻止'
     : kind === 'max-tokens' ? '⚠️ 输出达到 token 上限'
@@ -173,6 +178,11 @@ const en: typeof zh = {
   deliverableTooLarge: (path: string) => `Over this channel's upload limit, not sent: ${path}`,
   failed: (detail: string) => `Failed: ${detail}`,
   toolCall: (name: string, preview: string) => `🔧 ${name}${preview === '' ? '' : `\n${preview}`}`,
+  late: (time: string) => `⏳ Sent late: due at ${time}, while the line was down.`,
+  caughtUp: (time: string) => `⏳ Reply that finished while the plugin was restarting (${time}):`,
+  caughtUpFailed: (time: string, detail: string) => `⏳ While the plugin was restarting, this turn failed at ${time}: ${detail}`,
+  lineDown: (name: string, minutes: number, reason: string) => `⚠️ Line "${name}" has been down for ${minutes} min: ${reason}\nReplies meanwhile are sent once it is back.`,
+  lineBack: (name: string, queued: number) => `✅ Line "${name}" is back${queued > 0 ? `; sending ${queued} queued message(s)` : ''}.`,
   turnEnded: (kind: string, detail?: string) => kind === 'aborted' ? '⏹ Stopped'
     : kind === 'blocked' ? '⛔ Turn blocked'
     : kind === 'max-tokens' ? '⚠️ Output hit the token limit'

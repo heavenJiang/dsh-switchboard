@@ -207,6 +207,11 @@ export const en = {
   lineTypeTelegram: 'Telegram',
   lineTypeFeishu: 'Feishu',
   lineStatus: 'Status',
+  alertChats: 'Line outage alert chats',
+  alertChatsHint: 'When a line stays down, these chats hear about it through another line, and again when it is back. Telegram chat ids, or line:chat id for other lines. Empty uses the scheduled task chats.',
+  alertAfterMin: 'Outage alert after (minutes)',
+  alertAfterMinHint: 'How long a line may be down before the alert. 0 turns alerts off. Replies meanwhile are kept and sent once the line is back.',
+  lineQueued: '{n} waiting to send',
 } as const
 
 /** Dictionary keys. */
@@ -419,4 +424,9 @@ export const zh: Record<TelegramBridgeLocaleKey, string> = {
   lineTypeTelegram: 'Telegram',
   lineTypeFeishu: '飞书',
   lineStatus: '状态',
+  alertChats: '掉线提醒聊天',
+  alertChatsHint: '某条线路断开超过下面的时长时，通过其他线路通知这些聊天，恢复时再通知一次。Telegram 填聊天 ID，其他线路填「线路:聊天 ID」。留空则使用定时任务推送聊天。',
+  alertAfterMin: '掉线提醒阈值（分钟）',
+  alertAfterMinHint: '线路断开多久后提醒，0 表示关闭提醒。断开期间的回复会保存下来，线路恢复后补发。',
+  lineQueued: '待补发 {n} 条',
 }

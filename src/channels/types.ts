@@ -171,3 +171,28 @@ export function sleep(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener('abort', done, { once: true })
   })
 }
+
+/** Socket errors raised before a request leaves this machine. */
+const CONNECT_CODES = new Set([
+  'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET_CONNECT', 'CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID',
+])
+
+/**
+ * Whether a failed send certainly did not reach the platform, so sending it
+ * again cannot duplicate it: the connection never opened, the platform's
+ * gateway answered that it is unavailable, or flood control outlasted the
+ * client's retries. Anything else (a reset mid-request, a timeout) is
+ * treated as possibly delivered.
+ */
+export function undelivered(error: unknown): boolean {
+  for (let cause: unknown = error, depth = 0; cause !== undefined && cause !== null && depth < 4; depth++) {
+    const code = (cause as { code?: unknown }).code
+    if (typeof code === 'string' && CONNECT_CODES.has(code)) return true
+    if ((cause as { name?: unknown }).name === 'TelegramApiError' && typeof code === 'number') {
+      return code === 429 || code === 502 || code === 503 || code === 504
+    }
+    cause = (cause as { cause?: unknown }).cause
+  }
+  return false
+}
