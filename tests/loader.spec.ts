@@ -74,7 +74,7 @@ describe.skipIf(!enabled)('real Loader composition', () => {
 
     expect([...context.loader.entries()].filter(entry => entry.fiber === undefined && !entry.disabled)).toEqual([])
     expect([...routes.keys()].sort()).toEqual([
-      '/api/switchboard/history', '/api/switchboard/link', '/api/switchboard/media',
+      '/api/switchboard/feishu/register', '/api/switchboard/history', '/api/switchboard/link', '/api/switchboard/media',
       '/api/switchboard/models', '/api/switchboard/overview', '/api/switchboard/send',
       '/api/switchboard/session', '/api/switchboard/update-check',
     ])

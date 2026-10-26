@@ -22,6 +22,10 @@ A **line** is one bot on one chat platform plus the people allowed to use it. Co
 **Telegram line**: create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`), then **+ Telegram line** and paste the token. Allowed users are Telegram ids or `@usernames`.
 
 **Feishu line**: Feishu delivers events over the Open Platform's persistent connection, so no public URL is needed.
+
+**By QR (recommended)**: **+ Feishu line** → **Create a Feishu app by QR**, scan with the Feishu app (or **Open in browser** on this computer), and confirm. The bot, permissions, the `im.message.receive_v1` event, and the `card.action.trigger` callback are filled in; the Host stores the App Secret in the credentials store (it never reaches the browser), the scanner is added to the allowed users, and the line is saved and connects. For an existing app, **Complete permissions** adds what is missing the same way.
+
+**By hand**:
 1. On the [Feishu Open Platform](https://open.feishu.cn/app) (or [Lark](https://open.larksuite.com/app)) create a self-built app and add the **Bot** capability.
 2. Grant `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`, `im:message:send_as_bot`, and `im:resource`; optionally `contact:user.base:readonly` (names) and `im:chat:readonly` (group names).
 3. Add **+ Feishu line** with the **App ID** (`cli_…`) and **App Secret** and save: Feishu lets you pick the persistent connection only while a client is connected.

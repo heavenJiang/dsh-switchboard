@@ -1,7 +1,7 @@
 {
   "name": "dsh-switchboard",
   "description": "Switchboard (掌上指挥台) for DeepSeek Harness: command Agents from Telegram and Feishu bots — tasks, streamed replies, approvals, questions, notices, files, and voice.",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",
@@ -81,6 +81,7 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "esbuild": "^0.25.0",
+    "qrcode-generator": "2.0.4",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },

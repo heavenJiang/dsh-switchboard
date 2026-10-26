@@ -5,8 +5,9 @@
  */
 
 import { SettingsSecretField, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { defaultSecretRef, LINE_ID, type ChannelType } from '../lines.ts'
+import { FeishuScan, type ScanResult } from './FeishuScan.tsx'
 import type { TelegramBridgeLocaleKey } from './locales.ts'
 
 type T = (key: TelegramBridgeLocaleKey) => string
@@ -75,6 +76,13 @@ function problems(row: LineRow, rows: readonly LineRow[]): Partial<Record<'id' |
   }
 }
 
+/** A row after its Feishu app was created or extended by QR: the scanner may use it at once. */
+export function registeredRow(row: LineRow, result: ScanResult): LineRow {
+  const users = splitList(row.users)
+  if (result.ownerOpenId !== undefined && !users.includes(result.ownerOpenId)) users.push(result.ownerOpenId)
+  return { ...row, secret: '', users: users.join(', '), value: { ...row.value, appId: result.appId, domain: result.domain } }
+}
+
 /** Whether every row can be saved. */
 export function rowsValid(rows: readonly LineRow[]): boolean {
   return rows.every(row => Object.keys(problems(row, rows)).length === 0)
@@ -90,8 +98,11 @@ export function LinesEditor(props: {
   queued: Readonly<Record<string, number>>
   disabled: boolean
   onChange: (rows: LineRow[]) => void
+  /** A Feishu app was created or extended by QR for a row; the page saves it. */
+  onRegistered: (index: number, result: ScanResult) => void
 }): ReactNode {
   const { t, rows, disabled } = props
+  const [scanning, setScanning] = useState<{ index: number; repair: boolean } | undefined>(undefined)
   const update = (index: number, patch: { users?: string; chats?: string; secret?: string; value?: Partial<LineValue> }): void => {
     props.onChange(rows.map((row, i) => i !== index ? row : {
       ...row, ...patch, value: { ...row.value, ...patch.value },
@@ -145,12 +156,32 @@ export function LinesEditor(props: {
               )
               : (
                 <>
+                  {scanning?.index === index
+                    ? (
+                      <FeishuScan t={t} domain={v.domain} secretRef={v.secretRef.trim() || 'FEISHU_APP_SECRET'}
+                        {...(scanning.repair ? { appId: v.appId } : {})}
+                        onDone={(result) => { props.onRegistered(index, result) }}
+                        onClose={() => { setScanning(undefined) }} />
+                    )
+                    : (
+                      <div className="tgb-link-row">
+                        {v.appId.trim() === ''
+                          ? <button type="button" className="tgb-button tgb-button-primary" disabled={disabled || bad.secretRef === true}
+                            onClick={() => { setScanning({ index, repair: false }) }}>{t('feishuScan')}</button>
+                          : <button type="button" className="tgb-button" disabled={disabled || bad.appId === true}
+                            onClick={() => { setScanning({ index, repair: true }) }}>{t('feishuRepair')}</button>}
+                        <span className="tgb-muted tgb-small">{v.appId.trim() === '' ? t('feishuScanHint') : t('feishuRepairHint')}</span>
+                      </div>
+                    )}
+                  <details className="tgb-line-manual" open={v.appId.trim() !== ''}>
+                    <summary>{t('feishuManual')}</summary>
                   <p className="tgb-line-setup">{t('feishuSetup')}</p>
                   {field('appId', t('feishuAppId'), t('feishuAppIdHint'), v.appId, (text) => { update(index, { value: { appId: text.trim() } }) }, 'cli_a1b2c3d4e5f6')}
                   <SettingsSecretField id={`${id}-secret`} label={t('feishuSecret')} hint={t('feishuSecretHint')} disabled={disabled}
                     text={row.secret} configured={props.configured[v.id] === true}
                     stateLabel={props.configured[v.id] === true ? t('lineSecretSet') : t('lineSecretUnset')}
                     onEdit={(text) => { update(index, { secret: text }) }} />
+                  </details>
                   <div className="tgb-line-field">
                     <label htmlFor={`${id}-domain`}>{t('feishuDomain')}</label>
                     <select id={`${id}-domain`} className="tgb-select" value={v.domain} disabled={disabled}

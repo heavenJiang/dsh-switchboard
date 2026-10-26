@@ -34,7 +34,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
-import { LinesEditor, lineOf, rowOf, rowsValid, type LineRow, type LineState, type LineValue } from './LinesEditor.tsx'
+import { LinesEditor, lineOf, registeredRow, rowOf, rowsValid, type LineRow, type LineState, type LineValue } from './LinesEditor.tsx'
 import panelCss from './panel.css'
 import { ConsoleIcon, createTelegramPanel } from './TelegramPanel.tsx'
 import { remotes, trackRemotes } from './remotes.ts'
@@ -563,7 +563,21 @@ function createPage(form: ConfigForm<BridgeValues>, describe: SettingsDescribeFa
 
         <h3 style={styles.section}>{t('groupLines')}</h3>
         <LinesEditor t={t} rows={rows} configured={configured} states={lineStates} queued={lineQueued} disabled={disabled}
-          onChange={(next) => { setFailed(false); setLineRows(next) }} />
+          onChange={(next) => { setFailed(false); setLineRows(next) }}
+          onRegistered={(index, result) => {
+            // The Host already stored the secret; save the line right away so it connects.
+            const next = rows.map((row, i) => i === index ? registeredRow(row, result) : row)
+            setLineRows(next)
+            if (!rowsValid(next)) return
+            setSaving(true)
+            void form.mutate([{ op: 'set', path: ['lines'], value: next.map(lineOf) as unknown as PathValue }], snapshot.revision)
+              .then((accepted) => {
+                setCredentialTick(n => n + 1)
+                if (accepted) setLineRows(undefined)
+                setFailed(!accepted)
+              }, () => { setFailed(true) })
+              .finally(() => { setSaving(false) })
+          }} />
 
         <h3 style={styles.section}>{t('groupSession')}</h3>
         {valueField('workspacePath', 'workspace', { placeholder: '/Users/me/projects/app' })}

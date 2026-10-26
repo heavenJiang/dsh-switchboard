@@ -50,6 +50,7 @@ import {
 } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { Outbox } from './outbox.ts'
+import { RegistrationDesk } from './channels/feishu-register.ts'
 import { registerWebCommand } from './command.ts'
 import { LEGACY_LINE, LINE_ID, type ChannelType, type LineSettings } from './lines.ts'
 import type { BotLanguage } from './messages.ts'
@@ -633,9 +634,16 @@ export function apply(ctx: Context, config: Config): void {
     restart()
   })
 
+  // Secrets of apps created by QR go straight to the credentials store.
+  const registrations = new RegistrationDesk(async (ref, secret) => {
+    if (optional.credentials === undefined) throw new Error('the credentials store is not available')
+    await optional.credentials.set(ref as CredentialRef, secret)
+  })
+  ctx.effect(() => () => { registrations.dispose() }, 'switchboard: feishu registrations')
+
   // The Web viewer reads history through owner-only routes on the shared API channel.
   ctx.inject(['connection'], (scope) => {
-    registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog(), updates)
+    registerHistoryRoutes(scope, chatLog, bridge, () => sessionController.modelCatalog(), updates, registrations)
   })
 
   // `/switchboard` in the Web composer links the open Session to a chat.

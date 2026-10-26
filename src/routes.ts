@@ -7,6 +7,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import { modelLabel, type Switchboard } from './bridge.ts'
+import type { RegistrationDesk } from './channels/feishu-register.ts'
 import { splitChatKey } from './lines.ts'
 import type { ChatLog, ChatSummary } from './chatlog.ts'
 import type { UpdateChecker } from './updates.ts'
@@ -47,6 +48,7 @@ async function body(request: Request): Promise<Record<string, unknown>> {
  */
 export function registerHistoryRoutes(
   ctx: Context, log: ChatLog, bridge: Switchboard, models: () => Promise<unknown>, updates: UpdateChecker,
+  registrations?: RegistrationDesk,
 ): void {
   const fetchRoutes = ctx.connection.fetch
   /** The chat's line, platform, and bound Session's model, which the index does not store. */
@@ -153,6 +155,37 @@ export function registerHistoryRoutes(
       return json(await log.history(chatId, typeof before === 'string' ? before : undefined, size))
     },
   }), 'switchboard: history route')
+
+  // Feishu app creation by QR: the Host runs the device-code flow and keeps the secret.
+  if (registrations !== undefined) {
+    ctx.effect(() => fetchRoutes.register({
+      path: `${API_PREFIX}/feishu/register`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const { action, id, domain, secretRef, appId, appName, appDescription } = await body(request)
+        if (action === 'start') {
+          if (typeof secretRef !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(secretRef)) return json({ error: 'secretRef required' }, 400)
+          if (appId !== undefined && (typeof appId !== 'string' || !/^cli_\w+$/u.test(appId))) return json({ error: 'appId must be cli_…' }, 400)
+          try {
+            return json(await registrations.start({
+              domain: domain === 'lark' ? 'lark' : 'feishu',
+              secretRef,
+              ...(typeof appId === 'string' ? { appId } : {}),
+              ...(typeof appName === 'string' && appName.trim() !== '' ? { appName: appName.trim().slice(0, 40) } : {}),
+              ...(typeof appDescription === 'string' && appDescription.trim() !== '' ? { appDescription: appDescription.trim().slice(0, 200) } : {}),
+            }))
+          } catch (error: unknown) {
+            return json({ error: error instanceof Error ? error.message : String(error) }, 502)
+          }
+        }
+        if (typeof id !== 'string') return json({ error: 'id required' }, 400)
+        if (action === 'cancel') registrations.cancel(id)
+        const status = registrations.status(id)
+        return status === undefined ? json({ error: 'unknown registration' }, 404) : json({ id, status })
+      },
+    }), 'switchboard: feishu registration route')
+  }
 
   ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/media`,
