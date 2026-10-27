@@ -250,7 +250,7 @@ describe('Feishu line', () => {
     expect(harness.prompts[0]?.parts).toEqual([{ type: 'file', receiptId: 'r1' }])
   })
 
-  it('streams the reply in a progress card and replaces it with the reply', async () => {
+  it('streams the reply in a progress card, shrinks it to a summary, and sends the reply below', async () => {
     await store.update(KEY, { sessionId: 's1' })
     bridge.onSessionEvent('s1', { type: 'turn/start' })
     bridge.onAssistantStream('s1', { type: 'start' })
@@ -258,10 +258,11 @@ describe('Feishu line', () => {
     await until(() => feishu.sent.length === 1, 3000)
     expect(feishu.sent[0]?.type).toBe('interactive')
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Done: 3 fixed.' }] } } })
-    await until(() => feishu.patches.length === 1)
+    await until(() => feishu.sent.length === 2)
+    // A recalled Feishu message leaves a notice, so the progress card becomes a summary line.
     expect(feishu.patches[0]?.messageId).toBe(feishu.sent[0]?.id)
-    expect(cardText(feishu.patches[0]!.card)).toBe('Done: 3 fixed.')
-    expect(feishu.sent).toHaveLength(1)
+    expect(cardText(feishu.patches[0]!.card)).toMatch(/^⏱ Work · \d+s$/u)
+    expect(cardText(feishu.sent[1]!.content)).toBe('Done: 3 fixed.')
   })
 
   it('sends presented images and files back', async () => {

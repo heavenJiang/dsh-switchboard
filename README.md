@@ -58,7 +58,7 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | other `/xxx` | Not a command: sent to the Agent as text |
 
 - **Rendering**: Markdown becomes Telegram HTML (with a plain-text fallback) or a Feishu card's Markdown, split safely.
-- **One progress message**: while a turn runs, a single "⏳ Working · time · N tool calls" message shows the latest tool calls and the reply being written, with a **⏹ Stop** button, and is replaced by the reply; a stop or failure is told there too.
+- **One progress message**: while a turn runs, a single "⏳ Working · time · N tool calls" message shows the latest tool calls and the reply being written, with a **⏹ Stop** button, and steps aside when the reply arrives as a new message at the bottom (so it notifies): deleted on Telegram, shrunk to a one-line summary on Feishu; a stop or failure is told there too.
 - **Acknowledged at once**: your message gets 👀 (Feishu: OnIt) while it is worked on, cleared when done; a message sent during a running turn gets a "Queued" notice with **Steer now** and **Cancel**.
 - **Buttons under the reply**: **Continue**, **Retry**, **Show changes** (the turn's changes as a diff file, new files included), and **New session**; they move to the next reply.
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).

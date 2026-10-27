@@ -1588,25 +1588,32 @@ export class Switchboard {
   }
 
   /**
-   * Deliver a committed reply: it replaces the progress message where there is
-   * one, and the next activity of the turn starts a fresh progress message.
+   * Deliver a committed reply as a new message, so it is always the latest in
+   * the chat and notifies; the progress message steps aside (removed, or
+   * shrunk to a summary line), and the turn's next activity starts a fresh one.
    */
   private async deliverReply(sessionId: string, chats: string[], text: string): Promise<void> {
     const progress = this.progress.get(sessionId)
-    let replace: Map<string, string> | undefined
+    let shown: Map<string, string> | undefined
+    let summary = ''
     if (progress !== undefined) {
       clearTimeout(progress.timer)
       progress.timer = undefined
       clearInterval(progress.ticker)
       progress.ticker = undefined
-      replace = progress.messages
+      shown = progress.messages
+      summary = this.t.progressSummary(duration((Date.now() - progress.startedAt) / 1000, this.settings().language), progress.segment)
       progress.messages = new Map()
       progress.lines = []
       progress.segment = 0
       progress.text = ''
       await progress.pending
     }
-    await Promise.all(chats.map(key => this.durable(key, { kind: 'markdown', text }, sessionId, replace?.get(key))))
+    await Promise.all(chats.map((key) => {
+      const messageId = shown?.get(key)
+      if (messageId !== undefined) void this.enqueue(key, async (channel, chat) => { await channel.retire(chat, messageId, summary) })
+      return this.durable(key, { kind: 'markdown', text }, sessionId)
+    }))
   }
 
   /**

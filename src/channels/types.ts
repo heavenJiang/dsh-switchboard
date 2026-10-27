@@ -113,6 +113,11 @@ export interface Channel {
   send(chat: string, message: OutMessage): Promise<string>
   /** Replace an editable message's text and buttons (no buttons removes them). */
   edit(chat: string, messageId: string, message: OutMessage): Promise<void>
+  /**
+   * Take a progress message out of the way of the reply that follows it:
+   * removed where that leaves no trace, else shrunk to `summary`.
+   */
+  retire(chat: string, messageId: string, summary: string): Promise<void>
   /** Replace only the buttons of a message sent with buttons; `message.text` is its unchanged text. */
   editButtons(chat: string, messageId: string, message: OutMessage): Promise<void>
   /**

@@ -67,6 +67,7 @@ const zh = {
   progressEnded: (kind: string, elapsed: string, tools: number, detail?: string) => kind === 'completed'
     ? `✅ 完成 · ${elapsed}${tools > 0 ? ` · 工具 ${tools} 次` : ''}`
     : kind === 'aborted' ? `⏹ 已停止 · ${elapsed}` : `⚠️ 出错 · ${elapsed}${detail === undefined ? '' : `\n${detail}`}`,
+  progressSummary: (elapsed: string, tools: number) => `⏱ 处理过程 · ${elapsed}${tools > 0 ? ` · 工具 ${tools} 次` : ''}`,
   stopButton: '⏹ 停止',
   stopRequested: '正在停止…',
   queued: (ahead: number) => `⏳ 已排队${ahead > 0 ? `（前面还有 ${ahead} 条）` : ''}，当前任务结束后处理。`,
@@ -226,6 +227,7 @@ const en: typeof zh = {
   progressEnded: (kind: string, elapsed: string, tools: number, detail?: string) => kind === 'completed'
     ? `✅ Done · ${elapsed}${tools > 0 ? ` · ${tools} tool call(s)` : ''}`
     : kind === 'aborted' ? `⏹ Stopped · ${elapsed}` : `⚠️ Failed · ${elapsed}${detail === undefined ? '' : `\n${detail}`}`,
+  progressSummary: (elapsed: string, tools: number) => `⏱ Work · ${elapsed}${tools > 0 ? ` · ${tools} tool call(s)` : ''}`,
   stopButton: '⏹ Stop',
   stopRequested: 'Stopping…',
   queued: (ahead: number) => `⏳ Queued${ahead > 0 ? ` (${ahead} ahead)` : ''}; it runs when the current task ends.`,

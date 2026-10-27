@@ -501,7 +501,7 @@ describe('rendering and delivery', () => {
     await until(() => telegram.sent().includes('after the wait'))
   })
 
-  it('shows a burst of tool calls in one progress message that the reply replaces', async () => {
+  it('shows a burst of tool calls in one progress message that steps aside for the reply', async () => {
     settings = { ...settings, notifyToolCalls: true }
     await store.update(KEY, { sessionId: 's1' })
     for (const [i, command] of ['ls', 'cat a', 'npm test'].entries()) {
@@ -514,8 +514,23 @@ describe('rendering and delivery', () => {
     const first = telegram.calls.find(c => c.method === 'sendMessage')!
     expect((first.params['reply_markup'] as { inline_keyboard: { text: string }[][] }).inline_keyboard[0]![0]!.text).toBe('⏹ Stop')
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } })
-    await until(() => telegram.edits().includes('ok'))
-    expect(telegram.sent()).toHaveLength(1)
+    // The reply is a new message (it notifies); the progress message is deleted.
+    await until(() => telegram.sent().includes('ok'))
+    expect(telegram.calls.find(c => c.method === 'deleteMessage')?.params).toEqual({ chat_id: CHAT.id, message_id: 1 })
+    expect(telegram.sent()).toHaveLength(2)
+  })
+
+  it('keeps the reply last when other messages came after the progress message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c', name: 'bash', arguments: '{}' } })
+    await until(() => telegram.sent().length === 1)
+    // An approval lands below the progress message, as a queued notice or a file would.
+    void bridge.requestApproval({ sessionId: 's1', toolName: 'bash' })
+    await until(() => telegram.sent().some(t => t.includes('Approval needed')))
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Final answer' }] } } })
+    await until(() => telegram.sent().includes('Final answer'))
+    expect(telegram.sent().at(-1)).toBe('Final answer')
   })
 
   it('starts a fresh progress message after a reply', async () => {
@@ -528,13 +543,13 @@ describe('rendering and delivery', () => {
     // Older calls fold into the count.
     expect(latest.split('\n').slice(1)).toEqual(['…', ...[4, 5, 6, 7, 8, 9].map(i => `🔧 bash · command: step ${i}`)])
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'halfway' }] } } })
-    await until(() => telegram.edits().includes('halfway'))
+    await until(() => telegram.sent().includes('halfway'))
     call(10)
-    await until(() => telegram.sent().length === 2, 3000)
-    expect(telegram.sent()[1]).toMatch(/· 10 tool call\(s\)\n🔧 bash · command: step 10$/u)
+    await until(() => telegram.sent().length === 3, 3000)
+    expect(telegram.sent()[2]).toMatch(/· 10 tool call\(s\)\n🔧 bash · command: step 10$/u)
   })
 
-  it('streams the reply in the progress message and turns it into the reply', async () => {
+  it('streams the reply in the progress message, then sends the reply', async () => {
     await store.update(KEY, { sessionId: 's1' })
     bridge.onSessionEvent('s1', { type: 'turn/start' })
     bridge.onAssistantStream('s1', { type: 'start' })
@@ -542,8 +557,8 @@ describe('rendering and delivery', () => {
     await until(() => telegram.sent().length === 1, 3000)
     expect(telegram.sent()[0]).toMatch(/^⏳ Working · \d+s\n\nWorking through the failing tests one by one now ▍$/u)
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'All **fixed**.' }] } } })
-    await until(() => telegram.edits().includes('All <b>fixed</b>.'))
-    expect(telegram.sent()).toHaveLength(1)
+    await until(() => telegram.sent().includes('All <b>fixed</b>.'))
+    expect(telegram.calls.some(c => c.method === 'deleteMessage')).toBe(true)
   })
 })
 

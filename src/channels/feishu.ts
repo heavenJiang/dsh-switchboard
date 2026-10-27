@@ -259,6 +259,11 @@ export class FeishuChannel implements Channel {
     await this.options.api.patchCard(messageId, card({ plain: message.text }, message.buttons))
   }
 
+  /** A recalled Feishu message leaves a notice behind, so the card shrinks to a one-line summary. */
+  async retire(_chatId: string, messageId: string, summary: string): Promise<void> {
+    await this.options.api.patchCard(messageId, card({ plain: summary }))
+  }
+
   /** A card is replaced whole. */
   async editButtons(chatId: string, messageId: string, message: OutMessage): Promise<void> {
     await this.edit(chatId, messageId, message)

@@ -176,6 +176,12 @@ export class TelegramChannel implements Channel {
     })
   }
 
+  /** Deleting leaves no trace in Telegram; a message too old to delete is shrunk instead. */
+  async retire(chatId: string, messageId: string, summary: string): Promise<void> {
+    await this.client.deleteMessage(Number(chatId), Number(messageId)).catch(() =>
+      this.client.editMessageText(Number(chatId), Number(messageId), summary))
+  }
+
   async editButtons(chatId: string, messageId: string, message: OutMessage): Promise<void> {
     await this.client.call('editMessageReplyMarkup', {
       chat_id: Number(chatId), message_id: Number(messageId), reply_markup: { inline_keyboard: keyboard(message.buttons ?? []) },
