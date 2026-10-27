@@ -53,6 +53,7 @@ import { Outbox } from './outbox.ts'
 import { RegistrationDesk } from './channels/feishu-register.ts'
 import { registerWebCommand } from './command.ts'
 import { LEGACY_LINE, LINE_ID, type ChannelType, type LineSettings } from './lines.ts'
+import type { PersonSettings } from './people.ts'
 import type { BotLanguage } from './messages.ts'
 import { registerHistoryRoutes } from './routes.ts'
 import { UpdateChecker } from './updates.ts'
@@ -167,6 +168,8 @@ export interface Config {
   scheduleChats: Volatile<string[]>
   /** Replies longer than this many characters go as a Markdown file with a short preview; 0 never. */
   longReplyChars: Volatile<number>
+  /** Roles, presets, and directories of people; anyone not listed is an admin (a member when admitted by chat). */
+  people: Volatile<PersonSettings[]>
   /** Chat keys told when a line stays down; the schedule chats when empty. */
   alertChats: Volatile<string[]>
   /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
@@ -220,6 +223,13 @@ export const Config: Schema<Config> = Schema.object({
   turnSummaryMinSec: Schema.natural().max(86400).default(60).volatile(),
   scheduleChats: Schema.array(Schema.string()).default([]).volatile(),
   longReplyChars: Schema.natural().max(100000).default(6000).volatile(),
+  people: Schema.array(Schema.object({
+    line: Schema.string().required(),
+    id: Schema.string().required(),
+    role: Schema.union(['admin', 'member', 'guest'] as const).default('member'),
+    preset: Schema.string(),
+    dirs: Schema.array(Schema.string()).default([]),
+  })).default([]).volatile(),
   alertChats: Schema.array(Schema.string()).default([]).volatile(),
   alertAfterMin: Schema.natural().max(1440).default(5).volatile(),
   transcribeVoice: Schema.boolean().default(true).volatile(),
@@ -408,6 +418,7 @@ export function apply(ctx: Context, config: Config): void {
       scheduleChats: config.scheduleChats.get(),
       alertChats: config.alertChats.get(),
       longReplyChars: config.longReplyChars.get(),
+      people: config.people.get(),
       alertAfterMin: config.alertAfterMin.get(),
       language: config.language.get(),
       maxDownloadMb: config.maxDownloadMb.get(),

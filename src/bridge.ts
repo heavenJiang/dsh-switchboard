@@ -31,6 +31,7 @@ import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
 import { chatKey, splitChatKey, type LineSettings } from './lines.ts'
 import { outgoingKind, promptImageType, sniffImageType } from './media.ts'
 import { duration, MESSAGES, type BotLanguage, type Messages } from './messages.ts'
+import { actorFor, mayRunCommand, mayUse, type Actor, type PersonSettings } from './people.ts'
 import type { Outbox, OutboxPayload } from './outbox.ts'
 import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
 
@@ -69,6 +70,8 @@ export interface BridgeSettings {
   readonly sendDeliverables: boolean
   /** Replies longer than this many characters go as a Markdown file with a short preview; 0 never. */
   readonly longReplyChars?: number
+  /** Roles, presets, and directories of people; anyone not listed is an admin (or a member when admitted by chat). */
+  readonly people?: readonly PersonSettings[]
   /** Chat keys told when a line stays down; the schedule chats when empty. */
   readonly alertChats?: readonly string[]
   /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
@@ -776,6 +779,21 @@ export class Switchboard {
     return chat !== undefined && line.allowedChats.some(id => id.trim() === chat.id)
   }
 
+  /** What a person may do on a line. */
+  private actorOf(line: LineSettings, user: ChannelUser): Actor {
+    const ids = [user.id, ...(user.aliases ?? []), ...(user.username === undefined ? [] : [`@${user.username}`])]
+    const byName = ids.some(id => isAllowed(line.allowedUsers, id))
+    const fallback = line.workspacePath.trim() || this.settings().workspacePath.trim() || undefined
+    return actorFor(this.settings().people, line.id, ids, !byName, fallback)
+  }
+
+  /** Whether an actor may use a Session: admins any, others only in their directories. */
+  private async mayUseSession(actor: Actor, sessionId: string): Promise<boolean> {
+    if (actor.dirs === undefined) return true
+    const cwd = this.harness.live(sessionId)?.cwd ?? (await this.harness.listSessions().catch(() => [])).find(row => row.sessionId === sessionId)?.cwd
+    return mayUse(actor, cwd)
+  }
+
   /** A running line's current settings (access lists and directories change without a restart). */
   private settingsOf(entry: LiveLine): LineSettings {
     return this.settings().lines.find(line => line.id === entry.line.id) ?? entry.line
@@ -784,6 +802,7 @@ export class Switchboard {
   private async handleMessage(entry: LiveLine, message: InboundMessage): Promise<void> {
     const { channel } = entry
     const line = this.settingsOf(entry)
+    const actor = this.actorOf(line, message.from)
     const key = chatKey(line.id, message.chat.id)
     const from = message.from
     const t = this.t
@@ -818,13 +837,13 @@ export class Switchboard {
       return
     }
     try {
-      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(key, message)
-      if (attachments.length > 0) return await this.promptWithMedia(key, message)
+      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(key, message, actor)
+      if (attachments.length > 0) return await this.promptWithMedia(key, message, actor)
       if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
       if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
-      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], 'queue', message.messageId)
-      return await this.runCommand(key, parsed.name, parsed.args)
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], 'queue', actor, message.messageId)
+      return await this.runCommand(key, parsed.name, parsed.args, actor)
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
     }
@@ -834,11 +853,11 @@ export class Switchboard {
    * Download every attachment of one message (or album), stage it into the
    * chat's Session, and prompt with the text plus the receipts.
    */
-  private async promptWithMedia(key: string, message: InboundMessage, note?: string): Promise<void> {
+  private async promptWithMedia(key: string, message: InboundMessage, actor: Actor, note?: string): Promise<void> {
     const channel = this.channelOf(key)
     if (channel === undefined) return
     const t = this.t
-    const sessionId = await this.ensureSession(key)
+    const sessionId = await this.ensureSession(key, actor)
     if (sessionId === undefined) return
     const limit = this.settings().maxDownloadMb * 1024 * 1024
     const parts: PromptPart[] = []
@@ -878,7 +897,7 @@ export class Switchboard {
    * Transcribe a voice note and prompt with the text; when the host cannot
    * transcribe, the note goes to the Agent as an audio file instead.
    */
-  private async promptWithVoice(key: string, message: InboundMessage): Promise<void> {
+  private async promptWithVoice(key: string, message: InboundMessage, actor: Actor): Promise<void> {
     const channel = this.channelOf(key)
     const voice: InboundAttachment | undefined = message.voice
     if (channel === undefined || voice === undefined) return
@@ -889,14 +908,14 @@ export class Switchboard {
       const audio = await channel.download(voice, limit)
       transcript = (await this.harness.transcribe(audio, this.lifetime.signal)).trim()
     } catch (error: unknown) {
-      return this.promptWithMedia(key, message, t.voiceUnavailable(describe(error)))
+      return this.promptWithMedia(key, message, actor, t.voiceUnavailable(describe(error)))
     }
     if (transcript === '') return this.reply(key, t.voiceEmpty)
     const caption = (message.text ?? '').trim()
     const text = this.withQuote(caption === '' ? transcript : `${caption}\n\n${transcript}`, message.quote)
     this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
     await this.reply(key, t.voiceHeard(transcript))
-    await this.promptFromChat(key, [{ type: 'text', text }], 'queue', message.messageId)
+    await this.promptFromChat(key, [{ type: 'text', text }], 'queue', actor, message.messageId)
   }
 
   /** Prefix a prompt with the message it quotes, so the Agent knows what "this" refers to. */
@@ -916,7 +935,7 @@ export class Switchboard {
 
   // ─── commands ───────────────────────────────────────────────────────────
 
-  private async runCommand(key: string, name: string, args: string): Promise<void> {
+  private async runCommand(key: string, name: string, args: string, actor: Actor): Promise<void> {
     const t = this.t
     const binding = this.store.get(key)
     switch (name) {
@@ -934,33 +953,35 @@ export class Switchboard {
       case 'new': {
         if (args === '') {
           // Recent directories as buttons; with only the default, start right there.
-          const dirs = await this.recentDirs(key)
+          const dirs = (await this.recentDirs(key, actor)).filter(dir => mayUse(actor, dir))
           if (dirs.length > 1) {
             return this.sendPicker(key, { kind: 'dir', choices: dirs, at: Date.now() },
               dirs.map((dir, index) => `${index === 0 && dir === this.defaultWorkspace(key) ? '⭐ ' : '📁 '}${tildify(dir)}`), t.newPick)
           }
         }
-        const cwd = args === '' ? this.defaultWorkspace(key) : args
+        const cwd = args === '' ? this.workspaceFor(key, actor) : args
         if (cwd === undefined) return this.reply(key, t.noWorkspace)
-        const sessionId = await this.newSession(key, cwd)
+        const sessionId = await this.newSession(key, cwd, actor)
         return this.reply(key, t.created(sessionId, cwd))
       }
       case 'cwd': {
         if (args === '') return this.reply(key, this.defaultWorkspace(key) ?? t.noWorkspace)
         if (!(await isDirectory(args))) return this.reply(key, t.badWorkspace(args))
+        if (!mayUse(actor, args)) return this.reply(key, t.dirDenied(actor.dirs ?? []))
         await this.store.update(key, { workspacePath: args })
         return this.reply(key, t.cwdSet(args))
       }
       case 'use': {
         if (args === '') return this.reply(key, t.useUsage)
         const sessionId = this.sessionRef(key, args)
+        if (!(await this.mayUseSession(actor, sessionId))) return this.reply(key, t.dirDenied(actor.dirs ?? []))
         await this.store.update(key, { sessionId })
         await this.chatLog?.bind(key, sessionId).catch(() => {})
         this.attachToWorkspace(sessionId)
         return this.reply(key, t.bound(sessionId))
       }
       case 'sessions': {
-        const rows = (await this.harness.listSessions()).slice(0, 10)
+        const rows = (await this.harness.listSessions()).filter(row => mayUse(actor, row.cwd)).slice(0, 10)
         this.listings.set(key, rows.map(row => row.sessionId))
         if (rows.length === 0) return this.reply(key, t.sessions([]))
         const lines = rows.map((row, index) =>
@@ -972,6 +993,7 @@ export class Switchboard {
       case 'watch': {
         if (args === '') return this.reply(key, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
         const sessionId = this.sessionRef(key, args)
+        if (!(await this.mayUseSession(actor, sessionId))) return this.reply(key, t.dirDenied(actor.dirs ?? []))
         await this.store.setWatch(key, sessionId, true)
         this.attachToWorkspace(sessionId)
         return this.reply(key, t.watchOn(sessionId))
@@ -994,7 +1016,7 @@ export class Switchboard {
       }
       case 'steer': {
         if (args === '') return this.reply(key, t.steerUsage)
-        return this.promptFromChat(key, [{ type: 'text', text: args }], 'steer')
+        return this.promptFromChat(key, [{ type: 'text', text: args }], 'steer', actor)
       }
       case 'queue': {
         if (binding.sessionId === undefined) return this.reply(key, t.noSession)
@@ -1025,8 +1047,10 @@ export class Switchboard {
         }))
       }
       case 'model':
+        if (actor.role === 'guest') return this.reply(key, t.adminOnly)
         return this.modelCommand(key, binding.sessionId, args)
       case 'mode':
+        if (actor.role !== 'admin') return this.reply(key, t.adminOnly)
         return this.modeCommand(key, binding.sessionId, args)
       case 'get':
         return this.getCommand(key, binding.sessionId, args)
@@ -1034,6 +1058,9 @@ export class Switchboard {
         const line = `/${name}${args === '' ? '' : ` ${args}`}`
         // Harness commands run on the Host as in the Web composer; anything else is text for the Agent.
         if (binding.sessionId !== undefined) {
+          if (!mayRunCommand(actor, name) && (await this.harness.listCommands(binding.sessionId).catch(() => [])).some(command => command.name === name)) {
+            return this.reply(key, t.adminOnly)
+          }
           const result = await this.harness.runCommand(binding.sessionId, line)
           if (result !== undefined) {
             return this.reply(key, result.kind === 'error'
@@ -1041,7 +1068,7 @@ export class Switchboard {
               : result.text === undefined || result.text.trim() === '' ? t.commandDone(name) : result.text)
           }
         }
-        return this.promptFromChat(key, [{ type: 'text', text: line }], 'queue')
+        return this.promptFromChat(key, [{ type: 'text', text: line }], 'queue', actor)
       }
     }
   }
@@ -1071,9 +1098,9 @@ export class Switchboard {
   }
 
   /** Directories offered by `/new`: the chat's default first, then where recent Sessions ran. */
-  private async recentDirs(key: string): Promise<string[]> {
+  private async recentDirs(key: string, actor: Actor): Promise<string[]> {
     const dirs: string[] = []
-    const fallback = this.defaultWorkspace(key)
+    const fallback = this.workspaceFor(key, actor)
     if (fallback !== undefined) dirs.push(fallback)
     for (const row of await this.harness.listSessions().catch(() => [])) {
       if (row.cwd === undefined || dirs.some(dir => samePath(dir, row.cwd!))) continue
@@ -1234,25 +1261,33 @@ export class Switchboard {
     return path.trim() === '' ? undefined : path
   }
 
-  private async newSession(key: string, cwd: string): Promise<string> {
+  /** Where an actor's new Session goes: the chat's directory when they may use it, else their first directory. */
+  private workspaceFor(key: string, actor: Actor): string | undefined {
+    const preferred = this.defaultWorkspace(key)
+    if (mayUse(actor, preferred)) return preferred
+    return actor.dirs?.[0]
+  }
+
+  private async newSession(key: string, cwd: string, actor: Actor): Promise<string> {
     if (!(await isDirectory(cwd))) throw new Error(this.t.badWorkspace(cwd))
+    if (!mayUse(actor, cwd)) throw new Error(this.t.dirDenied(actor.dirs ?? []))
     const s = this.settings()
-    const sessionId = await this.harness.createSession(cwd, s.agentPreset, s.permissionPreset, s.model)
+    const sessionId = await this.harness.createSession(cwd, s.agentPreset, actor.preset ?? s.permissionPreset, s.model)
     await this.store.update(key, { sessionId })
     await this.chatLog?.bind(key, sessionId).catch(() => {})
     return sessionId
   }
 
   /** The chat's Session, creating one in the default directory when it has none. */
-  private async ensureSession(key: string): Promise<string | undefined> {
+  private async ensureSession(key: string, actor: Actor): Promise<string | undefined> {
     const existing = this.store.get(key).sessionId
     if (existing !== undefined) return existing
-    const cwd = this.defaultWorkspace(key)
+    const cwd = this.workspaceFor(key, actor)
     if (cwd === undefined) {
       await this.reply(key, this.t.noWorkspace)
       return undefined
     }
-    const sessionId = await this.newSession(key, cwd)
+    const sessionId = await this.newSession(key, cwd, actor)
     await this.reply(key, this.t.created(sessionId, cwd))
     return sessionId
   }
@@ -1263,8 +1298,8 @@ export class Switchboard {
    * while it is worked on.
    * @param source - the person's message, for its reaction.
    */
-  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', source?: string): Promise<void> {
-    const sessionId = await this.ensureSession(key)
+  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', actor: Actor, source?: string): Promise<void> {
+    const sessionId = await this.ensureSession(key, actor)
     if (sessionId === undefined) return
     await this.promptSession(key, sessionId, parts, mode, source)
   }
@@ -1978,11 +2013,12 @@ export class Switchboard {
       await channel.ack(action, t.unauthorized(action.from.id))
       return
     }
-    if (action.data.startsWith('pk:')) return this.handlePick(line, action)
+    const actor = this.actorOf(this.settingsOf(line), action.from)
+    if (action.data.startsWith('pk:')) return this.handlePick(line, action, actor)
     if (action.data.startsWith('st:')) return this.handleStop(line, action)
     if (action.data.startsWith('qs:') || action.data.startsWith('qx:')) return this.handleQueued(line, action)
-    if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action)
-    if (action.data.startsWith('mn:')) return this.handleMenu(line, action)
+    if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action, actor)
+    if (action.data.startsWith('mn:')) return this.handleMenu(line, action, actor)
     if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action)
     const match = /^ap:([\w-]+):([yn])$/u.exec(action.data)
     if (match === null) {
@@ -1992,6 +2028,11 @@ export class Switchboard {
     const pending = this.approvals.get(match[1] ?? '')
     if (pending === undefined) {
       await channel.ack(action, t.approvalGone)
+      return
+    }
+    // Guests watch; someone else (or the Web UI) answers.
+    if (actor.role === 'guest') {
+      await channel.ack(action, t.approvalNotYours)
       return
     }
     const who = action.from.username === undefined ? action.from.name : `@${action.from.username}`
@@ -2038,7 +2079,7 @@ export class Switchboard {
     })
   }
 
-  private async handleMenu(line: LiveLine, action: InboundAction): Promise<void> {
+  private async handleMenu(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
     await line.channel.ack(action)
     if (action.chat === undefined) return
     const key = chatKey(line.line.id, action.chat.id)
@@ -2047,13 +2088,13 @@ export class Switchboard {
     // Compact is a Harness command: without a Session it would reach the Agent as text.
     if (command === 'compact' && this.store.get(key).sessionId === undefined) return this.reply(key, this.t.noSession)
     try {
-      await this.runCommand(key, command, '')
+      await this.runCommand(key, command, '', actor)
     } catch (error: unknown) {
       await this.reply(key, this.t.failed(describe(error)))
     }
   }
 
-  private async handleReplyAction(line: LiveLine, action: InboundAction): Promise<void> {
+  private async handleReplyAction(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
     const [, id = '', verb = ''] = action.data.split(':')
     const actions = this.replyActions.get(id)
     if (actions === undefined) {
@@ -2066,13 +2107,13 @@ export class Switchboard {
       if (verb === 'c') await this.promptSession(key, actions.sessionId, [{ type: 'text', text: this.t.continuePrompt }], 'queue')
       else if (verb === 'r' && actions.retry !== undefined) await this.promptSession(key, actions.sessionId, actions.retry, 'queue')
       else if (verb === 'd') await this.sendChanges(key, actions)
-      else if (verb === 'n') await this.runCommand(key, 'new', '')
+      else if (verb === 'n') await this.runCommand(key, 'new', '', actor)
     } catch (error: unknown) {
       await this.reply(key, this.t.failed(describe(error)))
     }
   }
 
-  private async handlePick(line: LiveLine, action: InboundAction): Promise<void> {
+  private async handlePick(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
     const [, id = '', index = ''] = action.data.split(':')
     const picker = this.pickers.get(id)
     if (picker === undefined || action.chat === undefined) {
@@ -2081,9 +2122,13 @@ export class Switchboard {
     }
     await line.channel.ack(action)
     const key = chatKey(line.line.id, action.chat.id)
+    // Each press is checked against whoever pressed, not whoever asked for the list.
+    if (picker.kind === 'mode' && actor.role !== 'admin') return this.reply(key, this.t.adminOnly)
+    if (picker.kind === 'model' && actor.role === 'guest') return this.reply(key, this.t.adminOnly)
     if (picker.kind === 'session') {
       const sessionId = picker.choices[Number(index)]
       if (sessionId === undefined) return
+      if (!(await this.mayUseSession(actor, sessionId))) return this.reply(key, this.t.dirDenied(actor.dirs ?? []))
       await this.store.update(key, { sessionId })
       await this.chatLog?.bind(key, sessionId).catch(() => {})
       this.attachToWorkspace(sessionId)
@@ -2093,7 +2138,7 @@ export class Switchboard {
       const cwd = picker.choices[Number(index)]
       if (cwd === undefined) return
       try {
-        const sessionId = await this.newSession(key, cwd)
+        const sessionId = await this.newSession(key, cwd, actor)
         return await this.reply(key, this.t.created(sessionId, cwd))
       } catch (error: unknown) {
         return this.reply(key, this.t.failed(describe(error)))

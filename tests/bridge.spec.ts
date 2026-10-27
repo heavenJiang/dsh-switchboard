@@ -697,6 +697,42 @@ describe('menus and context', () => {
   })
 })
 
+describe('people', () => {
+  it('keeps a member to their directory and preset', async () => {
+    const { mkdir } = await import('node:fs/promises')
+    const allowed = join(dir, 'team')
+    await mkdir(allowed)
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'member', preset: 'read-only', dirs: [allowed] }] }
+    // The chat's default directory is outside: the first message starts in theirs.
+    telegram.push(text(USER, 'hello'))
+    await until(() => harness.created.length === 1)
+    expect(harness.created[0]).toMatchObject({ cwd: allowed, permissionPreset: 'read-only' })
+    telegram.push(text(USER, `/new ${dir}`))
+    await until(() => telegram.sent().some(t => t.includes('You can work only in')))
+    expect(harness.created).toHaveLength(1)
+    telegram.push(text(USER, `/cwd ${tmpdir()}`))
+    await until(() => telegram.sent().filter(t => t.includes('You can work only in')).length === 2)
+    telegram.push(text(USER, '/mode'))
+    await until(() => telegram.sent().includes('This needs admin rights.'))
+    // Sessions outside their directories are not listed (the fake's only one runs in /tmp).
+    telegram.push(text(USER, '/sessions'))
+    await until(() => telegram.sent().includes('No Sessions.'))
+  })
+
+  it('lets guests watch but not answer approvals', async () => {
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'guest' }] }
+    await store.update(KEY, { sessionId: 's5' })
+    const outcome = bridge.requestApproval({ sessionId: 's5', toolName: 'bash' })
+    const isPrompt = (c: { method: string; params: Record<string, unknown> }) => c.method === 'sendMessage' && String(c.params['text']).includes('Approval needed')
+    await until(() => telegram.calls.some(isPrompt))
+    const markup = telegram.calls.find(isPrompt)!.params['reply_markup'] as { inline_keyboard: { callback_data: string }[][] }
+    telegram.push({ callback_query: { id: 'q', from: USER, data: markup.inline_keyboard[0]![0]!.callback_data } })
+    await until(() => telegram.calls.some(c => c.method === 'answerCallbackQuery'))
+    expect(telegram.calls.find(c => c.method === 'answerCallbackQuery')?.params['text']).toContain('cannot answer approvals')
+    void outcome
+  })
+})
+
 describe('approval detail', () => {
   it('shows edits as a diff and writes as their opening lines', () => {
     expect(approvalDetail('edit', JSON.stringify({ file_path: '/app/a.ts', old_string: 'let a = 1', new_string: 'const a = 1\nconst b = 2' })))

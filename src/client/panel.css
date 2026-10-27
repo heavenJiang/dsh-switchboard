@@ -1086,3 +1086,44 @@ a.tgb-button { text-decoration: none; }
 .tgb-settings { display: grid; }
 .tgb-line-card, .tgb-people, .tgb-person-main { min-width: 0; }
 .tgb-add-row { grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); }
+
+/* ── members: roles ────────────────────────────────────────── */
+
+.tgb-person-block + .tgb-person-block { border-top: 1px solid var(--dsw-alias-border-l2); }
+.tgb-person-block .tgb-person + .tgb-person { border-top: 0; }
+
+.tgb-role {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 12px;
+}
+
+.tgb-person-scope {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .tgb-person-scope:hover { color: var(--dsw-alias-label-primary); }
+}
+
+.tgb-person-editor {
+  display: grid;
+  gap: 12px;
+  padding: 4px 14px 14px 62px;
+}
+
+@container tgb (max-width: 560px) {
+  .tgb-person-editor { padding-left: 14px; }
+}

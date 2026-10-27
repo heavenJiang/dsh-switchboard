@@ -10,6 +10,20 @@ import type { TelegramBridgeLocaleKey } from './locales.ts'
 
 type T = (key: TelegramBridgeLocaleKey) => string
 
+export type Role = 'admin' | 'member' | 'guest'
+
+/** One person's configured rights. */
+export interface PersonValue {
+  line: string
+  id: string
+  role: Role
+  preset?: string
+  dirs?: string[]
+}
+
+/** Permission presets a member's Sessions may use. */
+const PRESETS: [string, TelegramBridgeLocaleKey][] = [['read-only', 'presetReadOnly'], ['workspace-write', 'presetWorkspaceWrite'], ['danger-full-access', 'presetFullAccess']]
+
 const IGNORED_KEY = 'dsh-switchboard:ignored-requests'
 
 /** Requests the viewer dismissed, kept in this browser only. */
@@ -39,11 +53,19 @@ export function MembersView(props: {
   t: T
   lines: readonly LineValue[]
   chats: readonly ChatSummary[] | undefined
+  people: readonly PersonValue[]
+  /** The working directory people without directories are kept to. */
+  defaultDir: string
   busy: boolean
   onAllow: (chat: ChatSummary) => void
   onRemove: (lineId: string, userId: string) => void
+  /** Store a person's rights; admin removes the record. */
+  onPerson: (person: PersonValue) => void
 }): ReactNode {
   const { t, lines, chats } = props
+  const [open, setOpen] = useState<string | undefined>(undefined)
+  const recordOf = (lineId: string, userId: string): PersonValue => props.people.find(person => person.line === lineId && person.id.toLowerCase() === userId.toLowerCase())
+    ?? { line: lineId, id: userId, role: 'admin' }
   const [ignored, setIgnored] = useState(readIgnored)
   const pending = pendingRequests(chats ?? [], ignored)
   const lineName = (id: string | undefined): string => {
@@ -107,29 +129,106 @@ export function MembersView(props: {
             <ul className="tgb-people">
               {members.map(({ line, userId, chat }) => {
                 const name = chat?.sender?.name ?? userId
+                const rowKey = `${line.id}:${userId}`
+                const record = recordOf(line.id, userId)
+                const expanded = open === rowKey && record.role !== 'admin'
                 return (
-                  <li key={`${line.id}:${userId}`} className="tgb-person">
-                    <Initial name={name} />
-                    <span className="tgb-person-main">
-                      <span className="tgb-person-name">{name}</span>
-                      <span className="tgb-person-meta">
-                        <ChannelMark type={line.type} /> {lineName(line.id)}
-                        {chat?.sender !== undefined && <> · <code>{userId}</code></>}
-                        {chat !== undefined && <> · {t('membersLastSeen').replace('{time}', when(chat.lastAt))}</>}
+                  <li key={rowKey} className="tgb-person-block">
+                    <div className="tgb-person">
+                      <Initial name={name} />
+                      <span className="tgb-person-main">
+                        <span className="tgb-person-name">{name}</span>
+                        <span className="tgb-person-meta">
+                          <ChannelMark type={line.type} /> {lineName(line.id)}
+                          {chat?.sender !== undefined && <> · <code>{userId}</code></>}
+                          {chat !== undefined && <> · {t('membersLastSeen').replace('{time}', when(chat.lastAt))}</>}
+                        </span>
+                        {record.role !== 'admin' && (
+                          <button type="button" className="tgb-person-scope" onClick={() => { setOpen(expanded ? undefined : rowKey) }}>
+                            {scopeLabel(t, record, props.defaultDir)} {expanded ? '▴' : '▾'}
+                          </button>
+                        )}
                       </span>
-                    </span>
-                    <span className="tgb-person-actions">
-                      <button type="button" className="tgb-button tgb-button-quiet" disabled={props.busy}
-                        onClick={() => {
-                          if (window.confirm(t('membersRemoveConfirm').replace('{name}', name).replace('{line}', lineName(line.id)))) props.onRemove(line.id, userId)
-                        }}>{t('membersRemove')}</button>
-                    </span>
+                      <span className="tgb-person-actions">
+                        <select className="tgb-role" aria-label={t('membersRole')} value={record.role} disabled={props.busy}
+                          onChange={(event) => {
+                            const role = event.target.value as Role
+                            props.onPerson({ ...record, role })
+                            if (role !== 'admin') setOpen(rowKey)
+                          }}>
+                          <option value="admin">{t('roleAdmin')}</option>
+                          <option value="member">{t('roleMember')}</option>
+                          <option value="guest">{t('roleGuest')}</option>
+                        </select>
+                        <button type="button" className="tgb-button tgb-button-quiet" disabled={props.busy}
+                          onClick={() => {
+                            if (window.confirm(t('membersRemoveConfirm').replace('{name}', name).replace('{line}', lineName(line.id)))) props.onRemove(line.id, userId)
+                          }}>{t('membersRemove')}</button>
+                      </span>
+                    </div>
+                    {expanded && <PersonEditor t={t} record={record} defaultDir={props.defaultDir} busy={props.busy} onSave={props.onPerson} />}
                   </li>
                 )
               })}
             </ul>
           )}
       </section>
+    </div>
+  )
+}
+
+/** One line about what a member or guest may do. */
+function scopeLabel(t: T, record: PersonValue, defaultDir: string): string {
+  const preset = record.role === 'guest' ? 'read-only' : record.preset ?? 'workspace-write'
+  const presetName = t(PRESETS.find(([value]) => value === preset)?.[1] ?? 'presetWorkspaceWrite')
+  const dirs = record.dirs ?? []
+  const where = dirs.length === 0 ? (defaultDir === '' ? t('scopeNoDir') : tildeShort(defaultDir)) : dirs.length === 1 ? tildeShort(dirs[0]!) : t('scopeDirs').replace('{n}', String(dirs.length))
+  return `${presetName} · ${where}`
+}
+
+function tildeShort(path: string): string {
+  const parts = path.replace(/[\\/]+$/u, '').split(/[\\/]/u)
+  return parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : path
+}
+
+/** A member's or guest's preset and directories, saved together. */
+function PersonEditor(props: { t: T; record: PersonValue; defaultDir: string; busy: boolean; onSave: (person: PersonValue) => void }): ReactNode {
+  const { t, record } = props
+  const [preset, setPreset] = useState(record.preset ?? 'workspace-write')
+  const [dirs, setDirs] = useState((record.dirs ?? []).join('\n'))
+  const parsed = dirs.split(/\n|,/u).map(dir => dir.trim()).filter(dir => dir !== '')
+  const invalid = parsed.some(dir => !/^(\/|[a-z]:[\\/])/iu.test(dir))
+  const changed = preset !== (record.preset ?? 'workspace-write') || parsed.join('\n') !== (record.dirs ?? []).join('\n')
+  return (
+    <div className="tgb-person-editor">
+      {record.role === 'member' && (
+        <label className="tgb-line-field">
+          <span>{t('membersPreset')}</span>
+          <select className="tgb-select" value={preset} disabled={props.busy} onChange={(event) => { setPreset(event.target.value) }}>
+            {PRESETS.map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
+            {!PRESETS.some(([value]) => value === preset) && <option value={preset}>{preset}</option>}
+          </select>
+          <span className="tgb-muted tgb-small">{t('membersPresetHint')}</span>
+        </label>
+      )}
+      {record.role === 'guest' && <p className="tgb-muted tgb-small">{t('membersGuestHint')}</p>}
+      <label className="tgb-line-field">
+        <span>{t('membersDirs')}</span>
+        <textarea className="tgb-textarea" rows={2} value={dirs} placeholder={props.defaultDir} disabled={props.busy}
+          aria-invalid={invalid} onChange={(event) => { setDirs(event.target.value) }} />
+        <span className={invalid ? 'tgb-line-error' : 'tgb-muted tgb-small'}>
+          {invalid ? t('membersDirsInvalid') : t('membersDirsHint').replace('{dir}', props.defaultDir === '' ? t('scopeNoDir') : props.defaultDir)}
+        </span>
+      </label>
+      <div className="tgb-link-row">
+        <button type="button" className="tgb-button tgb-button-primary" disabled={props.busy || !changed || invalid}
+          onClick={() => {
+            props.onSave({
+              line: record.line, id: record.id, role: record.role, dirs: parsed,
+              ...(record.role === 'member' ? { preset } : {}),
+            })
+          }}>{t('save')}</button>
+      </div>
     </div>
   )
 }

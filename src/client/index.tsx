@@ -36,7 +36,7 @@ import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'r
 import { en, zh, type TelegramBridgeLocaleKey } from './locales.ts'
 import type { ChatSummary } from '../history-types.ts'
 import { LinesEditor, lineOf, registeredRow, rowOf, rowsValid, type LineRow, type LineState, type LineValue } from './LinesEditor.tsx'
-import { MembersView } from './MembersView.tsx'
+import { MembersView, type PersonValue } from './MembersView.tsx'
 import panelCss from './panel.css'
 import { ConsoleIcon, createTelegramPanel } from './TelegramPanel.tsx'
 import { remotes, trackRemotes } from './remotes.ts'
@@ -64,6 +64,7 @@ const PANEL_ID = 'switchboard' as MainPanelId
 interface BridgeValues {
   enabled?: boolean
   lines?: LineValue[]
+  people?: PersonValue[]
   allowedUsers?: string[]
   workspacePath?: string
   agentPreset?: string
@@ -396,18 +397,32 @@ export function createMembers(form: ConfigForm<BridgeValues>) {
     const snapshot = useSyncExternalStore(form.subscribe.bind(form), form.getSnapshot.bind(form))
     const [busy, setBusy] = useState(false)
     const lines = storedLines(snapshot.value ?? {})
-    const write = (next: LineValue[]): Promise<boolean> => {
+    const people = snapshot.value?.people ?? []
+    const write = (next: { lines?: LineValue[]; people?: PersonValue[] }): Promise<boolean> => {
       setBusy(true)
-      return form.mutate([{ op: 'set', path: ['lines'], value: next as unknown as PathValue }], snapshot.revision)
-        .catch(() => false).finally(() => { setBusy(false) })
+      const ops: PathOp[] = [
+        ...(next.lines === undefined ? [] : [{ op: 'set' as const, path: ['lines'], value: next.lines as unknown as PathValue }]),
+        ...(next.people === undefined ? [] : [{ op: 'set' as const, path: ['people'], value: next.people as unknown as PathValue }]),
+      ]
+      return form.mutate(ops, snapshot.revision).catch(() => false).finally(() => { setBusy(false) })
     }
+    const same = (person: PersonValue, line: string, id: string) => person.line === line && person.id.toLowerCase() === id.toLowerCase()
     return (
-      <MembersView t={t} lines={lines} chats={chats} busy={busy || !snapshot.writable}
+      <MembersView t={t} lines={lines} chats={chats} people={people} defaultDir={snapshot.value?.workspacePath ?? ''} busy={busy || !snapshot.writable}
+        onPerson={(person) => {
+          const rest = people.filter(other => !same(other, person.line, person.id))
+          // Admin is the default: no record needed.
+          void write({ people: person.role === 'admin' ? rest : [...rest, person] })
+        }}
         onAllow={(chat) => {
           const lineId = chat.line ?? 'telegram'
           const id = String(chat.sender?.id ?? '')
           if (id === '') return
-          void write(lines.map(line => line.id === lineId && !line.allowedUsers.includes(id) ? { ...line, allowedUsers: [...line.allowedUsers, id] } : line))
+          // People let in from here start as members, kept to the default directory.
+          void write({
+            lines: lines.map(line => line.id === lineId && !line.allowedUsers.includes(id) ? { ...line, allowedUsers: [...line.allowedUsers, id] } : line),
+            people: [...people.filter(other => !same(other, lineId, id)), { line: lineId, id, role: 'member', dirs: [] }],
+          })
             .then((accepted) => {
               // Tell the person they can start; a failure here only costs the greeting.
               if (accepted) {
@@ -418,7 +433,10 @@ export function createMembers(form: ConfigForm<BridgeValues>) {
             })
         }}
         onRemove={(lineId, userId) => {
-          void write(lines.map(line => line.id === lineId ? { ...line, allowedUsers: line.allowedUsers.filter(id => id !== userId) } : line))
+          void write({
+            lines: lines.map(line => line.id === lineId ? { ...line, allowedUsers: line.allowedUsers.filter(id => id !== userId) } : line),
+            people: people.filter(other => !same(other, lineId, userId)),
+          })
         }} />
     )
   }
