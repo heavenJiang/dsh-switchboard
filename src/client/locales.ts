@@ -252,6 +252,8 @@ export const en = {
   membersLastSeen: 'last {time}',
   membersWelcome: '✅ You can use this bot now. Just send a message to start.',
   lineUnset: 'Not set up',
+  longReplyChars: 'Long reply as a file (characters)',
+  longReplyCharsHint: 'Replies longer than this arrive as a short preview plus the full text as a Markdown file. 0 never.',
 } as const
 
 /** Dictionary keys. */
@@ -509,4 +511,6 @@ export const zh: Record<TelegramBridgeLocaleKey, string> = {
   membersLastSeen: '最近 {time}',
   membersWelcome: '✅ 你已获准使用这个机器人，直接发消息即可开始。',
   lineUnset: '未配置',
+  longReplyChars: '长回复转文件（字数）',
+  longReplyCharsHint: '超过这个字数的回复，只发开头一段并附上完整内容的 Markdown 文件。0 表示不转换。',
 }

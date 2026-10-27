@@ -16,6 +16,7 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { BindingStore, PendingChoice } from './bindings.ts'
 import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
@@ -66,6 +67,8 @@ export interface BridgeSettings {
   readonly maxDownloadMb: number
   /** Send files the Agent presents back to the chat. */
   readonly sendDeliverables: boolean
+  /** Replies longer than this many characters go as a Markdown file with a short preview; 0 never. */
+  readonly longReplyChars?: number
   /** Chat keys told when a line stays down; the schedule chats when empty. */
   readonly alertChats?: readonly string[]
   /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
@@ -127,6 +130,7 @@ export interface StagedFileInput {
 /** One Session row for `/sessions`. */
 export interface SessionRow {
   readonly sessionId: string
+  readonly title?: string
   readonly cwd?: string
   readonly updatedAt: number
   readonly running: boolean
@@ -270,6 +274,8 @@ interface PendingQuestions {
 type Picker =
   | { kind: 'model'; sessionId: string; choices: { choice: ModelChoice; name: string }[]; at: number }
   | { kind: 'mode'; sessionId: string; choices: PresetOption[]; at: number }
+  | { kind: 'session'; choices: string[]; at: number }
+  | { kind: 'dir'; choices: string[]; at: number }
 
 /** How a bot message is labelled in the chat history. */
 type OutKind = 'assistant' | 'tool' | 'notice'
@@ -367,7 +373,7 @@ export type BridgeState = LineState
 
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
-  'start', 'help', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
+  'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
   'status', 'model', 'mode', 'get', 'whoami',
 ])
 /** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
@@ -633,7 +639,14 @@ export class Switchboard {
     if (payload.kind === 'file') return this.sendLocalFileNow(channel, chat, key, payload.path, payload.description, note)
     const text = note === undefined ? payload.text : `${note}\n\n${payload.text}`
     if (payload.kind === 'markdown') {
-      const sent = await channel.sendMarkdown(chat, text, replaceId)
+      // A very long reply reads better as a file: a preview here, the whole text attached.
+      const limit = this.settings().longReplyChars ?? 0
+      const long = limit > 0 && payload.text.length > limit
+      const sent = await channel.sendMarkdown(chat, long ? `${note === undefined ? '' : `${note}\n\n`}${replyPreview(payload.text, Math.min(1200, Math.floor(limit / 2)))}${this.t.longReply(payload.text.length)}` : text, replaceId)
+      if (long) {
+        const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/gu, '')
+        await channel.sendFile(chat, { data: new TextEncoder().encode(payload.text), name: `${this.t.longReplyName}-${stamp}.md`, photo: false })
+      }
       this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text: payload.text }, sessionId)
       // A live reply may get the turn's buttons; a late one does not.
       if (sent !== undefined && sessionId !== undefined && note === undefined) {
@@ -740,6 +753,7 @@ export class Switchboard {
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
     entry.menuHasHarness = extra.length > 0
     await entry.channel.setMenu([
+      { command: 'menu', description: t.cmdMenu },
       { command: 'new', description: t.cmdNew },
       { command: 'stop', description: t.cmdStop },
       { command: 'model', description: t.cmdModel },
@@ -809,7 +823,7 @@ export class Switchboard {
       if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
       if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
-      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: parsed.text }], 'queue', message.messageId)
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], 'queue', message.messageId)
       return await this.runCommand(key, parsed.name, parsed.args)
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
@@ -828,7 +842,7 @@ export class Switchboard {
     if (sessionId === undefined) return
     const limit = this.settings().maxDownloadMb * 1024 * 1024
     const parts: PromptPart[] = []
-    const caption = (message.text ?? '').trim()
+    const caption = this.withQuote((message.text ?? '').trim(), message.quote)
     const logged: ChatAttachment[] = []
     this.startTyping(sessionId)
     for (const attachment of message.attachments) {
@@ -879,10 +893,17 @@ export class Switchboard {
     }
     if (transcript === '') return this.reply(key, t.voiceEmpty)
     const caption = (message.text ?? '').trim()
-    const text = caption === '' ? transcript : `${caption}\n\n${transcript}`
+    const text = this.withQuote(caption === '' ? transcript : `${caption}\n\n${transcript}`, message.quote)
     this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
     await this.reply(key, t.voiceHeard(transcript))
     await this.promptFromChat(key, [{ type: 'text', text }], 'queue', message.messageId)
+  }
+
+  /** Prefix a prompt with the message it quotes, so the Agent knows what "this" refers to. */
+  private withQuote(text: string, quote: string | undefined): string {
+    if (quote === undefined || quote.trim() === '') return text
+    const quoted = this.t.quoted(quote.trim())
+    return text === '' ? quoted : `${quoted}\n\n${text}`
   }
 
   /** Describe an attachment for the history, keeping a copy of images the viewer can show. */
@@ -900,6 +921,8 @@ export class Switchboard {
     const binding = this.store.get(key)
     switch (name) {
       case 'start':
+      case 'menu':
+        return this.sendMenu(key, name === 'start')
       case 'help': {
         const commands = (await this.harness.listCommands(binding.sessionId).catch(() => []))
           .filter(command => !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
@@ -909,6 +932,14 @@ export class Switchboard {
         return this.reply(key, lines.length === 0 ? t.help : `${t.help}\n\n${t.harnessCommands}\n${lines.join('\n')}`)
       }
       case 'new': {
+        if (args === '') {
+          // Recent directories as buttons; with only the default, start right there.
+          const dirs = await this.recentDirs(key)
+          if (dirs.length > 1) {
+            return this.sendPicker(key, { kind: 'dir', choices: dirs, at: Date.now() },
+              dirs.map((dir, index) => `${index === 0 && dir === this.defaultWorkspace(key) ? '⭐ ' : '📁 '}${tildify(dir)}`), t.newPick)
+          }
+        }
         const cwd = args === '' ? this.defaultWorkspace(key) : args
         if (cwd === undefined) return this.reply(key, t.noWorkspace)
         const sessionId = await this.newSession(key, cwd)
@@ -931,9 +962,12 @@ export class Switchboard {
       case 'sessions': {
         const rows = (await this.harness.listSessions()).slice(0, 10)
         this.listings.set(key, rows.map(row => row.sessionId))
+        if (rows.length === 0) return this.reply(key, t.sessions([]))
         const lines = rows.map((row, index) =>
-          `${index + 1}. ${row.running ? '▶' : '·'} ${row.sessionId}${row.cwd === undefined ? '' : `  ${row.cwd}`}${row.sessionId === binding.sessionId ? ' ✓' : ''}`)
-        return this.reply(key, t.sessions(lines))
+          `${index + 1}. ${row.running ? '▶' : '·'} ${row.title ?? row.sessionId}${row.cwd === undefined ? '' : `  ${tildify(row.cwd)}`}${row.sessionId === binding.sessionId ? ' ✓' : ''}`)
+        const labels = rows.map((row, index) =>
+          `${row.sessionId === binding.sessionId ? '✓ ' : ''}${index + 1}. ${truncate(row.title ?? shortId(row.sessionId), 36)}${row.running ? ' ▶' : ''}`)
+        return this.sendPicker(key, { kind: 'session', choices: rows.map(row => row.sessionId), at: Date.now() }, labels, `${t.sessions(lines)}\n\n${t.sessionsPick}`)
       }
       case 'watch': {
         if (args === '') return this.reply(key, t.watching((binding.watch ?? []).map(id => `· ${id}`)))
@@ -1017,6 +1051,36 @@ export class Switchboard {
     void this.harness.ensureWorkspace(sessionId).catch((error: unknown) => {
       this.logger.warn(`switchboard: could not add ${sessionId} to a Web workspace: ${describe(error)}`)
     })
+  }
+
+  /** The menu of common actions, as buttons. */
+  private async sendMenu(key: string, withHelp: boolean): Promise<void> {
+    const t = this.t
+    const sessionId = this.store.get(key).sessionId
+    const title = sessionId === undefined ? undefined
+      : (await this.harness.listSessions().catch(() => [])).find(row => row.sessionId === sessionId)?.title ?? shortId(sessionId)
+    const text = withHelp ? `${t.help}\n\n${t.menu(title)}` : t.menu(title)
+    const buttons: Button[][] = [
+      [{ text: t.menuNew, data: 'mn:new' }, { text: t.menuSessions, data: 'mn:sessions' }],
+      [{ text: t.menuModel, data: 'mn:model' }, { text: t.menuMode, data: 'mn:mode' }],
+      [{ text: t.menuStop, data: 'mn:stop' }, { text: t.menuCompact, data: 'mn:compact' }],
+      [{ text: t.menuStatus, data: 'mn:status' }, { text: t.menuHelp, data: 'mn:help' }],
+    ]
+    await this.enqueue(key, async (channel, chat) => { await channel.send(chat, { text, buttons }) })
+    this.log({ chatId: key }, { dir: 'out', kind: 'notice', text })
+  }
+
+  /** Directories offered by `/new`: the chat's default first, then where recent Sessions ran. */
+  private async recentDirs(key: string): Promise<string[]> {
+    const dirs: string[] = []
+    const fallback = this.defaultWorkspace(key)
+    if (fallback !== undefined) dirs.push(fallback)
+    for (const row of await this.harness.listSessions().catch(() => [])) {
+      if (row.cwd === undefined || dirs.some(dir => samePath(dir, row.cwd!))) continue
+      if (await isDirectory(row.cwd)) dirs.push(row.cwd)
+      if (dirs.length >= 6) break
+    }
+    return dirs
   }
 
   /** Put every linked Session into its directory's Web Workspace (startup backfill). */
@@ -1752,7 +1816,7 @@ export class Switchboard {
     const t = this.t
     const id = randomUUID().slice(0, 12)
     const call = request.callId === undefined ? undefined : this.toolCalls.get(request.callId)
-    const detail = call === undefined ? '' : previewArguments(call.arguments, 800)
+    const detail = call === undefined ? '' : approvalDetail(call.name, call.arguments)
     const text = t.approvalAsk(request.toolName, detail, request.reason)
     const buttons: Button[][] = [[
       { text: t.allow, data: `ap:${id}:y` },
@@ -1918,6 +1982,7 @@ export class Switchboard {
     if (action.data.startsWith('st:')) return this.handleStop(line, action)
     if (action.data.startsWith('qs:') || action.data.startsWith('qx:')) return this.handleQueued(line, action)
     if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action)
+    if (action.data.startsWith('mn:')) return this.handleMenu(line, action)
     if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action)
     const match = /^ap:([\w-]+):([yn])$/u.exec(action.data)
     if (match === null) {
@@ -1973,6 +2038,21 @@ export class Switchboard {
     })
   }
 
+  private async handleMenu(line: LiveLine, action: InboundAction): Promise<void> {
+    await line.channel.ack(action)
+    if (action.chat === undefined) return
+    const key = chatKey(line.line.id, action.chat.id)
+    const command = action.data.slice(3)
+    if (!['new', 'sessions', 'model', 'mode', 'stop', 'compact', 'status', 'help'].includes(command)) return
+    // Compact is a Harness command: without a Session it would reach the Agent as text.
+    if (command === 'compact' && this.store.get(key).sessionId === undefined) return this.reply(key, this.t.noSession)
+    try {
+      await this.runCommand(key, command, '')
+    } catch (error: unknown) {
+      await this.reply(key, this.t.failed(describe(error)))
+    }
+  }
+
   private async handleReplyAction(line: LiveLine, action: InboundAction): Promise<void> {
     const [, id = '', verb = ''] = action.data.split(':')
     const actions = this.replyActions.get(id)
@@ -2001,6 +2081,24 @@ export class Switchboard {
     }
     await line.channel.ack(action)
     const key = chatKey(line.line.id, action.chat.id)
+    if (picker.kind === 'session') {
+      const sessionId = picker.choices[Number(index)]
+      if (sessionId === undefined) return
+      await this.store.update(key, { sessionId })
+      await this.chatLog?.bind(key, sessionId).catch(() => {})
+      this.attachToWorkspace(sessionId)
+      return this.reply(key, this.t.bound(sessionId))
+    }
+    if (picker.kind === 'dir') {
+      const cwd = picker.choices[Number(index)]
+      if (cwd === undefined) return
+      try {
+        const sessionId = await this.newSession(key, cwd)
+        return await this.reply(key, this.t.created(sessionId, cwd))
+      } catch (error: unknown) {
+        return this.reply(key, this.t.failed(describe(error)))
+      }
+    }
     if (picker.kind === 'model') {
       const picked = picker.choices[Number(index)]
       if (picked !== undefined) await this.switchModel(key, picker.sessionId, picked.choice, picked.name)
@@ -2056,6 +2154,52 @@ function draftPreview(text: string, limit: number): string {
   const trimmed = text.trimEnd()
   const body = trimmed.length > limit ? `…${trimmed.slice(-limit)}` : trimmed
   return `${body} ▍`
+}
+
+/** The opening of a long reply, cut at a paragraph break. */
+function replyPreview(text: string, limit = 1200): string {
+  if (text.length <= limit) return text
+  const head = text.slice(0, limit)
+  const cut = head.lastIndexOf('\n\n')
+  const body = cut > limit / 2 ? head.slice(0, cut) : head
+  // An unclosed code fence would swallow the note after it.
+  return (body.match(/^```/gmu)?.length ?? 0) % 2 === 1 ? `${body}\n\`\`\`` : body
+}
+
+/**
+ * What an approval shows of a call: a diff for file edits, the start of the
+ * content for writes, the arguments otherwise.
+ */
+export function approvalDetail(name: string, raw: string): string {
+  let args: Record<string, unknown>
+  try {
+    args = JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    return previewArguments(raw, 800)
+  }
+  const path = typeof args['file_path'] === 'string' ? args['file_path'] : undefined
+  const lines = (text: string, mark: string, max: number): string[] => {
+    const all = text.split('\n')
+    const shown = all.slice(0, max).map(line => `${mark} ${line}`)
+    return all.length > max ? [...shown, `${mark} … (+${all.length - max})`] : shown
+  }
+  if (name === 'edit' && path !== undefined && typeof args['old_string'] === 'string' && typeof args['new_string'] === 'string') {
+    return [`📝 ${path}${args['replace_all'] === true ? ' (all matches)' : ''}`, ...lines(args['old_string'], '-', 12), ...lines(args['new_string'], '+', 12)].join('\n')
+  }
+  if (name === 'write' && path !== undefined && typeof args['content'] === 'string') {
+    return [`📝 ${path}`, ...lines(args['content'], '+', 16)].join('\n')
+  }
+  return previewArguments(raw, 800)
+}
+
+/** A path with the home directory as `~`. */
+function tildify(path: string): string {
+  const home = homedir()
+  return path === home || path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path
+}
+
+function samePath(a: string, b: string): boolean {
+  return a.replace(/[\\/]+$/u, '') === b.replace(/[\\/]+$/u, '')
 }
 
 /** `git diff` of some files against HEAD, untracked files included as additions. */

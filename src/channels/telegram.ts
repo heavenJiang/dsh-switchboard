@@ -30,6 +30,8 @@ export interface TelegramChannelOptions {
 const MAX_BACKOFF_MS = 60_000
 /** How long to wait for the rest of an album before delivering it. */
 const MEDIA_GROUP_WAIT_MS = 1500
+/** Quoted text kept for context. */
+const QUOTE_LIMIT = 1500
 /** Telegram's document upload ceiling for bots. */
 const SEND_LIMIT_BYTES = 50 * 1024 * 1024
 
@@ -124,6 +126,7 @@ export class TelegramChannel implements Channel {
       ...(a.size === undefined ? {} : { size: a.size }),
     }))
     const voice = first.voice
+    const quoted = (first.reply_to_message?.text ?? first.reply_to_message?.caption ?? '').trim()
     return {
       chat: chat(first.chat, from),
       from: user(from),
@@ -131,6 +134,7 @@ export class TelegramChannel implements Channel {
       ...(text === undefined ? {} : { text }),
       addressed,
       attachments,
+      ...(quoted === '' ? {} : { quote: quoted.slice(0, QUOTE_LIMIT) }),
       ...(voice === undefined || messages.length > 1 ? {} : {
         voice: { ref: voice.file_id, name: `voice_${first.message_id}.ogg`, mediaType: 'audio/ogg', ...(voice.file_size === undefined ? {} : { size: voice.file_size }) },
       }),

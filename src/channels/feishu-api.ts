@@ -170,6 +170,15 @@ export function createFeishuApi(line: LineSettings, logger: { debug(message: str
       return readLimited(response.body as AsyncIterable<Uint8Array>, limit)
     },
 
+    async getMessage(messageId) {
+      const found = await data<{ items?: { msg_type?: string; body?: { content?: string }; sender?: { sender_type?: string } }[] }>(
+        'message lookup', 'GET', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+      )
+      const item = found?.items?.[0]
+      if (item?.msg_type === undefined || item.body?.content === undefined) return undefined
+      return { type: item.msg_type, content: item.body.content, fromBot: item.sender?.sender_type === 'app' }
+    },
+
     async userName(openId) {
       if (openId === '') return undefined
       const found = await data<{ user?: { name?: string } }>('user lookup', 'GET', `/open-apis/contact/v3/users/${encodeURIComponent(openId)}?user_id_type=open_id`)

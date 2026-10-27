@@ -39,9 +39,10 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | Command | Effect |
 | --- | --- |
 | text, photo, file, voice | Goes to the current Session; one is started in the default directory if needed |
-| `/new [dir]` | New Session |
+| `/menu` | Buttons for common actions (new session, sessions, model, mode, stop, compact, status, help); the easiest way in Feishu |
+| `/new [dir]` | New Session; without a directory, pick the default or a recent one |
 | `/cwd <dir>` | Working directory for this chat's new Sessions |
-| `/sessions` | Recent Sessions, numbered |
+| `/sessions` | Recent Sessions with titles, as buttons that switch |
 | `/use <n\|sessionId>` | Switch to an existing Session (Web ones too) |
 | `/watch [n\|sessionId]` | Follow a Session's completions and approvals; no argument lists them |
 | `/unwatch <n\|sessionId\|all>` | Stop following |
@@ -61,7 +62,8 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 - **Acknowledged at once**: your message gets 👀 (Feishu: OnIt) while it is worked on, cleared when done; a message sent during a running turn gets a "Queued" notice with **Steer now** and **Cancel**.
 - **Buttons under the reply**: **Continue**, **Retry**, **Show changes** (the turn's changes as a diff file, new files included), and **New session**; they move to the next reply.
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
-- **Approvals and questions**: **Allow once / Reject** buttons; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
+- **Context and long content**: replying to (quoting) a message sends its text along. Replies over **Long reply as a file** (6000 characters) arrive as a preview plus a Markdown file; Feishu cards fold code blocks over 15 lines.
+- **Approvals and questions**: **Allow once / Reject** buttons, with a diff for file edits; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
 - **Media**: photos and files are staged through `ctx.fileUploads`; images reach the model as images. Voice notes are transcribed by the Harness speech service via ffmpeg. Files the Agent presents are sent back.
 - **Nothing lost**: replies, turn notices, and presented files that cannot be sent (line down, or a send that certainly failed) wait in an outbox and go out, marked late, once the line is back; sends with an unknown outcome are not repeated. After a plugin restart, the final reply of each turn that ended meanwhile is sent (up to 3 per Session). A line down longer than **Outage alert after** (5 min) is reported to the **Line outage alert chats** through another line.
 - **Groups**: by default only commands, @mentions, and replies to the bot are answered. Authorize users or whole chats per line.

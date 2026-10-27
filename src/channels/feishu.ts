@@ -23,6 +23,7 @@ export interface FeishuMessageEvent {
   }
   readonly message: {
     readonly message_id: string
+    /** The message this one replies to. */
     readonly parent_id?: string
     readonly chat_id: string
     readonly chat_type: string
@@ -69,6 +70,8 @@ export interface FeishuApi {
   uploadFile(data: Uint8Array, name: string, fileType: string): Promise<string>
   /** Download a message's image or file. */
   download(messageId: string, key: string, type: 'image' | 'file', limit: number): Promise<Uint8Array>
+  /** A message's type, content, and whether a bot sent it; undefined when it cannot be read. */
+  getMessage(messageId: string): Promise<{ type: string; content: string; fromBot: boolean } | undefined>
   /** Display name of a user, when the app may read contacts. */
   userName(openId: string): Promise<string | undefined>
   /** Name of a group chat, when the app may read it. */
@@ -90,6 +93,10 @@ const CARD_TEXT_LIMIT = 8000
 const ACTION_REPLY_MS = 2500
 /** Feishu redelivers events it thinks were missed; remember this many ids. */
 const SEEN_LIMIT = 500
+/** Quoted text kept for context. */
+const QUOTE_LIMIT = 1500
+/** Code blocks longer than this fold into a panel in cards. */
+const FOLD_LINES = 15
 /** Name lookups give up after this long rather than delay a message. */
 const LOOKUP_MS = 2000
 
@@ -173,9 +180,15 @@ export class FeishuChannel implements Channel {
       text = text?.split(mention.key).join(self ? '' : `@${mention.name}`)
     }
     text = text?.replace(/[ \t]{2,}/gu, ' ').trim()
-    const [name, title] = await Promise.all([
+    const parent = message.parent_id
+    const [name, title, quoted] = await Promise.all([
       this.lookup(`u:${openId}`, () => this.options.api.userName(openId)),
       type === 'group' ? this.lookup(`c:${message.chat_id}`, () => this.options.api.chatName(message.chat_id)) : Promise.resolve(undefined),
+      parent === undefined || parent === '' ? Promise.resolve(undefined) : this.lookup(`m:${parent}`, async () => {
+        const found = await this.options.api.getMessage(parent)
+        // Cards (the bot's replies) carry their text in the card JSON.
+        return found === undefined ? undefined : found.type === 'interactive' ? cardPlainText(found.content) : parseContent(found.type, found.content, parent).text
+      }),
     ])
     const aliases = [sender.sender_id?.user_id, sender.sender_id?.union_id].filter((id): id is string => id !== undefined && id !== '')
     const userName = name ?? openId
@@ -187,6 +200,7 @@ export class FeishuChannel implements Channel {
       addressed: type === 'private' || botMentioned,
       attachments: parsed.attachments,
       ...(parsed.voice === undefined ? {} : { voice: parsed.voice }),
+      ...(quoted === undefined || quoted.trim() === '' ? {} : { quote: quoted.trim().slice(0, QUOTE_LIMIT) }),
     }
     await sink.message(inbound)
   }
@@ -254,13 +268,15 @@ export class FeishuChannel implements Channel {
     let first = true
     let last: SentMarkdown | undefined
     for (const piece of chunkMarkdown(markdown, CARD_TEXT_LIMIT)) {
-      const content = card({ markdown: piece })
-      if (first && replaceId !== undefined) {
-        await this.options.api.patchCard(replaceId, content)
-        last = { messageId: replaceId, markdown: piece }
-      } else {
-        last = { messageId: await this.options.api.sendMessage(chatId, 'interactive', content), markdown: piece }
-      }
+      // Long code folds into panels; should Feishu refuse that card, the piece goes as one plain Markdown block.
+      const send = (content: object) => first && replaceId !== undefined
+        ? this.options.api.patchCard(replaceId, content).then(() => replaceId)
+        : this.options.api.sendMessage(chatId, 'interactive', content)
+      const folded = foldedCard(piece)
+      const messageId = folded === undefined
+        ? await send(card({ markdown: piece }))
+        : await send(folded).catch(() => send(card({ markdown: piece })))
+      last = { messageId, markdown: piece }
       first = false
     }
     return last
@@ -373,6 +389,60 @@ function parsePost(content: Record<string, unknown>, image: (key: string) => Inb
   }
   const text = lines.join('\n').trim()
   return { ...(text === '' ? {} : { text }), attachments }
+}
+
+/** Plain text of a card (its Markdown and text elements), for quoting a bot reply. */
+export function cardPlainText(raw: string): string | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  const texts: string[] = []
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child)
+    } else if (node !== null && typeof node === 'object') {
+      const record = node as Record<string, unknown>
+      if ((record['tag'] === 'markdown' || record['tag'] === 'plain_text' || record['tag'] === 'lark_md' || record['tag'] === 'text') && typeof record['content'] === 'string') texts.push(record['content'])
+      else if (record['tag'] === 'text' && typeof record['text'] === 'string') texts.push(record['text'])
+      // Button labels are not part of the reply.
+      if (record['tag'] === 'button') return
+      for (const child of Object.values(record)) walk(child)
+    }
+  }
+  walk(value)
+  const text = texts.join('\n').trim()
+  return text === '' ? undefined : text
+}
+
+/**
+ * A Markdown card whose long fenced code blocks fold into collapsible panels;
+ * undefined when nothing is long enough to fold.
+ */
+export function foldedCard(markdown: string): object | undefined {
+  const parts = markdown.split(/(^```[^\n]*\n[\s\S]*?^```[ \t]*$)/mu)
+  const elements: object[] = []
+  let folded = false
+  for (const part of parts) {
+    if (part.trim() === '') continue
+    const fence = /^```([^\n]*)\n([\s\S]*?)^```[ \t]*$/mu.exec(part)
+    const lines = fence === null ? 0 : fence[2]!.split('\n').length - 1
+    if (fence !== null && lines > FOLD_LINES) {
+      folded = true
+      const language = fence[1]!.trim()
+      elements.push({
+        tag: 'collapsible_panel',
+        expanded: false,
+        header: { title: { tag: 'plain_text', content: `${language === '' ? 'code' : language} · ${lines} lines` } },
+        elements: [{ tag: 'markdown', content: part.trim() }],
+      })
+    } else {
+      elements.push({ tag: 'markdown', content: part.trim() })
+    }
+  }
+  return folded ? { schema: '2.0', config: { update_multi: true }, body: { elements } } : undefined
 }
 
 /** A card 2.0 with one text element and optional button rows; editable by every recipient. */

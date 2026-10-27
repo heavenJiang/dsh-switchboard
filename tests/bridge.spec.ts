@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BindingStore } from '../src/bindings.ts'
 import { ChatLog } from '../src/chatlog.ts'
-import { Switchboard, type BridgeSettings } from '../src/bridge.ts'
+import { approvalDetail, Switchboard, type BridgeSettings } from '../src/bridge.ts'
 import { FakeHarness } from './fakes.ts'
 import type { LineSettings } from '../src/lines.ts'
 import type { TgUpdate } from '../src/telegram.ts'
@@ -211,7 +211,13 @@ describe('TelegramBridge', () => {
     expect(store.get(KEY).workspacePath).toBeUndefined()
     telegram.push(text(USER, `/cwd ${tmpdir()}`))
     await until(() => store.get(KEY).workspacePath === tmpdir())
+    // /new offers the chat's directory first (⭐), then where recent Sessions ran.
     telegram.push(text(USER, '/new'))
+    await until(() => telegram.calls.some(c => c.method === 'sendMessage' && String(c.params['text']).startsWith('Start the new Session')))
+    const picker = telegram.calls.find(c => String(c.params['text']).startsWith('Start the new Session'))!
+    const rows = (picker.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard
+    expect(rows.map(row => row[0]!.text)).toEqual([`⭐ ${tmpdir()}`, '📁 /tmp'])
+    telegram.push({ callback_query: { id: 'q', from: USER, data: rows[0]![0]!.callback_data, message: { message_id: 9, chat: CHAT, date: 0 } } })
     await until(() => harness.created.length === 1)
     expect(harness.created[0]?.cwd).toBe(tmpdir())
   })
@@ -644,6 +650,65 @@ describe('interaction', () => {
   })
 })
 
+describe('menus and context', () => {
+  const buttons = (call: { params: Record<string, unknown> } | undefined) =>
+    (call?.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard
+  const press = (data: string) => telegram.push({ callback_query: { id: 'q', from: USER, data, message: { message_id: 9, chat: CHAT, date: 0 } } })
+
+  it('/menu offers common actions as buttons that run them', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/menu'))
+    await until(() => telegram.sent().some(t => t.startsWith('Switchboard · current Session')))
+    const rows = buttons(telegram.calls.find(c => String(c.params['text']).startsWith('Switchboard ·')))
+    expect(rows.flat().map(button => button.text)).toEqual(['🆕 New session', '📋 Sessions', '🧠 Model', '🔐 Mode', '⏹ Stop', '🗜 Compact context', '📊 Status', '❓ Help'])
+    press(rows.flat().find(button => button.text === '📊 Status')!.callback_data)
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    press(rows.flat().find(button => button.text === '🗜 Compact context')!.callback_data)
+    await until(() => harness.ran.some(run => run.line === '/compact'))
+  })
+
+  it('/sessions lists Sessions as buttons that switch to them', async () => {
+    telegram.push(text(USER, '/sessions'))
+    await until(() => telegram.sent().some(t => t.startsWith('Recent Sessions')))
+    const rows = buttons(telegram.calls.find(c => String(c.params['text']).startsWith('Recent Sessions')))
+    expect(rows[0]![0]!.text).toBe('1. s1')
+    press(rows[0]![0]!.callback_data)
+    await until(() => store.get(KEY).sessionId === 's1')
+  })
+
+  it('passes the quoted message along as context', async () => {
+    telegram.push({ message: { message_id: 5, from: USER, chat: CHAT, date: 0, text: 'fix this one',
+      reply_to_message: { message_id: 4, chat: CHAT, date: 0, text: 'Error: cannot read x\nat line 3' } } })
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: '> Error: cannot read x\n> at line 3\n\nfix this one' }])
+  })
+
+  it('sends a very long reply as a preview and a Markdown file', async () => {
+    settings = { ...settings, longReplyChars: 500 }
+    await store.update(KEY, { sessionId: 's1' })
+    const long = `${'Intro paragraph. '.repeat(10)}\n\n${'More detail here. '.repeat(60)}`
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }] } } })
+    await until(() => telegram.uploads.length === 1)
+    expect(telegram.uploads[0]).toMatchObject({ method: 'sendDocument', bytes: long.trim().length })
+    expect(telegram.uploads[0]!.name).toMatch(/^reply-\d{12}\.md$/u)
+    const preview = telegram.sent().find(t => t.includes('Long reply'))!
+    expect(preview.length).toBeLessThan(600)
+    expect(preview).toContain('Intro paragraph.')
+  })
+})
+
+describe('approval detail', () => {
+  it('shows edits as a diff and writes as their opening lines', () => {
+    expect(approvalDetail('edit', JSON.stringify({ file_path: '/app/a.ts', old_string: 'let a = 1', new_string: 'const a = 1\nconst b = 2' })))
+      .toBe('📝 /app/a.ts\n- let a = 1\n+ const a = 1\n+ const b = 2')
+    const content = Array.from({ length: 20 }, (_, i) => `line ${i}`).join('\n')
+    const write = approvalDetail('write', JSON.stringify({ file_path: '/app/b.md', content }))
+    expect(write.split('\n')).toHaveLength(18)
+    expect(write.split('\n').at(-1)).toBe('+ … (+4)')
+    expect(approvalDetail('bash', '{"command":"rm -rf build"}')).toBe('command: rm -rf build')
+  })
+})
+
 describe('turn summaries and following', () => {
   it('summarizes long turns with changed files for bound chats', async () => {
     await store.update(KEY, { sessionId: 's1' })
@@ -910,7 +975,7 @@ describe('harness commands', () => {
 
   it('lists Harness commands in /help and in the bot menu', async () => {
     const menu = telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands'] as { command: string }[]
-    expect(menu.map(c => c.command)).toEqual(['new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'help', 'compact', 'goal'])
+    expect(menu.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'help', 'compact', 'goal'])
     await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/help'))
     await until(() => telegram.sent().length === 1)

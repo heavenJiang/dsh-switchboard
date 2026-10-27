@@ -90,6 +90,7 @@ interface BridgeValues {
   scheduleChats?: string[]
   alertChats?: string[]
   alertAfterMin?: number
+  longReplyChars?: number
   transcribeVoice?: boolean
   ffmpegPath?: string
   showPanel?: boolean
@@ -108,7 +109,7 @@ interface ModelDraft { provider?: string; model?: string; effort?: string }
 
 type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
-  | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin'
+  | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'longReplyChars'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
   | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
@@ -129,6 +130,7 @@ const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; pars
   scheduleChats: listField(v => v.scheduleChats),
   alertChats: listField(v => v.alertChats),
   alertAfterMin: intField(v => v.alertAfterMin, 0, 1440),
+  longReplyChars: intField(v => v.longReplyChars, 0, 100000),
   turnSummaryMinSec: intField(v => v.turnSummaryMinSec, 0, 86400),
   turnSummary: { format: v => v.turnSummary ?? 'long', parse: text => ['off', 'long', 'always'].includes(text) ? text : undefined },
   channelPromptText: { format: v => v.channelPromptText ?? '', parse: text => text.trim() },
@@ -654,6 +656,7 @@ export function createSettings(form: ConfigForm<BridgeValues>, describe: Setting
           <div className="tgb-more-body">
             {toggle('channelPrompt')}
             {toggleOn('channelPrompt') && valueField('channelPromptText', 'channel-prompt')}
+            {valueField('longReplyChars', 'long-reply', { numeric: true })}
             {toggle('sendDeliverables')}
             {valueField('maxDownloadMb', 'max-download', { numeric: true })}
             {toggle('transcribeVoice')}

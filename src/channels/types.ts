@@ -45,6 +45,8 @@ export interface InboundMessage {
   readonly attachments: readonly InboundAttachment[]
   /** A voice note to transcribe; also listed in `attachments`, which carry it when transcription fails. */
   readonly voice?: InboundAttachment
+  /** Text of the message this one replies to (quotes), for context. */
+  readonly quote?: string
 }
 
 /** A button press. */

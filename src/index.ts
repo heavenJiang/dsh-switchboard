@@ -165,6 +165,8 @@ export interface Config {
   turnSummaryMinSec: Volatile<number>
   /** Chat ids that receive scheduled-run results. */
   scheduleChats: Volatile<string[]>
+  /** Replies longer than this many characters go as a Markdown file with a short preview; 0 never. */
+  longReplyChars: Volatile<number>
   /** Chat keys told when a line stays down; the schedule chats when empty. */
   alertChats: Volatile<string[]>
   /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
@@ -217,6 +219,7 @@ export const Config: Schema<Config> = Schema.object({
   turnSummary: Schema.union(['off', 'long', 'always'] as const).default('long').volatile(),
   turnSummaryMinSec: Schema.natural().max(86400).default(60).volatile(),
   scheduleChats: Schema.array(Schema.string()).default([]).volatile(),
+  longReplyChars: Schema.natural().max(100000).default(6000).volatile(),
   alertChats: Schema.array(Schema.string()).default([]).volatile(),
   alertAfterMin: Schema.natural().max(1440).default(5).volatile(),
   transcribeVoice: Schema.boolean().default(true).volatile(),
@@ -404,6 +407,7 @@ export function apply(ctx: Context, config: Config): void {
       transcribeVoice: config.transcribeVoice.get(),
       scheduleChats: config.scheduleChats.get(),
       alertChats: config.alertChats.get(),
+      longReplyChars: config.longReplyChars.get(),
       alertAfterMin: config.alertAfterMin.get(),
       language: config.language.get(),
       maxDownloadMb: config.maxDownloadMb.get(),
@@ -515,12 +519,16 @@ export function apply(ctx: Context, config: Config): void {
       return items
         .filter(item => item.origin !== 'subagent' && !item.blank)
         .sort((a, b) => b.updatedAt - a.updatedAt)
-        .map((item): SessionRow => ({
-          sessionId: item.sessionId,
-          updatedAt: item.updatedAt,
-          running: item.running,
-          ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
-        }))
+        .map((item): SessionRow => {
+          const title = (item.projections?.values as { title?: unknown } | undefined)?.title
+          return {
+            sessionId: item.sessionId,
+            updatedAt: item.updatedAt,
+            running: item.running,
+            ...(typeof title === 'string' && title.trim() !== '' ? { title: title.trim() } : {}),
+            ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
+          }
+        })
     },
     queued(sessionId) {
       const inbox = agents.get(sessionId as SessionId)?.inbox

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BindingStore } from '../src/bindings.ts'
 import { Switchboard, type BridgeSettings } from '../src/bridge.ts'
-import { parseContent, type FeishuApi, type FeishuCardActionEvent, type FeishuCardResponse, type FeishuMessageEvent } from '../src/channels/feishu.ts'
+import { card, cardPlainText, foldedCard, parseContent, type FeishuApi, type FeishuCardActionEvent, type FeishuCardResponse, type FeishuMessageEvent } from '../src/channels/feishu.ts'
 import { ChatLog } from '../src/chatlog.ts'
 import type { LineSettings } from '../src/lines.ts'
 import { FakeHarness } from './fakes.ts'
@@ -82,6 +82,8 @@ class FakeFeishu implements FeishuApi {
     return data
   }
 
+  readonly messages = new Map<string, { type: string; content: string; fromBot: boolean }>()
+  async getMessage(messageId: string) { return this.messages.get(messageId) }
   async userName(openId: string) { return openId === ANN ? 'Ann' : undefined }
   async chatName(chatId: string) { return chatId === GROUP ? 'Team' : undefined }
 
@@ -196,7 +198,8 @@ describe('Feishu line', () => {
     }))
     feishu.deliver(message(GROUP, 'text', { text: '@_user_1 please deploy' }, { mentions: [{ key: '@_user_1', id: { open_id: BOT.openId }, name: BOT.name }] }))
     await until(() => harness.prompts.length === 2)
-    expect(harness.prompts.map(p => p.parts)).toEqual([
+    // The two messages are handled concurrently; order is not part of the contract.
+    expect(harness.prompts.map(p => p.parts).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual([
       [{ type: 'text', text: '@Bob hi' }],
       [{ type: 'text', text: 'please deploy' }],
     ])
@@ -284,10 +287,31 @@ describe('Feishu line', () => {
     expect(feishu.reactions[1]?.emoji).toBe('DONE')
   })
 
+  it('passes a quoted bot reply along as context', async () => {
+    feishu.messages.set('om_bot', { type: 'interactive', content: JSON.stringify(card({ markdown: 'Build failed: missing env' })), fromBot: true })
+    feishu.deliver(message(DM, 'text', { text: 'why?' }, { parent_id: 'om_bot' }))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: '> Build failed: missing env\n\nwhy?' }])
+  })
+
   it('needs an app id and secret', async () => {
     settings = { ...settings, lines: [{ ...FEISHU_LINE, appId: '' }] }
     await bridge.reconcile()
     await until(() => bridge.state.kind === 'error')
+  })
+})
+
+describe('Feishu cards', () => {
+  it('folds long code blocks and keeps short ones inline', () => {
+    const longCode = Array.from({ length: 20 }, (_, i) => `step ${i}`).join('\n')
+    const folded = foldedCard(`Result:\n\n\`\`\`bash\n${longCode}\n\`\`\`\n\nDone.`) as { body: { elements: Record<string, unknown>[] } }
+    expect(folded.body.elements.map(element => element['tag'])).toEqual(['markdown', 'collapsible_panel', 'markdown'])
+    expect((folded.body.elements[1]!['header'] as { title: { content: string } }).title.content).toBe('bash · 20 lines')
+    expect(foldedCard('short\n```\nls\n```')).toBeUndefined()
+  })
+
+  it('reads the text of a card', () => {
+    expect(cardPlainText(JSON.stringify({ body: { elements: [{ tag: 'markdown', content: 'Hello' }, { tag: 'button', text: { tag: 'plain_text', content: 'Stop' } }] } }))).toBe('Hello')
   })
 })
 
