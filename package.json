@@ -1,6 +1,19 @@
 {
   "name": "dsh-switchboard",
   "description": "Switchboard (掌上指挥台) for DeepSeek Harness: command Agents from Telegram and Feishu bots — tasks, streamed replies, approvals, questions, notices, files, and voice.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "telegram",
+    "feishu",
+    "lark",
+    "bot",
+    "chatops",
+    "agent",
+    "remote-control",
+    "掌上指挥台"
+  ],
   "version": "0.5.15",
   "icon": "./icon.svg",
   "repository": {
@@ -25,7 +38,7 @@
     "icon.svg",
     "locale/*.json",
     "cordis.patch.yml",
-    "docs",
+    "docs/*.md",
     "README.md",
     "README.zh.md",
     "lib/index.js",
@@ -33,6 +46,7 @@
     "CHANGELOG.md"
   ],
   "license": "MIT",
+  "author": "heavenJiang",
   "engines": {
     "dsh": ">=0.2.0-0 <0.3.0"
   },
@@ -57,7 +71,8 @@
     "build": "node scripts/build.mjs",
     "prepare": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
@@ -104,5 +119,11 @@
     "@deepseek-ai/dsh-workspace": {
       "optional": true
     }
+  },
+  "bugs": {
+    "url": "https://github.com/heavenJiang/dsh-switchboard/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

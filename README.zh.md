@@ -8,7 +8,7 @@
 
 机器人是 Web Host 的另一个客户端：它通过 `ctx.sessionController`（与 Web 界面同一条路径）创建会话和发送消息，所以聊天里开的会话会出现在 Web 侧栏中，Web 端的会话也可以接管或订阅。机器人新建的会话会放进工作目录对应的 Web 工作区（没有就自动创建），和其他会话一起显示在侧栏里。
 
-![掌上指挥台概览](docs/images/panel-dashboard.png)
+![掌上指挥台概览](docs/images/overview-zh.png)
 
 ## 线路
 
@@ -145,7 +145,11 @@
 
 插件页（插件 → 已安装插件 → 掌上指挥台）显示版本信息和完整设置，与控制台共用同一套界面。
 
-![聊天记录](docs/images/panel-thread.png)
+![聊天记录](docs/images/thread-zh.png)
+
+![线路](docs/images/lines-zh.png)
+
+![成员与权限](docs/images/members-zh.png)
 
 **会话内的掌上指挥台标签页**
 
@@ -239,7 +243,7 @@
 
 网络受限时，在启动 `dsh` 前设置 `HTTPS_PROXY` 即可，Harness 的出站代理策略会自动覆盖机器人的请求。
 
-![设置页](docs/images/settings.png)
+![设置](docs/images/settings-zh.png)
 
 ## 架构
 

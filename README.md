@@ -8,7 +8,7 @@ Command DeepSeek Harness Agents from your phone through Telegram and Feishu (Lar
 
 The bots are other clients of the Web host. They create and prompt Sessions through `ctx.sessionController`, the same path the Web UI uses, so chat Sessions appear in the Web sidebar and Web Sessions can be taken over or followed. Sessions a bot creates go into the Web Workspace for their working directory (created on first use).
 
-![Switchboard overview](docs/images/panel-dashboard.png)
+![Switchboard overview](docs/images/overview-en.png)
 
 ## Lines
 
@@ -77,7 +77,11 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 - **`/switchboard` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session.
 - **Channel note**: Sessions bound to a chat get a short note asking for phone-friendly replies.
 
-![Chat thread](docs/images/panel-thread.png)
+![Chat thread](docs/images/thread-en.png)
+
+![Lines](docs/images/lines-en.png)
+
+![Members and rights](docs/images/members-en.png)
 
 ## Models
 
