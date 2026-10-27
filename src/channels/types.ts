@@ -85,6 +85,12 @@ export interface ChannelSink {
   action(action: InboundAction): Promise<void>
 }
 
+/** The last message a Markdown send produced. */
+export interface SentMarkdown {
+  readonly messageId: string
+  readonly markdown: string
+}
+
 /** A file to send. */
 export interface OutFile {
   readonly data: Uint8Array
@@ -110,8 +116,17 @@ export interface Channel {
   /**
    * Send Markdown rendered for the platform, split to size.
    * @param replaceId - an editable message to turn into the first piece.
+   * @returns the last piece's message and its Markdown, for {@link addButtons}.
    */
-  sendMarkdown(chat: string, markdown: string, replaceId?: string): Promise<void>
+  sendMarkdown(chat: string, markdown: string, replaceId?: string): Promise<SentMarkdown | undefined>
+  /** Put buttons under a message sent with {@link sendMarkdown} (none removes them). */
+  addButtons(chat: string, sent: SentMarkdown, buttons: readonly (readonly Button[])[]): Promise<void>
+  /**
+   * Mark a person's message as being worked on, done, or failed, where the platform has reactions.
+   * @param previous - the handle `working` returned, which `done` and `failed` replace.
+   * @returns a handle for the next state.
+   */
+  react(chat: string, messageId: string, state: 'working' | 'done' | 'failed', previous?: unknown): Promise<unknown>
   sendFile(chat: string, file: OutFile, caption?: string): Promise<void>
   download(attachment: InboundAttachment, limit: number): Promise<Uint8Array>
   /** Show that the bot is working, where the platform can. */

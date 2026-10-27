@@ -12,7 +12,7 @@ import { safeName } from '../media.ts'
 import {
   CredentialsRejectedError, FileTooLargeError, sleep,
   type Button, type Channel, type ChannelChat, type ChannelSink, type InboundAction, type InboundAttachment,
-  type InboundMessage, type OutFile, type OutMessage,
+  type InboundMessage, type OutFile, type OutMessage, type SentMarkdown,
 } from './types.ts'
 
 /** `im.message.receive_v1`, the fields read here. */
@@ -62,6 +62,9 @@ export interface FeishuApi {
   /** @returns the new message's id. */
   sendMessage(chatId: string, type: 'text' | 'interactive' | 'image' | 'file', content: object): Promise<string>
   patchCard(messageId: string, card: object): Promise<void>
+  /** @returns the reaction's id, for removing it. */
+  addReaction(messageId: string, emojiType: string): Promise<string>
+  removeReaction(messageId: string, reactionId: string): Promise<void>
   uploadImage(data: Uint8Array): Promise<string>
   uploadFile(data: Uint8Array, name: string, fileType: string): Promise<string>
   /** Download a message's image or file. */
@@ -247,14 +250,31 @@ export class FeishuChannel implements Channel {
     await this.edit(chatId, messageId, message)
   }
 
-  async sendMarkdown(chatId: string, markdown: string, replaceId?: string): Promise<void> {
+  async sendMarkdown(chatId: string, markdown: string, replaceId?: string): Promise<SentMarkdown | undefined> {
     let first = true
+    let last: SentMarkdown | undefined
     for (const piece of chunkMarkdown(markdown, CARD_TEXT_LIMIT)) {
       const content = card({ markdown: piece })
-      if (first && replaceId !== undefined) await this.options.api.patchCard(replaceId, content)
-      else await this.options.api.sendMessage(chatId, 'interactive', content)
+      if (first && replaceId !== undefined) {
+        await this.options.api.patchCard(replaceId, content)
+        last = { messageId: replaceId, markdown: piece }
+      } else {
+        last = { messageId: await this.options.api.sendMessage(chatId, 'interactive', content), markdown: piece }
+      }
       first = false
     }
+    return last
+  }
+
+  /** A card is replaced whole: the same Markdown with the buttons under it. */
+  async addButtons(_chatId: string, sent: SentMarkdown, buttons: readonly (readonly Button[])[]): Promise<void> {
+    await this.options.api.patchCard(sent.messageId, card({ markdown: sent.markdown }, buttons))
+  }
+
+  /** Feishu's OnIt while working, then DONE or ERROR in its place. */
+  async react(_chatId: string, messageId: string, state: 'working' | 'done' | 'failed', previous?: unknown): Promise<unknown> {
+    if (typeof previous === 'string') await this.options.api.removeReaction(messageId, previous).catch(() => {})
+    return this.options.api.addReaction(messageId, state === 'working' ? 'OnIt' : state === 'failed' ? 'ERROR' : 'DONE')
   }
 
   async sendFile(chatId: string, file: OutFile, caption?: string): Promise<void> {

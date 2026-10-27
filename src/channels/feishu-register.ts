@@ -16,6 +16,8 @@ export const FEISHU_SCOPES = [
   // Downloading images and files from messages needs the general read scope.
   'im:message:readonly',
   'im:message:send_as_bot',
+  // Marks a message as being worked on.
+  'im:message.reactions:write_only',
   'im:resource',
   'contact:user.base:readonly',
   'im:chat:readonly',

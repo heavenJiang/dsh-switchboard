@@ -128,6 +128,17 @@ export function createFeishuApi(line: LineSettings, logger: { debug(message: str
       await request('card update', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, { content: JSON.stringify(card) })
     },
 
+    async addReaction(messageId, emojiType) {
+      const added = await data<{ reaction_id?: string }>('reaction', 'POST', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+        reaction_type: { emoji_type: emojiType },
+      })
+      return added?.reaction_id ?? ''
+    },
+
+    async removeReaction(messageId, reactionId) {
+      await request('reaction removal', 'DELETE', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reactionId)}`)
+    },
+
     async uploadImage(bytes) {
       const form = new FormData()
       form.set('image_type', 'message')

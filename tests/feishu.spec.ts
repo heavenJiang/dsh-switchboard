@@ -59,6 +59,13 @@ class FakeFeishu implements FeishuApi {
     this.patches.push({ messageId, card: card as Record<string, unknown> })
   }
 
+  readonly reactions: { messageId: string; emoji: string }[] = []
+  async addReaction(messageId: string, emoji: string): Promise<string> {
+    this.reactions.push({ messageId, emoji })
+    return `r${this.reactions.length}`
+  }
+  async removeReaction(): Promise<void> {}
+
   async uploadImage(data: Uint8Array): Promise<string> {
     this.uploads.push({ kind: 'image', bytes: data.byteLength })
     return 'img_key'
@@ -240,8 +247,9 @@ describe('Feishu line', () => {
     expect(harness.prompts[0]?.parts).toEqual([{ type: 'file', receiptId: 'r1' }])
   })
 
-  it('streams a draft card and replaces it with the reply', async () => {
+  it('streams the reply in a progress card and replaces it with the reply', async () => {
     await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
     bridge.onAssistantStream('s1', { type: 'start' })
     bridge.onAssistantStream('s1', { type: 'chunk', chunk: { type: 'text-delta', text: 'Working through the failing tests one at a time…' } })
     await until(() => feishu.sent.length === 1, 3000)
@@ -263,6 +271,17 @@ describe('Feishu line', () => {
     expect(feishu.uploads).toEqual([{ kind: 'image', bytes: 3 }, { kind: 'file', bytes: 2, name: 'report.pdf', fileType: 'pdf' }])
     expect(feishu.sent.map(m => m.type)).toEqual(['image', 'file', 'text'])
     expect(feishu.texts()[2]).toBe('report.pdf\nQ3')
+  })
+
+  it('marks messages with OnIt while working and DONE after', async () => {
+    const event = message(DM, 'text', { text: 'go' })
+    feishu.deliver(event)
+    await until(() => feishu.reactions.length === 1)
+    expect(feishu.reactions[0]).toEqual({ messageId: event.message.message_id, emoji: 'OnIt' })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    await until(() => feishu.reactions.length === 2)
+    expect(feishu.reactions[1]?.emoji).toBe('DONE')
   })
 
   it('needs an app id and secret', async () => {

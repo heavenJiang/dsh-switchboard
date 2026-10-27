@@ -57,8 +57,9 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | other `/xxx` | Not a command: sent to the Agent as text |
 
 - **Rendering**: Markdown becomes Telegram HTML (with a plain-text fallback) or a Feishu card's Markdown, split safely.
-- **Streaming**: a draft is edited every couple of seconds and then replaced by the formatted reply.
-- **Tool activity**: tool calls between two replies share one "🛠 Tool calls · N" message edited in place.
+- **One progress message**: while a turn runs, a single "⏳ Working · time · N tool calls" message shows the latest tool calls and the reply being written, with a **⏹ Stop** button, and is replaced by the reply; a stop or failure is told there too.
+- **Acknowledged at once**: your message gets 👀 (Feishu: OnIt) while it is worked on, cleared when done; a message sent during a running turn gets a "Queued" notice with **Steer now** and **Cancel**.
+- **Buttons under the reply**: **Continue**, **Retry**, **Show changes** (the turn's changes as a diff file, new files included), and **New session**; they move to the next reply.
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
 - **Approvals and questions**: **Allow once / Reject** buttons; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
 - **Media**: photos and files are staged through `ctx.fileUploads`; images reach the model as images. Voice notes are transcribed by the Harness speech service via ffmpeg. Files the Agent presents are sent back.

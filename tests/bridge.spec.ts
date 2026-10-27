@@ -220,8 +220,10 @@ describe('TelegramBridge', () => {
     await store.update(KEY, { sessionId: 's5' })
     bridge.onSessionEvent('s5', { type: 'tool/call', data: { callId: 'c1', name: 'bash', arguments: '{"command":"npm test"}' } })
     const outcome = bridge.requestApproval({ sessionId: 's5', toolName: 'bash', callId: 'c1' })
-    await until(() => telegram.calls.some(c => c.method === 'sendMessage' && c.params['reply_markup'] !== undefined))
-    const prompt = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!
+    // The progress message (with its stop button) comes first; the approval follows it.
+    const isPrompt = (c: { method: string; params: Record<string, unknown> }) => c.method === 'sendMessage' && String(c.params['text']).includes('Approval needed')
+    await until(() => telegram.calls.some(isPrompt))
+    const prompt = telegram.calls.find(isPrompt)!
     expect(String(prompt.params['text'])).toContain('command: npm test')
     const markup = prompt.params['reply_markup'] as { inline_keyboard: { callback_data: string }[][] }
     const allow = markup.inline_keyboard[0]![0]!.callback_data
@@ -493,44 +495,152 @@ describe('rendering and delivery', () => {
     await until(() => telegram.sent().includes('after the wait'))
   })
 
-  it('batches a burst of tool calls into one message, flushed before the reply', async () => {
+  it('shows a burst of tool calls in one progress message that the reply replaces', async () => {
     settings = { ...settings, notifyToolCalls: true }
     await store.update(KEY, { sessionId: 's1' })
     for (const [i, command] of ['ls', 'cat a', 'npm test'].entries()) {
       bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: `c${i}`, name: 'bash', arguments: JSON.stringify({ command }) } })
     }
+    await until(() => telegram.sent().length === 1)
+    await until(() => telegram.sent().concat(telegram.edits()).some(text => text.includes('npm test')))
+    const shown = [...telegram.sent(), ...telegram.edits()].filter(text => text.includes('npm test')).at(-1)!
+    expect(shown).toMatch(/^⏳ Working · \d+s · 3 tool call\(s\)\n🔧 bash · command: ls\n🔧 bash · command: cat a\n🔧 bash · command: npm test$/u)
+    const first = telegram.calls.find(c => c.method === 'sendMessage')!
+    expect((first.params['reply_markup'] as { inline_keyboard: { text: string }[][] }).inline_keyboard[0]![0]!.text).toBe('⏹ Stop')
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } })
-    await until(() => telegram.sent().length === 2)
-    expect(telegram.sent()[0]).toBe('🛠 Tool calls · 3\n🔧 bash · command: ls\n🔧 bash · command: cat a\n🔧 bash · command: npm test')
-    expect(telegram.sent()[1]).toBe('ok')
+    await until(() => telegram.edits().includes('ok'))
+    expect(telegram.sent()).toHaveLength(1)
   })
 
-  it('edits one activity message as calls keep coming, and starts a new one after a reply', async () => {
+  it('starts a fresh progress message after a reply', async () => {
     settings = { ...settings, notifyToolCalls: true }
     await store.update(KEY, { sessionId: 's1' })
     const call = (i: number) => bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: `k${i}`, name: 'bash', arguments: JSON.stringify({ command: `step ${i}` }) } })
-    call(1)
-    await until(() => telegram.sent().length === 1, 3000)
-    call(2)
-    await until(() => telegram.edits().some(t => t.startsWith('🛠 Tool calls · 2')), 3000)
-    expect(telegram.sent()).toHaveLength(1)
-    for (let i = 3; i <= 15; i++) call(i)
-    await until(() => telegram.edits().some(t => t.startsWith('🛠 Tool calls · 15\n…')), 4000)
+    for (let i = 1; i <= 9; i++) call(i)
+    await until(() => telegram.sent().concat(telegram.edits()).some(text => text.includes('step 9')), 3000)
+    const latest = [...telegram.sent(), ...telegram.edits()].filter(text => text.includes('step 9')).at(-1)!
+    // Older calls fold into the count.
+    expect(latest.split('\n').slice(1)).toEqual(['…', ...[4, 5, 6, 7, 8, 9].map(i => `🔧 bash · command: step ${i}`)])
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'halfway' }] } } })
-    call(16)
-    await until(() => telegram.sent().filter(t => t.startsWith('🛠')).length === 2, 4000)
-    expect(telegram.sent().at(-1)).toBe('🛠 Tool calls · 1\n🔧 bash · command: step 16')
+    await until(() => telegram.edits().includes('halfway'))
+    call(10)
+    await until(() => telegram.sent().length === 2, 3000)
+    expect(telegram.sent()[1]).toMatch(/· 10 tool call\(s\)\n🔧 bash · command: step 10$/u)
   })
 
-  it('streams a draft and turns it into the final reply', async () => {
+  it('streams the reply in the progress message and turns it into the reply', async () => {
     await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
     bridge.onAssistantStream('s1', { type: 'start' })
     bridge.onAssistantStream('s1', { type: 'chunk', chunk: { type: 'text-delta', text: 'Working through the failing tests one by one now' } })
     await until(() => telegram.sent().length === 1, 3000)
-    expect(telegram.sent()[0]).toMatch(/one by one now ▍$/u)
+    expect(telegram.sent()[0]).toMatch(/^⏳ Working · \d+s\n\nWorking through the failing tests one by one now ▍$/u)
     bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'All **fixed**.' }] } } })
     await until(() => telegram.edits().includes('All <b>fixed</b>.'))
     expect(telegram.sent()).toHaveLength(1)
+  })
+})
+
+describe('interaction', () => {
+  const pressFrom = (markup: unknown, label: string): string => {
+    const rows = (markup as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard
+    return rows.flat().find(button => button.text === label)!.callback_data
+  }
+
+  it('stops the turn from the progress message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    harness.running = true
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c', name: 'bash', arguments: '{}' } })
+    await until(() => telegram.sent().length === 1)
+    const markup = telegram.calls.find(c => c.method === 'sendMessage')!.params['reply_markup']
+    telegram.push({ callback_query: { id: 'q', from: USER, data: pressFrom(markup, '⏹ Stop') } })
+    await until(() => harness.cancelled.includes('s1'))
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+    await until(() => telegram.edits().some(text => text.startsWith('⏹ Stopped')))
+    // The outcome is told in the progress message, not in a new one.
+    expect(telegram.sent()).toHaveLength(1)
+  })
+
+  it('reports a failure in the progress message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c', name: 'bash', arguments: '{}' } })
+    await until(() => telegram.sent().length === 1)
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'failed', error: { message: 'quota exceeded' } } } })
+    await until(() => telegram.edits().some(text => text.startsWith('⚠️ Failed') && text.includes('quota exceeded')))
+    expect(telegram.sent()).toHaveLength(1)
+  })
+
+  it('marks a message with 👀 while it is worked on and clears it when done', async () => {
+    telegram.push(text(USER, 'build it'))
+    await until(() => harness.prompts.length === 1)
+    await until(() => telegram.calls.some(c => c.method === 'setMessageReaction'))
+    expect(telegram.calls.find(c => c.method === 'setMessageReaction')?.params).toEqual({ chat_id: CHAT.id, message_id: 1, reaction: [{ type: 'emoji', emoji: '👀' }] })
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    await until(() => telegram.calls.filter(c => c.method === 'setMessageReaction').length === 2)
+    expect(telegram.calls.filter(c => c.method === 'setMessageReaction')[1]?.params['reaction']).toEqual([])
+  })
+
+  it('tells a message waiting behind a running turn, and steers it in on request', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    harness.running = true
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    harness.inbox.set('s1', [{ id: 'm9', text: 'also update docs' }])
+    telegram.push(text(USER, 'also update docs'))
+    await until(() => telegram.sent().some(t => t.startsWith('⏳ Queued')))
+    const notice = telegram.calls.find(c => c.method === 'sendMessage' && String(c.params['text']).startsWith('⏳ Queued'))!
+    telegram.push({ callback_query: { id: 'q', from: USER, data: pressFrom(notice.params['reply_markup'], '↪ Steer now') } })
+    await until(() => harness.prompts.some(p => p.mode === 'steer'))
+    expect(harness.inbox.get('s1')).toEqual([])
+    await until(() => telegram.edits().includes('↪ Added to the running task.'))
+  })
+
+  it('sends the changes of a turn as a diff, untracked files included', async () => {
+    const { execFileSync } = await import('node:child_process')
+    const { mkdir } = await import('node:fs/promises')
+    const repo = join(dir, 'repo')
+    await mkdir(join(repo, 'src'), { recursive: true })
+    const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { stdio: 'pipe' })
+    git('init', '-q')
+    await writeFile(join(repo, 'README.md'), 'old\n')
+    git('add', '.')
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init')
+    await writeFile(join(repo, 'README.md'), 'new\n')
+    await writeFile(join(repo, 'src', 'a.ts'), 'export const a = 1\n')
+    telegram.push(text(USER, 'edit'))
+    await until(() => harness.prompts.length === 1)
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'workspace/changes', seq: 3 })
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Edited.' }] } } })
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'completed' } } }, repo)
+    await until(() => telegram.calls.some(c => c.method === 'editMessageReplyMarkup'))
+    const markup = telegram.calls.find(c => c.method === 'editMessageReplyMarkup')!.params['reply_markup']
+    telegram.push({ callback_query: { id: 'q', from: USER, data: pressFrom(markup, 'Show changes') } })
+    await until(() => telegram.uploads.length === 1, 3000)
+    expect(telegram.uploads[0]).toMatchObject({ method: 'sendDocument', name: 'changes-s1.diff', caption: '2 file(s) changed this turn' })
+    expect(telegram.uploads[0]!.bytes).toBeGreaterThan(100)
+  })
+
+  it('puts Continue, Retry, Show changes, and New session under the last reply', async () => {
+    telegram.push(text(USER, 'refactor'))
+    await until(() => harness.prompts.length === 1)
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    bridge.onSessionEvent('s1', { type: 'workspace/changes', seq: 3 })
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Refactored.' }] } } })
+    await until(() => telegram.sent().includes('Refactored.') || telegram.edits().includes('Refactored.'))
+    bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    await until(() => telegram.calls.some(c => c.method === 'editMessageReplyMarkup'))
+    const markup = telegram.calls.find(c => c.method === 'editMessageReplyMarkup')!.params['reply_markup'] as { inline_keyboard: { text: string }[][] }
+    expect(markup.inline_keyboard[0]!.map(button => button.text)).toEqual(['Continue', 'Retry', 'Show changes', 'New session'])
+    telegram.push({ callback_query: { id: 'q', from: USER, data: pressFrom(markup, 'Continue') } })
+    await until(() => harness.prompts.length === 2)
+    expect(harness.prompts[1]).toMatchObject({ sessionId: 's1', parts: [{ type: 'text', text: 'Continue' }], mode: 'queue' })
+    // The next turn takes the buttons off.
+    bridge.onSessionEvent('s1', { type: 'turn/start' })
+    await until(() => telegram.calls.filter(c => c.method === 'editMessageReplyMarkup').length === 2)
+    expect((telegram.calls.filter(c => c.method === 'editMessageReplyMarkup')[1]!.params['reply_markup'] as { inline_keyboard: unknown[] }).inline_keyboard).toEqual([])
   })
 })
 

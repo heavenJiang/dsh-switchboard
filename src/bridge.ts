@@ -13,6 +13,7 @@
  * exercised with a fake.
  */
 
+import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
@@ -23,12 +24,12 @@ import { TelegramChannel } from './channels/telegram.ts'
 import {
   undelivered,
   type Button, type Channel, type ChannelChat, type ChannelSink, type ChannelUser, type InboundAction, type InboundAttachment,
-  type InboundMessage, type LineState,
+  type InboundMessage, type LineState, type SentMarkdown,
 } from './channels/types.ts'
 import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
 import { chatKey, splitChatKey, type LineSettings } from './lines.ts'
 import { outgoingKind, promptImageType, sniffImageType } from './media.ts'
-import { MESSAGES, type BotLanguage, type Messages } from './messages.ts'
+import { duration, MESSAGES, type BotLanguage, type Messages } from './messages.ts'
 import type { Outbox, OutboxPayload } from './outbox.ts'
 import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
 
@@ -273,25 +274,65 @@ type Picker =
 /** How a bot message is labelled in the chat history. */
 type OutKind = 'assistant' | 'tool' | 'notice'
 
-/** A reply being written, shown as one edited message per chat. */
-interface Draft {
+/**
+ * A turn as the chats see it while it runs: one message per chat, edited in
+ * place with the elapsed time, the latest tool calls, and the reply being
+ * written, and replaced by the reply once it is committed.
+ */
+interface Progress {
+  readonly startedAt: number
+  /** Tool lines since the last reply, newest last. */
+  lines: string[]
+  /** Tool calls since the turn started. */
+  count: number
+  /** Tool calls since the last reply; more than the lines shown fold into "…". */
+  segment: number
+  /** Reply text being streamed. */
   text: string
-  /** Draft message per chat key, once sent. */
-  readonly messages: Map<string, string>
-  lastFlush: number
+  /** Progress message per chat key. */
+  messages: Map<string, string>
   timer: ReturnType<typeof setTimeout> | undefined
-  /** The send or edit in flight; finalization waits for it. */
+  /** Whether `timer` is only the quiet-turn delay, which real activity cuts short. */
+  delayed: boolean
+  /** Repaints the elapsed time while a message is shown. */
+  ticker: ReturnType<typeof setInterval> | undefined
+  lastFlush: number
+  /** The send or edit in flight; a reply waits for it. */
   pending: Promise<void>
+  /** Short id the stop button carries. */
+  readonly stopId: string
 }
 
-/** Tool calls between two replies, shown as one message edited in place. */
-interface ToolActivity {
-  readonly lines: string[]
-  count: number
-  readonly messages: Map<string, string>
-  timer: ReturnType<typeof setTimeout> | undefined
-  lastFlush: number
-  pending: Promise<void>
+/** A person's message being worked on, marked with a reaction until its turn ends. */
+interface Receipt {
+  readonly key: string
+  readonly messageId: string
+  /** When it was queued; 0 when it joined the running turn (steer). */
+  at: number
+  readonly handle: Promise<unknown>
+}
+
+/** A "queued" notice with its steer and cancel buttons. */
+interface QueuedNotice {
+  readonly sessionId: string
+  readonly key: string
+  readonly itemId: string
+  readonly parts: readonly PromptPart[]
+  readonly messageId: string
+  /** The person's message, whose reaction follows the notice. */
+  readonly sourceId?: string
+  readonly at: number
+}
+
+/** What the buttons under a finished reply act on. */
+interface ReplyActions {
+  readonly sessionId: string
+  readonly key: string
+  readonly cwd?: string
+  readonly files: readonly string[]
+  /** The prompt Retry sends again, when the turn came from this chat. */
+  readonly retry?: readonly PromptPart[]
+  readonly at: number
 }
 
 /** What the bridge tracks about a Session's running turn. */
@@ -341,14 +382,20 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 }
 const TYPING_INTERVAL_MS = 4500
 const TOOL_PREVIEW_LENGTH = 200
-/** Tool lines arriving within this window go out as one message (Telegram allows about one message per second per chat). */
-const TOOL_BATCH_MS = 1500
-/** Lines an activity message shows; older calls fold into its count. */
-const TOOL_LINES_SHOWN = 12
-/** Draft edits are at least this far apart. */
-const DRAFT_INTERVAL_MS = 1500
-/** A draft appears once the reply has this much text. */
+/** Progress edits are at least this far apart (Telegram allows about one message per second per chat). */
+const PROGRESS_INTERVAL_MS = 1500
+/** Tool lines a progress message shows; older calls fold into its count. */
+const PROGRESS_LINES = 6
+/** A quiet turn still shows its progress message after this long. */
+const PROGRESS_DELAY_MS = 4000
+/** How often a shown progress message repaints its elapsed time. */
+const PROGRESS_TICK_MS = 10_000
+/** Streamed text shows once there is this much of it. */
 const DRAFT_MIN_CHARS = 40
+/** Buttons and notices are remembered this long. */
+const ACTION_TTL_MS = 24 * 60 * 60 * 1000
+/** Largest diff sent by Show changes. */
+const DIFF_LIMIT_BYTES = 1024 * 1024
 /** Buttons in one /model picker; longer catalogs are reached by name. */
 const PICKER_BUTTONS = 30
 const PICKER_TTL_MS = 10 * 60 * 1000
@@ -369,9 +416,22 @@ export class Switchboard {
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly questions = new Map<string, PendingQuestions>()
   private readonly toolCalls = new Map<string, { name: string; arguments: string }>()
-  /** One edited "tool activity" message per Session and chat, until the next reply. */
-  private readonly toolBatches = new Map<string, ToolActivity>()
-  private readonly drafts = new Map<string, Draft>()
+  /** The running turn's progress message per Session. */
+  private readonly progress = new Map<string, Progress>()
+  /** Stop buttons: short id → Session. */
+  private readonly stopIds = new Map<string, string>()
+  /** Messages marked as being worked on, per Session. */
+  private readonly receipts = new Map<string, Receipt[]>()
+  private readonly queuedNotices = new Map<string, QueuedNotice>()
+  private readonly replyActions = new Map<string, ReplyActions>()
+  /** The last reply of a Session per chat, which gets the buttons when the turn ends. */
+  private readonly lastReplies = new Map<string, Map<string, SentMarkdown>>()
+  /** The reply currently carrying buttons, per chat, so they move to the next one. */
+  private readonly buttoned = new Map<string, SentMarkdown>()
+  /** Replies of a Session still on their way; the turn's buttons wait for them. */
+  private readonly replyDeliveries = new Map<string, Promise<void>>()
+  /** What each chat last prompted each Session with, for Retry. */
+  private readonly lastPrompts = new Map<string, readonly PromptPart[]>()
   private readonly turns = new Map<string, TurnState>()
   private readonly pickers = new Map<string, Picker>()
   /** The last /sessions listing per chat, so `/use 2` and `/watch 2` work. */
@@ -525,9 +585,11 @@ export class Switchboard {
     for (const pending of this.questions.values()) pending.settle('delegate', this.t.questionTimedOut)
     for (const timer of this.typing.values()) clearInterval(timer)
     this.typing.clear()
-    for (const sessionId of [...this.toolBatches.keys()]) this.flushTools(sessionId)
-    for (const draft of this.drafts.values()) clearTimeout(draft.timer)
-    this.drafts.clear()
+    for (const progress of this.progress.values()) {
+      clearTimeout(progress.timer)
+      clearInterval(progress.ticker)
+    }
+    this.progress.clear()
     await Promise.allSettled([...this.sendTails.values()])
     for (const id of [...this.live.keys()]) await this.stopLine(id)
   }
@@ -571,8 +633,14 @@ export class Switchboard {
     if (payload.kind === 'file') return this.sendLocalFileNow(channel, chat, key, payload.path, payload.description, note)
     const text = note === undefined ? payload.text : `${note}\n\n${payload.text}`
     if (payload.kind === 'markdown') {
-      await channel.sendMarkdown(chat, text, replaceId)
+      const sent = await channel.sendMarkdown(chat, text, replaceId)
       this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text: payload.text }, sessionId)
+      // A live reply may get the turn's buttons; a late one does not.
+      if (sent !== undefined && sessionId !== undefined && note === undefined) {
+        const replies = this.lastReplies.get(sessionId) ?? new Map<string, SentMarkdown>()
+        replies.set(key, sent)
+        this.lastReplies.set(sessionId, replies)
+      }
       return
     }
     for (const chunk of chunkText(text)) await channel.send(chat, { text: chunk })
@@ -741,7 +809,7 @@ export class Switchboard {
       if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
       if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
-      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: parsed.text }], 'queue')
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: parsed.text }], 'queue', message.messageId)
       return await this.runCommand(key, parsed.name, parsed.args)
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
@@ -789,7 +857,7 @@ export class Switchboard {
       return
     }
     if (caption !== '') parts.unshift({ type: 'text', text: caption })
-    await this.harness.prompt(sessionId, parts, 'queue')
+    await this.promptSession(key, sessionId, parts, 'queue', message.messageId)
   }
 
   /**
@@ -814,7 +882,7 @@ export class Switchboard {
     const text = caption === '' ? transcript : `${caption}\n\n${transcript}`
     this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
     await this.reply(key, t.voiceHeard(transcript))
-    await this.promptFromChat(key, [{ type: 'text', text }], 'queue')
+    await this.promptFromChat(key, [{ type: 'text', text }], 'queue', message.messageId)
   }
 
   /** Describe an attachment for the history, keeping a copy of images the viewer can show. */
@@ -1125,11 +1193,40 @@ export class Switchboard {
     return sessionId
   }
 
-  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void> {
+  /**
+   * Prompt the chat's Session. A message that waits behind a running turn gets
+   * a notice with steer and cancel buttons; the person's message is marked
+   * while it is worked on.
+   * @param source - the person's message, for its reaction.
+   */
+  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', source?: string): Promise<void> {
     const sessionId = await this.ensureSession(key)
     if (sessionId === undefined) return
+    await this.promptSession(key, sessionId, parts, mode, source)
+  }
+
+  private async promptSession(key: string, sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', source?: string): Promise<void> {
+    const busy = mode === 'queue' && this.harness.live(sessionId)?.running === true
     this.startTyping(sessionId)
     await this.harness.prompt(sessionId, parts, mode)
+    this.lastPrompts.set(`${key}|${sessionId}`, parts)
+    if (source !== undefined) this.markReceived(sessionId, key, source, mode === 'steer')
+    if (!busy) return
+    const items = this.harness.queued(sessionId) ?? []
+    const item = items.at(-1)
+    if (item === undefined) return
+    const id = randomUUID().slice(0, 8)
+    const t = this.t
+    const now = Date.now()
+    for (const [old, notice] of this.queuedNotices) if (now - notice.at > ACTION_TTL_MS) this.queuedNotices.delete(old)
+    await this.enqueue(key, async (channel, chat) => {
+      const messageId = await channel.send(chat, {
+        text: t.queued(items.length - 1),
+        buttons: [[{ text: t.queueSteerButton, data: `qs:${id}` }, { text: t.queueCancelButton, data: `qx:${id}` }]],
+        editable: true,
+      })
+      this.queuedNotices.set(id, { sessionId, key, itemId: item.id, parts, messageId, at: now, ...(source === undefined ? {} : { sourceId: source }) })
+    })
   }
 
   // ─── Web-side operations ────────────────────────────────────────────────
@@ -1198,7 +1295,11 @@ export class Switchboard {
       void this.store.setCursor(sessionId, event.seq)
     }
     if (event.type === 'turn/start') {
-      this.turns.set(sessionId, { startedAt: event.time ?? Date.now(), tools: 0, scheduled: false })
+      const startedAt = event.time ?? Date.now()
+      this.turns.set(sessionId, { startedAt, tools: 0, scheduled: false })
+      this.startProgress(sessionId, startedAt)
+      this.clearReplyButtons(sessionId)
+      this.updateQueuedNotices(sessionId)
       return
     }
     if (event.type === 'user/message') {
@@ -1220,13 +1321,14 @@ export class Switchboard {
       const text = assistantText(event.data)
       if (text === '') return
       if (turn !== undefined) turn.lastText = text
-      this.flushTools(sessionId)
-      void this.finishDraft(sessionId, chats, text)
+      // Chained, so the turn end's buttons land on the last reply once it is delivered.
+      const delivered = (this.replyDeliveries.get(sessionId) ?? Promise.resolve()).then(() => this.deliverReply(sessionId, chats, text))
+      this.replyDeliveries.set(sessionId, delivered)
     } else if (event.type === 'tool/call') {
       const data = event.data as { callId: string; name: string; arguments: string }
       this.rememberToolCall(data.callId, data.name, data.arguments)
       if (turn !== undefined) turn.tools++
-      if (this.settings().notifyToolCalls && chats.length > 0) this.queueToolLine(sessionId, data.name, data.arguments)
+      if (chats.length > 0) this.noteToolCall(sessionId, data.name, data.arguments)
     } else if (event.type === 'deliverables/presented') {
       if (!this.settings().sendDeliverables) return
       const files = (event.data as { files?: readonly { path: string; description?: string }[] }).files ?? []
@@ -1235,11 +1337,19 @@ export class Switchboard {
         for (const key of chats) void this.durable(key, { kind: 'file', path, ...(file.description === undefined ? {} : { description: file.description }) }, sessionId)
       }
     } else if (event.type === 'turn/end') {
-      this.flushTools(sessionId)
       this.turns.delete(sessionId)
       const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } }).reason
       const kind = reason?.kind ?? 'completed'
-      this.endTurn(sessionId, kind, reason?.error?.message, turn, chats, watchers, event.time ?? Date.now())
+      const endedAt = event.time ?? Date.now()
+      const shown = this.endProgress(sessionId, kind, reason?.error?.message, endedAt)
+      this.finishReceipts(sessionId, kind, turn?.startedAt ?? endedAt)
+      const delivered = this.replyDeliveries.get(sessionId) ?? Promise.resolve()
+      this.replyDeliveries.delete(sessionId)
+      // Buttons and turn-end notices follow the turn's last reply.
+      void delivered.then(() => {
+        if (kind === 'completed') this.offerReplyActions(sessionId, turn, cwd)
+        this.endTurn(sessionId, kind, reason?.error?.message, turn, chats.filter(key => !shown.has(key)), watchers, endedAt)
+      })
     }
   }
 
@@ -1270,117 +1380,247 @@ export class Switchboard {
     }
   }
 
-  /**
-   * Add a tool call to the Session's activity message. Calls between two
-   * replies share one message that is edited in place (edits do not notify),
-   * so a long run of commands does not flood the chat.
-   */
-  private queueToolLine(sessionId: string, name: string, args: string): void {
+  // ─── progress, reactions, and reply buttons ─────────────────────────────
+
+  /** Begin a turn's progress: shown after a moment even if nothing happens, so the chat knows it is working. */
+  private startProgress(sessionId: string, startedAt: number): Progress {
+    const old = this.progress.get(sessionId)
+    if (old !== undefined) {
+      clearTimeout(old.timer)
+      clearInterval(old.ticker)
+    }
+    const stopId = randomUUID().slice(0, 8)
+    this.stopIds.set(stopId, sessionId)
+    while (this.stopIds.size > 64) this.stopIds.delete(this.stopIds.keys().next().value as string)
+    const progress: Progress = {
+      startedAt, lines: [], count: 0, segment: 0, text: '', messages: new Map(), timer: undefined, delayed: true, ticker: undefined,
+      lastFlush: 0, pending: Promise.resolve(), stopId,
+    }
+    this.progress.set(sessionId, progress)
+    progress.timer = setTimeout(() => {
+      progress.timer = undefined
+      progress.delayed = false
+      this.renderProgress(sessionId, progress)
+    }, PROGRESS_DELAY_MS)
+    return progress
+  }
+
+  /** Add a tool call to the progress message (and to the history, which keeps every call). */
+  private noteToolCall(sessionId: string, name: string, args: string): void {
     const preview = previewArguments(args, TOOL_PREVIEW_LENGTH)
     const line = `🔧 ${name}${preview === '' ? '' : ` · ${preview}`}`
-    // The history viewer keeps every call.
     for (const key of this.outputChats(sessionId)) this.log({ chatId: key }, { dir: 'out', kind: 'tool', text: line }, sessionId)
-    let activity = this.toolBatches.get(sessionId)
-    if (activity === undefined) {
-      activity = { lines: [], count: 0, messages: new Map(), timer: undefined, lastFlush: 0, pending: Promise.resolve() }
-      this.toolBatches.set(sessionId, activity)
+    const progress = this.progress.get(sessionId) ?? this.startProgress(sessionId, Date.now())
+    progress.count++
+    progress.segment++
+    if (this.settings().notifyToolCalls) {
+      progress.lines.push(line)
+      if (progress.lines.length > PROGRESS_LINES) progress.lines.shift()
     }
-    activity.lines.push(line)
-    if (activity.lines.length > TOOL_LINES_SHOWN) activity.lines.shift()
-    activity.count++
-    if (activity.timer !== undefined) return
-    const current = activity
-    current.timer = setTimeout(() => {
-      current.timer = undefined
-      this.renderTools(sessionId, current)
-    }, Math.max(0, current.lastFlush + TOOL_BATCH_MS - Date.now()))
-  }
-
-  /** Send or edit the activity message in every output chat. */
-  private renderTools(sessionId: string, activity: ToolActivity): Promise<void> {
-    activity.lastFlush = Date.now()
-    const hidden = activity.count - activity.lines.length
-    const text = [this.t.toolActivity(activity.count), ...(hidden > 0 ? ['…'] : []), ...activity.lines].join('\n')
-    // Each chat's send queue is serial, so an edit runs after the send that
-    // created its message; the id is read when the operation runs.
-    const sends = this.outputChats(sessionId).map(key => this.enqueue(key, async (channel, chat) => {
-      const messageId = activity.messages.get(key)
-      if (messageId === undefined) activity.messages.set(key, await channel.send(chat, { text, editable: true }))
-      else await channel.edit(chat, messageId, { text, editable: true }).catch(() => {})
-    }))
-    activity.pending = Promise.all(sends).then(() => {})
-    return activity.pending
-  }
-
-  /** Close the activity message: show its last state, and start a new one after the next reply. */
-  private flushTools(sessionId: string): void {
-    const activity = this.toolBatches.get(sessionId)
-    if (activity === undefined) return
-    this.toolBatches.delete(sessionId)
-    if (activity.timer !== undefined) {
-      clearTimeout(activity.timer)
-      activity.timer = undefined
-      void this.renderTools(sessionId, activity)
-    }
+    this.scheduleProgress(sessionId, progress)
   }
 
   /**
-   * Follow the live reply as it is written: a draft message per chat, edited
-   * at most every {@link DRAFT_INTERVAL_MS}, finalized when the reply commits.
+   * Follow the live reply as it is written, shown in the progress message.
    * @param sessionId - the Agent's Session (top-level Agents only).
    * @param frame - one assistant stream frame.
    */
   onAssistantStream(sessionId: string, frame: { type: string; chunk?: { type: string; text?: string }; outcome?: { kind: string } }): void {
     if (this.live.size === 0 || !this.settings().streamReplies) return
+    const progress = this.progress.get(sessionId)
+    if (progress === undefined) return
     if (frame.type === 'start') {
-      const old = this.drafts.get(sessionId)
-      if (old !== undefined) clearTimeout(old.timer)
-      // A new attempt replaces an abandoned one's draft text; its messages are reused.
-      this.drafts.set(sessionId, { text: '', messages: old?.messages ?? new Map(), lastFlush: 0, timer: undefined, pending: old?.pending ?? Promise.resolve() })
+      // A new attempt replaces an abandoned one's text.
+      progress.text = ''
       return
     }
-    const draft = this.drafts.get(sessionId)
-    if (draft === undefined) return
     if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta' && typeof frame.chunk.text === 'string') {
-      draft.text += frame.chunk.text
-      this.scheduleDraft(sessionId, draft)
+      progress.text += frame.chunk.text
+      if (progress.text.trim().length >= DRAFT_MIN_CHARS) this.scheduleProgress(sessionId, progress)
     }
   }
 
-  private scheduleDraft(sessionId: string, draft: Draft): void {
-    if (draft.timer !== undefined || draft.text.trim().length < DRAFT_MIN_CHARS) return
-    const wait = Math.max(0, draft.lastFlush + DRAFT_INTERVAL_MS - Date.now())
-    draft.timer = setTimeout(() => {
-      draft.timer = undefined
-      draft.lastFlush = Date.now()
-      const text = draftPreview(draft.text)
-      draft.pending = draft.pending.then(() => this.showDraft(sessionId, draft, text)).catch(() => {})
-    }, wait)
+  private scheduleProgress(sessionId: string, progress: Progress): void {
+    if (progress.timer !== undefined && !progress.delayed) return
+    clearTimeout(progress.timer)
+    progress.delayed = false
+    progress.timer = setTimeout(() => {
+      progress.timer = undefined
+      this.renderProgress(sessionId, progress)
+    }, Math.max(0, progress.lastFlush + PROGRESS_INTERVAL_MS - Date.now()))
   }
 
-  private async showDraft(sessionId: string, draft: Draft, text: string): Promise<void> {
-    for (const key of this.store.chatsFor(sessionId)) {
-      const messageId = draft.messages.get(key)
-      if (messageId === undefined) {
-        await this.enqueue(key, async (channel, chat) => {
-          draft.messages.set(key, await channel.send(chat, { text, editable: true }))
-        })
-      } else {
-        const { chat } = splitChatKey(key)
-        await this.channelOf(key)?.edit(chat, messageId, { text, editable: true }).catch(() => {})
+  /** Show the progress message now (before an approval or question, so they follow it). */
+  private flushProgress(sessionId: string): void {
+    const progress = this.progress.get(sessionId)
+    if (progress === undefined || progress.messages.size === 0 && progress.count === 0) return
+    clearTimeout(progress.timer)
+    progress.timer = undefined
+    this.renderProgress(sessionId, progress)
+  }
+
+  /** Send or edit the progress message in every output chat. */
+  private renderProgress(sessionId: string, progress: Progress): void {
+    if (this.progress.get(sessionId) !== progress) return
+    progress.lastFlush = Date.now()
+    const t = this.t
+    const hidden = progress.segment - progress.lines.length
+    const elapsed = duration((Date.now() - progress.startedAt) / 1000, this.settings().language)
+    const draft = progress.text.trim().length >= DRAFT_MIN_CHARS ? draftPreview(progress.text, 1500) : undefined
+    const text = [
+      t.progress(elapsed, progress.count),
+      ...(progress.lines.length > 0 && hidden > 0 ? ['…'] : []),
+      ...progress.lines,
+      ...(draft === undefined ? [] : ['', draft]),
+    ].join('\n')
+    const buttons = [[{ text: t.stopButton, data: `st:${progress.stopId}` }]]
+    // Each chat's send queue is serial, so an edit runs after the send that created its message.
+    const sends = this.outputChats(sessionId).map(key => this.enqueue(key, async (channel, chat) => {
+      const messageId = progress.messages.get(key)
+      if (messageId === undefined) progress.messages.set(key, await channel.send(chat, { text, buttons, editable: true }))
+      else await channel.edit(chat, messageId, { text, buttons, editable: true }).catch(() => {})
+    }))
+    progress.pending = Promise.all(sends).then(() => {})
+    if (progress.ticker === undefined) {
+      progress.ticker = setInterval(() => {
+        if (progress.timer === undefined) this.renderProgress(sessionId, progress)
+      }, PROGRESS_TICK_MS)
+    }
+  }
+
+  /**
+   * Deliver a committed reply: it replaces the progress message where there is
+   * one, and the next activity of the turn starts a fresh progress message.
+   */
+  private async deliverReply(sessionId: string, chats: string[], text: string): Promise<void> {
+    const progress = this.progress.get(sessionId)
+    let replace: Map<string, string> | undefined
+    if (progress !== undefined) {
+      clearTimeout(progress.timer)
+      progress.timer = undefined
+      clearInterval(progress.ticker)
+      progress.ticker = undefined
+      replace = progress.messages
+      progress.messages = new Map()
+      progress.lines = []
+      progress.segment = 0
+      progress.text = ''
+      await progress.pending
+    }
+    await Promise.all(chats.map(key => this.durable(key, { kind: 'markdown', text }, sessionId, replace?.get(key))))
+  }
+
+  /**
+   * Close the progress message at turn end with the outcome.
+   * @returns the chats whose progress message now shows the outcome.
+   */
+  private endProgress(sessionId: string, kind: string, error: string | undefined, endedAt: number): Set<string> {
+    const progress = this.progress.get(sessionId)
+    this.progress.delete(sessionId)
+    if (progress === undefined) return new Set()
+    clearTimeout(progress.timer)
+    clearInterval(progress.ticker)
+    const shown = new Set(progress.messages.keys())
+    if (shown.size === 0) return shown
+    const text = this.t.progressEnded(kind, duration((endedAt - progress.startedAt) / 1000, this.settings().language), progress.count, error)
+    void progress.pending.then(() => {
+      for (const [key, messageId] of progress.messages) {
+        void this.enqueue(key, async (channel, chat) => { await channel.edit(chat, messageId, { text, editable: true }) })
       }
+    })
+    // A completed turn's progress message says only "done"; failures and stops are told there instead of in a new message.
+    return kind === 'completed' ? new Set() : shown
+  }
+
+  /** Mark a person's message as being worked on. */
+  private markReceived(sessionId: string, key: string, messageId: string, steer: boolean): void {
+    const channel = this.channelOf(key)
+    if (channel === undefined) return
+    const handle = channel.react(splitChatKey(key).chat, messageId, 'working').catch(() => undefined)
+    const list = this.receipts.get(sessionId) ?? []
+    list.push({ key, messageId, at: steer ? 0 : Date.now(), handle })
+    this.receipts.set(sessionId, list.slice(-50))
+  }
+
+  /** Clear the marks of the messages a finished turn handled (those queued before it started, or steered into it). */
+  private finishReceipts(sessionId: string, kind: string, startedAt: number): void {
+    const list = this.receipts.get(sessionId)
+    if (list === undefined) return
+    const done = list.filter(receipt => receipt.at <= startedAt)
+    const rest = list.filter(receipt => receipt.at > startedAt)
+    if (rest.length === 0) this.receipts.delete(sessionId)
+    else this.receipts.set(sessionId, rest)
+    const state = kind === 'completed' || kind === 'aborted' ? 'done' : 'failed'
+    for (const receipt of done) this.settleReceipt(receipt, state)
+  }
+
+  private settleReceipt(receipt: Receipt, state: 'done' | 'failed'): void {
+    void receipt.handle.then(previous => this.channelOf(receipt.key)?.react(splitChatKey(receipt.key).chat, receipt.messageId, state, previous)).catch(() => {})
+  }
+
+  /** Remember a reply's actions and put the buttons under the last reply of each bound chat. */
+  private offerReplyActions(sessionId: string, turn: TurnState | undefined, cwd: string | undefined): void {
+    const replies = this.lastReplies.get(sessionId)
+    this.lastReplies.delete(sessionId)
+    if (replies === undefined) return
+    const t = this.t
+    const now = Date.now()
+    for (const [id, actions] of this.replyActions) if (now - actions.at > ACTION_TTL_MS) this.replyActions.delete(id)
+    for (const [key, sent] of replies) {
+      if (!this.store.chatsFor(sessionId).includes(key)) continue
+      const id = randomUUID().slice(0, 8)
+      const retry = this.lastPrompts.get(`${key}|${sessionId}`)
+      const files = turn?.files ?? []
+      this.replyActions.set(id, {
+        sessionId, key, files, at: now,
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(retry === undefined ? {} : { retry }),
+      })
+      const row = [
+        { text: t.actContinue, data: `ab:${id}:c` },
+        ...(retry === undefined ? [] : [{ text: t.actRetry, data: `ab:${id}:r` }]),
+        ...(files.length > 0 ? [{ text: t.actChanges, data: `ab:${id}:d` }] : []),
+        { text: t.actNew, data: `ab:${id}:n` },
+      ]
+      const previous = this.buttoned.get(key)
+      this.buttoned.set(key, sent)
+      void this.enqueue(key, async (channel, chat) => {
+        if (previous !== undefined && previous.messageId !== sent.messageId) await channel.addButtons(chat, previous, []).catch(() => {})
+        await channel.addButtons(chat, sent, [row])
+      })
     }
   }
 
-  /** Deliver a committed reply: replace the draft when there is one, else send it. */
-  private async finishDraft(sessionId: string, chats: string[], text: string): Promise<void> {
-    const draft = this.drafts.get(sessionId)
-    this.drafts.delete(sessionId)
-    if (draft !== undefined) {
-      clearTimeout(draft.timer)
-      await draft.pending
+  /** Take the buttons off the last reply of chats bound to a Session that starts a new turn. */
+  private clearReplyButtons(sessionId: string): void {
+    for (const key of this.store.chatsFor(sessionId)) {
+      const sent = this.buttoned.get(key)
+      if (sent === undefined) continue
+      this.buttoned.delete(key)
+      void this.enqueue(key, async (channel, chat) => { await channel.addButtons(chat, sent, []).catch(() => {}) })
     }
-    for (const key of chats) void this.durable(key, { kind: 'markdown', text }, sessionId, draft?.messages.get(key))
+  }
+
+  /** Mark queued notices whose message has started. */
+  private updateQueuedNotices(sessionId: string): void {
+    const waiting = new Set((this.harness.queued(sessionId) ?? []).map(item => item.id))
+    for (const [id, notice] of this.queuedNotices) {
+      if (notice.sessionId !== sessionId || waiting.has(notice.itemId)) continue
+      this.queuedNotices.delete(id)
+      void this.enqueue(notice.key, async (channel, chat) => { await channel.edit(chat, notice.messageId, { text: this.t.queueStarted }) })
+    }
+  }
+
+  /** Send the files a turn changed as a diff (or their names, outside a git work tree). */
+  private async sendChanges(key: string, actions: ReplyActions): Promise<void> {
+    const t = this.t
+    if (actions.files.length === 0 || actions.cwd === undefined) return this.reply(key, t.changesNone)
+    const diff = await gitDiff(actions.cwd, actions.files).catch(() => '')
+    if (diff.trim() === '') return this.reply(key, `${t.changesCaption(actions.files.length)}\n${actions.files.map(file => `· ${file}`).join('\n')}`)
+    const data = new TextEncoder().encode(diff)
+    await this.enqueue(key, async (channel, chat) => {
+      await channel.sendFile(chat, { data: data.slice(0, DIFF_LIMIT_BYTES), name: `changes-${shortId(actions.sessionId)}.diff`, photo: false }, t.changesCaption(actions.files.length))
+    })
   }
 
   /**
@@ -1388,7 +1628,7 @@ export class Switchboard {
    * @param replaceId - a draft message to turn into the first piece.
    */
   private deliverMarkdown(key: string, markdown: string, replaceId?: string): Promise<void> {
-    return this.enqueue(key, (channel, chat) => channel.sendMarkdown(chat, markdown, replaceId))
+    return this.enqueue(key, async (channel, chat) => { await channel.sendMarkdown(chat, markdown, replaceId) })
   }
 
   /**
@@ -1508,7 +1748,7 @@ export class Switchboard {
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
     // The question should follow the reply that led to it.
-    this.flushTools(request.sessionId)
+    this.flushProgress(request.sessionId)
     const t = this.t
     const id = randomUUID().slice(0, 12)
     const call = request.callId === undefined ? undefined : this.toolCalls.get(request.callId)
@@ -1567,7 +1807,7 @@ export class Switchboard {
     const chats = this.reachable([...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])])
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
-    this.flushTools(request.sessionId)
+    this.flushProgress(request.sessionId)
     const t = this.t
     const id = randomUUID().slice(0, 8)
     const answer = Promise.withResolvers<QuestionAnswer | 'delegate' | 'cancelled'>()
@@ -1675,6 +1915,9 @@ export class Switchboard {
       return
     }
     if (action.data.startsWith('pk:')) return this.handlePick(line, action)
+    if (action.data.startsWith('st:')) return this.handleStop(line, action)
+    if (action.data.startsWith('qs:') || action.data.startsWith('qx:')) return this.handleQueued(line, action)
+    if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action)
     if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action)
     const match = /^ap:([\w-]+):([yn])$/u.exec(action.data)
     if (match === null) {
@@ -1690,6 +1933,63 @@ export class Switchboard {
     if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who), who)
     else pending.settle('rejected', t.approvalRejected(who), who)
     await channel.ack(action)
+  }
+
+  private async handleStop(line: LiveLine, action: InboundAction): Promise<void> {
+    const sessionId = this.stopIds.get(action.data.slice(3))
+    const live = sessionId === undefined ? undefined : this.harness.live(sessionId)
+    if (sessionId === undefined || live?.running !== true || !this.harness.cancel(sessionId)) {
+      await line.channel.ack(action, this.t.notRunning)
+      return
+    }
+    await line.channel.ack(action, this.t.stopRequested)
+  }
+
+  private async handleQueued(line: LiveLine, action: InboundAction): Promise<void> {
+    const t = this.t
+    const id = action.data.slice(3)
+    const notice = this.queuedNotices.get(id)
+    const waiting = notice === undefined ? undefined : this.harness.queued(notice.sessionId)?.some(item => item.id === notice.itemId)
+    if (notice === undefined || waiting !== true) {
+      await line.channel.ack(action, t.queueGone)
+      return
+    }
+    this.queuedNotices.delete(id)
+    await line.channel.ack(action)
+    this.harness.dropQueued(notice.sessionId, [notice.itemId])
+    const steer = action.data.startsWith('qs:')
+    if (steer) await this.harness.prompt(notice.sessionId, notice.parts, 'steer')
+    // The person's message now ends with the running turn, or is no longer being worked on.
+    const receipt = this.receipts.get(notice.sessionId)?.find(candidate => candidate.key === notice.key && candidate.messageId === notice.sourceId)
+    if (receipt !== undefined) {
+      if (steer) receipt.at = 0
+      else {
+        this.receipts.set(notice.sessionId, (this.receipts.get(notice.sessionId) ?? []).filter(candidate => candidate !== receipt))
+        this.settleReceipt(receipt, 'done')
+      }
+    }
+    await this.enqueue(notice.key, async (channel, chat) => {
+      await channel.edit(chat, notice.messageId, { text: steer ? t.queueSteered : t.queueDropped })
+    })
+  }
+
+  private async handleReplyAction(line: LiveLine, action: InboundAction): Promise<void> {
+    const [, id = '', verb = ''] = action.data.split(':')
+    const actions = this.replyActions.get(id)
+    if (actions === undefined) {
+      await line.channel.ack(action, this.t.modelPickerExpired)
+      return
+    }
+    await line.channel.ack(action)
+    const key = action.chat === undefined ? actions.key : chatKey(line.line.id, action.chat.id)
+    try {
+      if (verb === 'c') await this.promptSession(key, actions.sessionId, [{ type: 'text', text: this.t.continuePrompt }], 'queue')
+      else if (verb === 'r' && actions.retry !== undefined) await this.promptSession(key, actions.sessionId, actions.retry, 'queue')
+      else if (verb === 'd') await this.sendChanges(key, actions)
+      else if (verb === 'n') await this.runCommand(key, 'new', '')
+    } catch (error: unknown) {
+      await this.reply(key, this.t.failed(describe(error)))
+    }
   }
 
   private async handlePick(line: LiveLine, action: InboundAction): Promise<void> {
@@ -1751,11 +2051,26 @@ function clock(at: number): string {
   return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-/** The tail of a reply in progress, sized for one message. */
-function draftPreview(text: string): string {
+/** The tail of a reply in progress, sized for the progress message. */
+function draftPreview(text: string, limit: number): string {
   const trimmed = text.trimEnd()
-  const body = trimmed.length > 3800 ? `…${trimmed.slice(-3800)}` : trimmed
+  const body = trimmed.length > limit ? `…${trimmed.slice(-limit)}` : trimmed
   return `${body} ▍`
+}
+
+/** `git diff` of some files against HEAD, untracked files included as additions. */
+function gitDiff(cwd: string, files: readonly string[]): Promise<string> {
+  const run = (args: string[]): Promise<string> => new Promise((resolve, reject) => {
+    execFile('git', ['-C', cwd, ...args], { maxBuffer: DIFF_LIMIT_BYTES * 2, timeout: 15_000 }, (error, stdout) => {
+      if (error !== null && stdout === '') reject(error)
+      else resolve(stdout)
+    })
+  })
+  return run(['diff', '--no-color', 'HEAD', '--', ...files]).then(async (tracked) => {
+    const untracked = (await run(['ls-files', '--others', '--exclude-standard', '--', ...files]).catch(() => '')).split('\n').filter(Boolean)
+    const added = await Promise.all(untracked.slice(0, 20).map(file => run(['diff', '--no-color', '--no-index', '--', '/dev/null', file]).catch(() => '')))
+    return [tracked, ...added].filter(part => part.trim() !== '').join('\n')
+  })
 }
 
 /** What the history knows about a chat from one incoming message. */

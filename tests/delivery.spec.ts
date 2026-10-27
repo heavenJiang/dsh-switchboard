@@ -41,6 +41,8 @@ class Feishu implements FeishuApi {
     return `om_${this.sent.length}`
   }
   async patchCard() {}
+  async addReaction() { return 'r' }
+  async removeReaction() {}
   async uploadImage() { return 'img' }
   async uploadFile() { return 'file' }
   async download(): Promise<Uint8Array> { return new Uint8Array() }

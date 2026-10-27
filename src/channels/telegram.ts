@@ -11,7 +11,7 @@ import { chunkText } from '../text.ts'
 import {
   FileTooLargeError, sleep,
   type Button, type Channel, type ChannelChat, type ChannelSink, type ChannelUser, type InboundAction,
-  type InboundAttachment, type InboundMessage, type OutFile, type OutMessage,
+  type InboundAttachment, type InboundMessage, type OutFile, type OutMessage, type SentMarkdown,
 } from './types.ts'
 
 /** Where a Telegram line keeps its getUpdates position. */
@@ -178,26 +178,54 @@ export class TelegramChannel implements Channel {
     })
   }
 
-  async sendMarkdown(chatId: string, markdown: string, replaceId?: string): Promise<void> {
+  async sendMarkdown(chatId: string, markdown: string, replaceId?: string): Promise<SentMarkdown | undefined> {
     const chat = Number(chatId)
     let first = true
+    let last: SentMarkdown | undefined
     for (const piece of chunkMarkdown(markdown)) {
       const html = markdownToTelegramHtml(piece)
       const target = first && replaceId !== undefined ? Number(replaceId) : undefined
       first = false
       try {
-        if (target === undefined) await this.client.sendMessage(chat, html, { parseMode: 'HTML' })
-        else await this.client.editMessageText(chat, target, html, 'HTML')
+        if (target === undefined) last = { messageId: String((await this.client.sendMessage(chat, html, { parseMode: 'HTML' })).message_id), markdown: piece }
+        else {
+          await this.client.editMessageText(chat, target, html, 'HTML')
+          last = { messageId: String(target), markdown: piece }
+        }
       } catch (error: unknown) {
         if (!(error instanceof TelegramApiError) || error.code !== 400) throw error
-        if (/not modified/iu.test(error.description)) continue
+        if (/not modified/iu.test(error.description)) {
+          if (target !== undefined) last = { messageId: String(target), markdown: piece }
+          continue
+        }
         // Telegram rejected the markup: send the piece as plain text.
         for (const plain of chunkText(piece)) {
-          if (target === undefined) await this.client.sendMessage(chat, plain)
-          else await this.client.editMessageText(chat, target, plain).catch(() => this.client.sendMessage(chat, plain))
+          if (target === undefined) last = { messageId: String((await this.client.sendMessage(chat, plain)).message_id), markdown: plain }
+          else {
+            last = await this.client.editMessageText(chat, target, plain).then(
+              () => ({ messageId: String(target), markdown: plain }),
+              async () => ({ messageId: String((await this.client.sendMessage(chat, plain)).message_id), markdown: plain }),
+            )
+          }
         }
       }
     }
+    return last
+  }
+
+  async addButtons(chatId: string, sent: SentMarkdown, buttons: readonly (readonly Button[])[]): Promise<void> {
+    await this.client.call('editMessageReplyMarkup', {
+      chat_id: Number(chatId), message_id: Number(sent.messageId), reply_markup: { inline_keyboard: keyboard(buttons) },
+    })
+  }
+
+  /** 👀 while working, cleared when done, 👎 on failure (emoji from the Bot API's reaction set). */
+  async react(chatId: string, messageId: string, state: 'working' | 'done' | 'failed'): Promise<unknown> {
+    const emoji = state === 'working' ? '👀' : state === 'failed' ? '👎' : undefined
+    await this.client.call('setMessageReaction', {
+      chat_id: Number(chatId), message_id: Number(messageId), reaction: emoji === undefined ? [] : [{ type: 'emoji', emoji }],
+    })
+    return undefined
   }
 
   async sendFile(chatId: string, file: OutFile, caption?: string): Promise<void> {
