@@ -16,7 +16,7 @@ A **line** is one bot on one chat platform plus the people allowed to use it. Co
 
 ## Quick start
 
-1. Install into a Web profile: **Plugins → Add plugin** with `github:heavenJiang/dsh-switchboard`, or `dsh plugin --profile web add github:heavenJiang/dsh-switchboard`.
+1. Install into a Web profile: **Plugins → Add plugin** with `dsh-switchboard`, or `dsh plugin --profile web add dsh-switchboard`.
 2. Open **Plugins → Installed → Switchboard** (or **Plugin settings** in the sidebar panel), add a line under **Lines**, fill in its credentials and **Allowed users** (send `/whoami` to the bot for your id), set the **Default working directory**, and **Save**. Changes apply immediately.
 
 **Telegram line**: create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`), then **+ Telegram line** and paste the token. Allowed users are Telegram ids or `@usernames`.

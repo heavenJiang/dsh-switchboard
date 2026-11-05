@@ -20,10 +20,10 @@
 
 ## 快速开始
 
-1. 安装到 Web profile：在 Web 侧栏 **插件 → 添加插件** 中填 `github:heavenJiang/dsh-switchboard`，或用命令行：
+1. 安装到 Web profile：在 Web 侧栏 **插件 → 添加插件** 中填 `dsh-switchboard`，或用命令行：
 
    ```sh
-   dsh plugin --profile web add github:heavenJiang/dsh-switchboard
+   dsh plugin --profile web add dsh-switchboard
    ```
 
 2. 打开侧栏 **插件 → 已安装插件 → 掌上指挥台**（也可以点侧栏 **掌上指挥台** 右上角的 **插件设置**），在 **线路** 里添加线路、填写凭据和 **允许的用户**，再填 **默认工作目录**，点 **保存**，即时生效。
@@ -186,10 +186,10 @@
 
 ## 版本与更新
 
-插件详情页（配置表单上方）有 **版本** 区块：显示当前版本和安装来源，可以 **检查更新**。
+更新和其他第三方插件一样，由插件页完成：
 
-- **从 GitHub 安装**：检查默认分支最新提交里 `package.json` 的版本号。点 **更新到 vX.Y.Z** 后，插件管理器用最新提交就地重装。新提交第一次安装需要授权构建脚本，页面会列出要授权的条目，确认后继续。
-- **从 npm 安装**：调用插件管理器原生的更新接口。
+- **从 npm 安装**：在插件详情页的 **版本** 区块选择新版本，弹出更新窗口，确认后依次检查、卸载旧版本、安装新版本；失败时自动装回旧版本。需要 dsh 0.2.2 或更新版本。控制台的新版本提示会带你到这里。
+- **从 GitHub 安装**：插件页不支持更新这类安装。详情页会提示新版本；要更新，先在插件页卸载，再从 npm 添加 `dsh-switchboard`（步骤见 [docs/PUBLISHING.md](docs/PUBLISHING.md)），设置、数据和凭据都会保留。
 - **本地链接或来源不明**：只显示版本，不检查也不更新。
 
 从旧包名 `dsh-telegram-bridge` 迁移的步骤见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。

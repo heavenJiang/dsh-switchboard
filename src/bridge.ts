@@ -750,7 +750,10 @@ export class Switchboard {
   /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
   private async registerCommands(entry: LiveLine, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
     const t = this.t
-    const extra = (harnessCommands ?? await this.harness.listCommands(undefined).catch(() => []))
+    const extra = (harnessCommands ?? await this.harness.listCommands(undefined).catch((error: unknown) => {
+      this.logger.warn(`switchboard [${entry.line.id}]: Harness commands left out of the menu: ${describe(error)}`)
+      return []
+    }))
       .filter(command => MENU_NAME.test(command.name) && !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
       .slice(0, 20)
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))

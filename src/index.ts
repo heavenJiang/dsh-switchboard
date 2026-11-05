@@ -574,8 +574,9 @@ export function apply(ctx: Context, config: Config): void {
     async listCommands(sessionId) {
       const commands = optional.commands
       if (commands === undefined) return []
+      // Without a Session, any top-level Agent can name the commands: subagents may carry scoped ones of their own.
       const agent = sessionId === undefined
-        ? agents.roots()[0]
+        ? agents.list().find(item => item.session.header.origin !== 'subagent')
         : await resolveAgent(sessionId)
       if (agent === undefined) return []
       return commands.list(agent).map(descriptor => ({
