@@ -73,6 +73,7 @@ export class FakeHarness implements HarnessPort {
   async ensureWorkspace(sessionId: string): Promise<void> {
     if (!this.workspaced.includes(sessionId)) this.workspaced.push(sessionId)
   }
+  contextUsage?: (sessionId: string) => { used: number; window?: number } | undefined
   changedFiles(): string[] | undefined {
     return ['src/a.ts', 'README.md']
   }

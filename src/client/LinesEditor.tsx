@@ -22,6 +22,7 @@ export interface LineValue {
   allowedUsers: string[]
   allowedChats: string[]
   groupMentionOnly: boolean
+  steerWhileBusy: boolean
   workspacePath: string
   apiBaseUrl: string
   appId: string
@@ -59,7 +60,7 @@ export function newRow(type: ChannelType, rows: readonly LineRow[]): LineRow {
   for (let n = 2; taken.has(id); n++) id = `${type}-${n}`
   return rowOf({
     id, type, name: '', enabled: true, secretRef: defaultSecretRef(type, id),
-    allowedUsers: [], allowedChats: [], groupMentionOnly: true, workspacePath: '',
+    allowedUsers: [], allowedChats: [], groupMentionOnly: true, steerWhileBusy: false, workspacePath: '',
     apiBaseUrl: 'https://api.telegram.org', appId: '', domain: 'feishu',
   })
 }
@@ -208,6 +209,11 @@ export function LinesEditor(props: {
                       <span>{t('lineMentionOnly')}</span>
                       <Switch checked={v.groupMentionOnly} label={t('lineMentionOnly')} disabled={disabled}
                         onChange={(on) => { update(index, { value: { groupMentionOnly: on } }) }} />
+                    </label>
+                    <label className="tgb-line-toggle">
+                      <span>{t('lineSteerWhileBusy')}</span>
+                      <Switch checked={v.steerWhileBusy === true} label={t('lineSteerWhileBusy')} disabled={disabled}
+                        onChange={(on) => { update(index, { value: { steerWhileBusy: on } }) }} />
                     </label>
                     {field('workspacePath', t('lineWorkspace'), t('lineWorkspaceHint'), v.workspacePath, (text) => { update(index, { value: { workspacePath: text } }) })}
                     {v.type === 'telegram'

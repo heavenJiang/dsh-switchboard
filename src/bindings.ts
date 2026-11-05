@@ -24,6 +24,19 @@ export interface PendingChoice {
   preset?: string
 }
 
+/** One finished turn of a followed Session, kept for the chat's digest. */
+export interface DigestItem {
+  readonly sessionId: string
+  readonly at: number
+  /** How the turn ended: `completed`, `aborted`, or a failure kind. */
+  readonly kind: string
+  /** The reply's opening, or the failure's message. */
+  readonly text?: string
+}
+
+/** Digest items a chat keeps; older ones fall off. */
+const DIGEST_ITEMS = 100
+
 /** File format version 1. */
 interface BindingsFile {
   version: 1
@@ -36,6 +49,10 @@ interface BindingsFile {
   offsets?: Record<string, number>
   /** Last Session event seq the bridge mirrored, per linked Session, so a restart can catch up. */
   cursors?: Record<string, number>
+  /** Turns of followed Sessions not yet sent in a digest, per chat key. */
+  digests?: Record<string, DigestItem[]>
+  /** Local day (`YYYY-MM-DD`) the last daily digest went out. */
+  digestDay?: string
 }
 
 /**
@@ -99,6 +116,8 @@ export class BindingStore {
       ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
       ...(parsed.offsets === undefined ? {} : { offsets: parsed.offsets }),
       ...(parsed.cursors === undefined ? {} : { cursors: parsed.cursors }),
+      ...(parsed.digests === undefined ? {} : { digests: parsed.digests }),
+      ...(parsed.digestDay === undefined ? {} : { digestDay: parsed.digestDay }),
     }
   }
 
@@ -205,6 +224,44 @@ export class BindingStore {
   setCursor(sessionId: string, seq: number): Promise<void> {
     if (seq <= (this.data.cursors?.[sessionId] ?? -1)) return this.writing
     this.data.cursors = { ...this.data.cursors, [sessionId]: seq }
+    return this.flush()
+  }
+
+  /** @returns the turns waiting for a chat's digest, oldest first. */
+  digestItems(chat: string): readonly DigestItem[] {
+    return this.data.digests?.[chat] ?? []
+  }
+
+  /** @returns the chats with turns waiting for a digest. */
+  digestChats(): string[] {
+    return Object.keys(this.data.digests ?? {})
+  }
+
+  /** Keep a finished turn for each chat's digest and persist. */
+  addDigest(chats: readonly string[], item: DigestItem): Promise<void> {
+    if (chats.length === 0) return this.writing
+    const digests = { ...this.data.digests }
+    for (const chat of chats) digests[chat] = [...digests[chat] ?? [], item].slice(-DIGEST_ITEMS)
+    this.data.digests = digests
+    return this.flush()
+  }
+
+  /** Forget a chat's waiting turns and persist. */
+  clearDigest(chat: string): Promise<void> {
+    const digests = { ...this.data.digests }
+    delete digests[chat]
+    this.data.digests = digests
+    return this.flush()
+  }
+
+  /** @returns the local day the last daily digest went out. */
+  digestDay(): string | undefined {
+    return this.data.digestDay
+  }
+
+  /** Record the day of a daily digest and persist. */
+  setDigestDay(day: string): Promise<void> {
+    this.data.digestDay = day
     return this.flush()
   }
 

@@ -52,7 +52,8 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | `/model [name]` | Show or switch the Session's model (buttons, fuzzy match; the Web default is untouched) |
 | `/mode [mode]` | Show or switch the Session's permission mode |
 | `/get <path>` | Fetch a file or list a directory inside the working directory (symlinks cannot escape it) |
-| `/status` | Session, model, directory, run state, and line |
+| `/status` | Session, model, directory, run state, line, context use, this turn's time, goal, todos, subagents, and queue |
+| `/digest` | Roundup of followed Sessions over 24 hours: finished, failed, waiting for you, and running. Set **Daily digest of followed Sessions** to get it once a day instead of a notice per turn; failures, approvals, and questions still arrive at once |
 | `/whoami` | Your user and chat id (anyone) |
 | Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer; `/help` lists them |
 | other `/xxx` | Not a command: sent to the Agent as text |

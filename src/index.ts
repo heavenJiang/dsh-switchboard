@@ -42,6 +42,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-user-approval'
 // Side-effect type import: declaration-merges the question waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-questions'
+import type {} from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-workspace-changes'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { BindingStore, defaultStateFile, migrateLegacyStateDir } from './bindings.ts'
@@ -89,6 +90,8 @@ export interface LineConfig {
   allowedChats: readonly string[]
   /** In groups, answer only commands, @mentions, and replies to the bot. */
   groupMentionOnly: boolean
+  /** While a turn runs, plain text and voice join it instead of waiting in the queue. */
+  steerWhileBusy: boolean
   /** Working directory for this line's new Sessions; empty uses the plugin-wide one. */
   workspacePath: string
   /** Telegram: Bot API root. */
@@ -108,6 +111,7 @@ const LineConfig: Schema<LineConfig> = Schema.object({
   allowedUsers: Schema.array(Schema.string()).default([]),
   allowedChats: Schema.array(Schema.string()).default([]),
   groupMentionOnly: Schema.boolean().default(true),
+  steerWhileBusy: Schema.boolean().default(false),
   workspacePath: Schema.string().default(''),
   apiBaseUrl: Schema.string().default('https://api.telegram.org'),
   appId: Schema.string().default(''),
@@ -172,6 +176,8 @@ export interface Config {
   people: Volatile<PersonSettings[]>
   /** Chat keys told when a line stays down; the schedule chats when empty. */
   alertChats: Volatile<string[]>
+  /** Local time (`HH:MM`) of the daily digest of followed Sessions; empty sends each turn's notice instead. */
+  watchDigestTime: Volatile<string>
   /** Minutes a line may be down before the alert chats hear of it; 0 turns alerts off. */
   alertAfterMin: Volatile<number>
   /** Transcribe voice notes when speech recognition is composed. */
@@ -231,6 +237,7 @@ export const Config: Schema<Config> = Schema.object({
     dirs: Schema.array(Schema.string()).default([]),
   })).default([]).volatile(),
   alertChats: Schema.array(Schema.string()).default([]).volatile(),
+  watchDigestTime: Schema.string().default('').volatile(),
   alertAfterMin: Schema.natural().max(1440).default(5).volatile(),
   transcribeVoice: Schema.boolean().default(true).volatile(),
   ffmpegPath: Schema.string().default('ffmpeg').volatile(),
@@ -284,6 +291,7 @@ export function apply(ctx: Context, config: Config): void {
     changes?: Context['workspaceChanges']
     workspaces?: Context['workspaceRegistry']
     commands?: Context['commands']
+    tokenMeter?: Context['tokenMeter']
   } = {}
   ctx.inject(['workspaceRegistry'], (scope) => {
     optional.workspaces = scope.workspaceRegistry
@@ -292,6 +300,10 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['speechToText'], (scope) => {
     optional.speech = scope.speechToText
     scope.effect(() => () => { delete optional.speech }, 'switchboard: speech service')
+  })
+  ctx.inject(['tokenMeter'], (scope) => {
+    optional.tokenMeter = scope.tokenMeter
+    scope.effect(() => () => { delete optional.tokenMeter }, 'switchboard: token meter')
   })
   ctx.inject(['workspaceChanges'], (scope) => {
     optional.changes = scope.workspaceChanges
@@ -302,6 +314,17 @@ export function apply(ctx: Context, config: Config): void {
     optional.commands = scope.commands
     scope.effect(() => () => { delete optional.commands }, 'switchboard: command registry')
   })
+
+  /** The top-level Session a subagent works for, through any subagents that started it. */
+  const rootSession = (header: { id: SessionId; origin?: string; parentSession?: SessionId }): string => {
+    let current = header
+    while (current.origin === 'subagent' && current.parentSession !== undefined) {
+      const parent = agents.get(current.parentSession)?.session.header
+      if (parent === undefined) return current.parentSession
+      current = parent
+    }
+    return current.id
+  }
 
   /** The Session's live Agent, resumed through the Session controller like any other Host API domain. */
   const resolveAgent = async (sessionId: string) => {
@@ -321,6 +344,7 @@ export function apply(ctx: Context, config: Config): void {
       allowedUsers: [...config.allowedUsers.get()],
       allowedChats: [...config.allowedChats.get()],
       groupMentionOnly: config.groupMentionOnly.get(),
+      steerWhileBusy: false,
       workspacePath: '',
       apiBaseUrl: config.apiBaseUrl.get(),
       appId: '', domain: 'feishu',
@@ -363,6 +387,7 @@ export function apply(ctx: Context, config: Config): void {
       allowedUsers: line.allowedUsers,
       allowedChats: line.allowedChats,
       groupMentionOnly: line.groupMentionOnly,
+      steerWhileBusy: line.steerWhileBusy,
       workspacePath: line.workspacePath,
       ...(secret === undefined ? {} : { secret }),
       ...(line.type === 'telegram'
@@ -417,6 +442,7 @@ export function apply(ctx: Context, config: Config): void {
       transcribeVoice: config.transcribeVoice.get(),
       scheduleChats: config.scheduleChats.get(),
       alertChats: config.alertChats.get(),
+      watchDigestTime: config.watchDigestTime.get(),
       longReplyChars: config.longReplyChars.get(),
       people: config.people.get(),
       alertAfterMin: config.alertAfterMin.get(),
@@ -595,6 +621,18 @@ export function apply(ctx: Context, config: Config): void {
       const { result } = execution
       return { kind: result.kind, ...(result.text === undefined ? {} : { text: result.text }) }
     },
+    contextUsage(sessionId) {
+      const agent = agents.get(sessionId as SessionId)
+      if (agent === undefined || optional.tokenMeter === undefined) return undefined
+      try {
+        const { pressureTokens, contextWindow } = optional.tokenMeter.contextPressure(agent.session)
+        if (pressureTokens === undefined) return undefined
+        return { used: pressureTokens, ...(contextWindow === undefined ? {} : { window: contextWindow }) }
+      } catch (error: unknown) {
+        logger.debug(`switchboard: context usage unavailable: ${String(error)}`)
+        return undefined
+      }
+    },
     changedFiles(sessionId, seq) {
       const summary = optional.changes?.summary(sessionId as SessionId, seq as never)
       return summary?.files.map(file => file.display)
@@ -713,6 +751,8 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.on('agent/status', ({ agent, status }) => {
     bridge.onAgentStatus(agent.session.header.id, status === 'running')
+    const { header } = agent.session
+    if (header.origin === 'subagent') bridge.onSubagentStatus(rootSession(header), header.id, status === 'running')
   })
 
   // Prepended so a linked chat is asked before the Web UI; a timeout or an
@@ -725,7 +765,12 @@ export function apply(ctx: Context, config: Config): void {
       ...(request.reason === undefined ? {} : { reason: request.reason }),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     })
-    return outcome === 'delegate' ? next() : outcome
+    if (outcome === 'delegate') return next()
+    if (outcome !== 'timeout') return outcome
+    const handed = await next()
+    // Nobody else can answer: the chat should know the step did not run.
+    if (handed === 'unavailable') bridge.noteUnanswered(request.agent.session.header.id, request.toolName)
+    return handed
   }, { prepend: true })
 
   // The Agent's questions go to linked chats first, like approvals.

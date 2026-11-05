@@ -1026,11 +1026,458 @@ describe('harness commands', () => {
 
   it('lists Harness commands in /help and in the bot menu', async () => {
     const menu = telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands'] as { command: string }[]
-    expect(menu.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'help', 'compact', 'goal'])
+    expect(menu.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'digest', 'help', 'compact', 'goal'])
     await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/help'))
     await until(() => telegram.sent().length === 1)
     expect(telegram.sent()[0]).toContain('/compact [focus] — Compact the context')
     expect(telegram.sent()[0]).not.toContain('Harness status (shadowed')
+  })
+})
+
+describe('turn details in the progress message', () => {
+  const progressText = (): string => [...telegram.sent(), ...telegram.edits()].filter(t => t.startsWith('⏳')).at(-1) ?? ''
+
+  it('shows the todo list, and drops it once everything is done', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', {
+      type: 'todo/write',
+      data: { todos: [{ content: 'Read', status: 'completed' }, { content: 'Fix the API', status: 'in_progress' }, { content: 'Test', status: 'pending' }] },
+    })
+    await until(() => progressText().includes('✅ 1/3 · now: Fix the API'), 2500)
+    bridge.onSessionEvent('s1', { type: 'todo/write', data: { todos: [{ content: 'Read', status: 'completed' }] } })
+    await until(() => !progressText().includes('✅') && progressText() !== '', 2500)
+  })
+
+  it('says so while the context is compacted', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', { type: 'compaction/start', data: {} })
+    await until(() => progressText().includes('Compacting the context'), 2500)
+    bridge.onSessionEvent('s1', { type: 'compaction/end', data: {} })
+    await until(() => !progressText().includes('Compacting'), 2500)
+  })
+})
+
+describe('steering while busy', () => {
+  it('sends plain text into the running turn on a line set to steer', async () => {
+    settings = withLine({ steerWhileBusy: true })
+    await store.update(KEY, { sessionId: 's1' })
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    harness.running = true
+    telegram.push(text(USER, 'use the other file'))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]!.mode).toBe('steer')
+    expect(telegram.sent().some(t => t.includes('queued'))).toBe(false)
+  })
+
+  it('queues while idle, on other lines, and for quotes', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    settings = withLine({ steerWhileBusy: true })
+    telegram.push(text(USER, 'idle'))
+    await until(() => harness.prompts.length === 1)
+    harness.running = true
+    settings = withLine({ steerWhileBusy: false })
+    telegram.push(text(USER, 'not on this line'))
+    await until(() => harness.prompts.length === 2)
+    settings = withLine({ steerWhileBusy: true })
+    telegram.push({ message: { message_id: 2, from: USER, chat: CHAT, date: 0, text: 'this one', reply_to_message: { message_id: 1, from: USER, chat: CHAT, date: 0, text: 'earlier' } } })
+    await until(() => harness.prompts.length === 3)
+    expect(harness.prompts.map(p => p.mode)).toEqual(['queue', 'queue', 'queue'])
+  })
+})
+
+describe('waiting for an answer', () => {
+  const buttonsOf = (match: string): { text: string; callback_data: string }[] => {
+    const call = telegram.calls.find(c => c.method === 'sendMessage' && String(c.params['text']).includes(match))!
+    return (call.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard.flat()
+  }
+
+  it('reminds before the time runs out, then reports the timeout', async () => {
+    settings = { ...settings, approvalTimeoutSec: 0.2 }
+    await store.update(KEY, { sessionId: 's1' })
+    const outcome = bridge.requestApproval({ sessionId: 's1', toolName: 'bash' })
+    await until(() => telegram.sent().some(t => t.startsWith('⏰')))
+    expect(buttonsOf('⏰').map(b => b.callback_data.at(-1))).toEqual(['y', 'n', 'w'])
+    await expect(outcome).resolves.toBe('timeout')
+  })
+
+  it('answers from the reminder and closes it', async () => {
+    settings = { ...settings, approvalTimeoutSec: 0.4 }
+    await store.update(KEY, { sessionId: 's1' })
+    const outcome = bridge.requestApproval({ sessionId: 's1', toolName: 'bash' })
+    await until(() => telegram.sent().some(t => t.startsWith('⏰')))
+    telegram.push({ callback_query: { id: 'q1', from: USER, data: buttonsOf('⏰')[0]!.callback_data } })
+    await expect(outcome).resolves.toBe('allowed-once')
+    await until(() => telegram.edits().filter(t => t.includes('Allowed')).length === 2)
+  })
+
+  it('waits longer when asked', async () => {
+    settings = { ...settings, approvalTimeoutSec: 0.4 }
+    await store.update(KEY, { sessionId: 's1' })
+    const started = Date.now()
+    const outcome = bridge.requestApproval({ sessionId: 's1', toolName: 'bash' })
+    await until(() => telegram.sent().some(t => t.startsWith('⏰')))
+    telegram.push({ callback_query: { id: 'q1', from: USER, data: buttonsOf('⏰')[2]!.callback_data } })
+    await until(() => telegram.edits().some(t => t.includes('Waiting another')))
+    await expect(outcome).resolves.toBe('timeout')
+    expect(Date.now() - started).toBeGreaterThan(600)
+  })
+
+  it('reminds about questions and can wait longer', async () => {
+    settings = { ...settings, approvalTimeoutSec: 0.4 }
+    await store.update(KEY, { sessionId: 's1' })
+    const started = Date.now()
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [{ id: 'q', question: 'Which?' }] })
+    await until(() => telegram.sent().some(t => t.startsWith('⏰')))
+    telegram.push({ callback_query: { id: 'q1', from: USER, data: buttonsOf('⏰')[0]!.callback_data } })
+    await expect(answer).resolves.toBe('delegate')
+    expect(Date.now() - started).toBeGreaterThan(600)
+  })
+
+  it('tells the chat when nobody took over an approval', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.noteUnanswered('s1', 'bash')
+    await until(() => telegram.sent().some(t => t.includes('did not run')))
+  })
+})
+
+describe('/status details', () => {
+  it('adds the context, the running turn, todos, and the queue', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    harness.inbox.set('s1', [{ id: 'a', text: 'next' }])
+    harness.contextUsage = () => ({ used: 84_000, window: 200_000 })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() - 5000 })
+    bridge.onSessionEvent('s1', { type: 'todo/write', data: { todos: [{ content: 'Fix', status: 'in_progress' }] } })
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    const status = telegram.sent().find(t => t.startsWith('Bot:'))!
+    expect(status).toContain('Context: 42% (84k / 200k)')
+    expect(status).toContain('This turn:')
+    expect(status).toContain('Todos: ✅ 0/1 · now: Fix')
+    expect(status).toContain('Queued: 1')
+  })
+
+  it('stays short without those details', async () => {
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(telegram.sent().find(t => t.startsWith('Bot:'))).not.toMatch(/Context|This turn|Todos|Queued/u)
+  })
+})
+
+describe('menu', () => {
+  it('adds Harness commands at the first turn when none were listed at connect', async () => {
+    await bridge.stop()
+    const commands = harness.commands
+    harness.commands = []
+    telegram.calls.length = 0
+    await bridge.reconcile()
+    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
+    harness.commands = commands
+    bridge.onSessionEvent('s9', { type: 'turn/start', time: Date.now() })
+    await until(() => telegram.calls.filter(c => c.method === 'setMyCommands').length === 2)
+    const menu = telegram.calls.filter(c => c.method === 'setMyCommands').at(-1)!.params['commands'] as { command: string }[]
+    expect(menu.map(c => c.command)).toContain('compact')
+    bridge.onSessionEvent('s9', { type: 'turn/start', time: Date.now() })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(telegram.calls.filter(c => c.method === 'setMyCommands')).toHaveLength(2)
+  })
+})
+
+describe('digest of followed Sessions', () => {
+  const finish = (sessionId: string, reply: string, kind = 'completed'): void => {
+    bridge.onSessionEvent(sessionId, { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent(sessionId, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: reply }] } } })
+    bridge.onSessionEvent(sessionId, { type: 'turn/end', time: Date.now(), data: { reason: { kind, ...(kind === 'completed' ? {} : { error: { message: 'boom' } }) } } })
+  }
+
+  it('sends each turn as before when no time is set, and /digest gathers them', async () => {
+    await store.setWatch(KEY, 's1', true)
+    finish('s1', 'Deployed.')
+    finish('s1', 'Tested.')
+    await until(() => telegram.sent().filter(t => t.startsWith('✅')).length === 2)
+    telegram.push(text(USER, '/digest'))
+    await until(() => telegram.sent().some(t => t.startsWith('📋')))
+    const digest = telegram.sent().find(t => t.startsWith('📋'))!
+    expect(digest).toContain('s1')
+    expect(digest).toContain('2 turn(s) · Tested.')
+  })
+
+  it('explains an empty digest', async () => {
+    telegram.push(text(USER, '/digest'))
+    await until(() => telegram.sent().some(t => t.includes('/watch')))
+    await store.setWatch(KEY, 's1', true)
+    telegram.push(text(USER, '/digest'))
+    await until(() => telegram.sent().some(t => t.includes('Nothing new')))
+  })
+
+  it('shows what waits for an answer', async () => {
+    await store.setWatch(KEY, 's1', true)
+    const outcome = bridge.requestApproval({ sessionId: 's1', toolName: 'bash' })
+    await until(() => telegram.sent().some(t => t.includes('bash')))
+    telegram.push(text(USER, '/digest'))
+    await until(() => telegram.sent().some(t => t.startsWith('📋')))
+    expect(telegram.sent().find(t => t.startsWith('📋'))).toContain('Waiting for you')
+    await bridge.stop()
+    await outcome
+  })
+
+  it('holds finished turns for the daily message, but not failures', async () => {
+    settings = { ...settings, watchDigestTime: '20:00' }
+    await store.setWatch(KEY, 's1', true)
+    finish('s1', 'Deployed.')
+    finish('s1', 'Oops', 'error')
+    await until(() => telegram.sent().some(t => t.includes('boom')))
+    expect(telegram.sent().some(t => t.startsWith('✅'))).toBe(false)
+
+    await bridge.sendDailyDigest(new Date(2026, 10, 5, 19, 59))
+    expect(telegram.sent().some(t => t.startsWith('📋'))).toBe(false)
+    await bridge.sendDailyDigest(new Date(2026, 10, 5, 20, 0))
+    await until(() => telegram.sent().some(t => t.startsWith('📋')))
+    const digest = telegram.sent().find(t => t.startsWith('📋'))!
+    expect(digest).toContain('Finished')
+    expect(digest).toContain('Failed or stopped')
+
+    // Once a day, and the sent turns do not come back.
+    finish('s1', 'Later.')
+    await until(() => store.digestItems(KEY).length === 1)
+    await bridge.sendDailyDigest(new Date(2026, 10, 5, 21, 0))
+    expect(telegram.sent().filter(t => t.startsWith('📋'))).toHaveLength(1)
+    await bridge.sendDailyDigest(new Date(2026, 10, 6, 20, 1))
+    await until(() => telegram.sent().filter(t => t.startsWith('📋')).length === 2)
+    expect(telegram.sent().filter(t => t.startsWith('📋')).at(-1)).not.toContain('Deployed')
+  })
+
+  it('keeps sending each turn when the digest time cannot be read', async () => {
+    settings = { ...settings, watchDigestTime: '25:00' }
+    await store.setWatch(KEY, 's1', true)
+    finish('s1', 'Deployed.')
+    await until(() => telegram.sent().some(t => t.startsWith('✅')))
+  })
+
+  it('keeps waiting turns across restarts', async () => {
+    await store.setWatch(KEY, 's1', true)
+    await store.addDigest([KEY], { sessionId: 's1', at: 5, kind: 'completed', text: 'Kept' })
+    await store.setDigestDay('2026-11-05')
+    await store.settled()
+    const reloaded = new BindingStore(join(dir, 'state.json'))
+    await reloaded.load()
+    expect(reloaded.digestItems(KEY)).toEqual([{ sessionId: 's1', at: 5, kind: 'completed', text: 'Kept' }])
+    expect(reloaded.digestDay()).toBe('2026-11-05')
+  })
+})
+
+describe('plan review', () => {
+  const plan = (detail: string) => ({
+    id: 'plan-review', header: 'Plan review', question: 'Approve this plan and leave plan mode?', detail,
+    options: [{ label: 'Approve' }, { label: 'Keep planning' }],
+    intent: { kind: 'plan-review', approve: 'Approve' },
+  })
+  const review = () => telegram.calls.find(c => c.method === 'sendMessage' && String(c.params['text']).includes('review the plan'))!
+  const choices = () => (review().params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard.flat()
+
+  it('sends the plan, then buttons that answer with the original labels', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [plan('# Steps\n1. Fix the API')] })
+    await until(() => telegram.calls.some(c => c.method === 'sendMessage' && String(c.params['text']).includes('review the plan')))
+    const texts = telegram.sent()
+    expect(texts.findIndex(t => t.includes('Fix the API'))).toBeLessThan(texts.findIndex(t => t.includes('review the plan')))
+    expect(choices().map(b => b.text)).toEqual(['✅ Approve and start', '📝 Keep planning'])
+    telegram.push({ callback_query: { id: 'q1', from: USER, data: choices()[0]!.callback_data } })
+    await expect(answer).resolves.toEqual({ answers: [{ id: 'plan-review', selected: ['Approve'] }] })
+  })
+
+  it('takes plain text as feedback', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [plan('Plan')] })
+    await until(() => telegram.sent().some(t => t.includes('review the plan')))
+    telegram.push(text(USER, 'skip step 2'))
+    await expect(answer).resolves.toEqual({ answers: [{ id: 'plan-review', selected: [], custom: 'skip step 2' }] })
+  })
+
+  it('keeps a guest from approving', async () => {
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'guest', dirs: [] }] }
+    await store.update(KEY, { sessionId: 's1' })
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [plan('Plan')] })
+    await until(() => telegram.sent().some(t => t.includes('review the plan')))
+    telegram.push({ callback_query: { id: 'q1', from: USER, data: choices()[0]!.callback_data } })
+    await until(() => telegram.calls.some(c => c.method === 'answerCallbackQuery'))
+    await bridge.stop()
+    await expect(answer).resolves.toBe('delegate')
+  })
+
+  it('splits a plan longer than one message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [plan(`${'Step one of the plan.\n\n'.repeat(400)}The end.`)] })
+    await until(() => telegram.sent().some(t => t.includes('review the plan')))
+    expect(telegram.sent().every(t => t.length <= 4096)).toBe(true)
+    expect(telegram.sent().join('')).toContain('The end.')
+    await bridge.stop()
+    await answer
+  })
+
+  it('moves a long detail of an ordinary question out of the buttons message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    const answer = bridge.requestAnswers({ sessionId: 's1', questions: [{ id: 'q', question: 'Which?', detail: 'x '.repeat(1000), options: [{ label: 'A' }] }] })
+    await until(() => telegram.sent().some(t => t.includes('Which?')))
+    expect(telegram.sent().find(t => t.includes('Which?'))!.length).toBeLessThan(300)
+    await bridge.stop()
+    await answer
+  })
+})
+
+describe('approval shortcuts', () => {
+  const ask = (toolName: string, reason?: string) => bridge.requestApproval({ sessionId: 's1', toolName, ...(reason === undefined ? {} : { reason }) })
+  const prompts = () => telegram.calls.filter(c => c.method === 'sendMessage' && c.params['reply_markup'] !== undefined && String(c.params['text']).includes('Approval needed'))
+  const buttons = (index: number) => (prompts()[index]!.params['reply_markup'] as { inline_keyboard: { callback_data: string }[][] }).inline_keyboard.flat().map(b => b.callback_data)
+  const press = (data: string, id = 'q1') => { telegram.push({ callback_query: { id, from: USER, message: { message_id: 1, chat: CHAT, date: 0 }, data } }) }
+  const startTurn = async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+  }
+
+  it('skips later approvals of the same tool and reason until the turn ends', async () => {
+    await startTurn()
+    const first = ask('edit')
+    await until(() => prompts().length === 1)
+    press(buttons(0).find(data => data.endsWith(':a'))!)
+    await expect(first).resolves.toBe('allowed-once')
+    await expect(ask('edit')).resolves.toBe('allowed-once')
+    expect(prompts()).toHaveLength(1)
+
+    // Another reason is another risk.
+    const other = ask('edit', 'outside the workspace')
+    await until(() => prompts().length === 2)
+    press(buttons(1)[1]!, 'q2')
+    await expect(other).resolves.toBe('rejected')
+
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    const next = ask('edit')
+    await until(() => prompts().length === 3)
+    await bridge.stop()
+    await next
+  })
+
+  it('never offers it for a shell or outside a turn', async () => {
+    await startTurn()
+    const shell = ask('bash')
+    await until(() => prompts().length === 1)
+    expect(buttons(0).some(data => data.endsWith(':a'))).toBe(false)
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    const idle = ask('edit')
+    await until(() => prompts().length === 2)
+    expect(buttons(1).some(data => data.endsWith(':a'))).toBe(false)
+    await bridge.stop()
+    await Promise.all([shell, idle])
+  })
+
+  it('is for admins only', async () => {
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'member', dirs: [] }] }
+    await startTurn()
+    const outcome = ask('edit')
+    await until(() => prompts().length === 1)
+    press(buttons(0).find(data => data.endsWith(':a'))!)
+    await until(() => telegram.calls.some(c => c.method === 'answerCallbackQuery'))
+    await bridge.stop()
+    await expect(outcome).resolves.toBe('delegate')
+  })
+
+  it('records each approval it skips', async () => {
+    await startTurn()
+    const first = ask('edit')
+    await until(() => prompts().length === 1)
+    press(buttons(0).find(data => data.endsWith(':a'))!)
+    await first
+    await ask('edit')
+    await chatLog.settled()
+    const entries = (await chatLog.history(KEY, undefined, 50)).entries.filter(entry => entry.kind === 'approval')
+    expect(entries.at(-1)?.approval?.by).toContain('allowed for the turn')
+  })
+
+  it('passes the next message to the Agent as the reason for a rejection', async () => {
+    await startTurn()
+    harness.loaded.set('s1', { provider: 'local', model: 'small' })
+    harness.running = true
+    const outcome = ask('bash')
+    await until(() => prompts().length === 1)
+    press(buttons(0)[1]!)
+    await expect(outcome).resolves.toBe('rejected')
+    await until(() => telegram.calls.some(c => c.method === 'answerCallbackQuery'))
+    telegram.push(text(USER, 'wrong branch'))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]).toMatchObject({ mode: 'steer', parts: [{ type: 'text', text: 'I rejected the bash call because: wrong branch' }] })
+    telegram.push(text(USER, 'something else'))
+    await until(() => harness.prompts.length === 2)
+    expect(harness.prompts[1]!.parts).toEqual([{ type: 'text', text: 'something else' }])
+  })
+
+  it('does not take a follower\'s next message as the reason', async () => {
+    await store.update(KEY, { sessionId: 'other' })
+    await store.setWatch(KEY, 's1', true)
+    const outcome = ask('bash')
+    await until(() => prompts().length === 1)
+    press(buttons(0)[1]!)
+    await expect(outcome).resolves.toBe('rejected')
+    await until(() => telegram.calls.some(c => c.method === 'answerCallbackQuery'))
+    telegram.push(text(USER, 'hello'))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]).toMatchObject({ sessionId: 'other', parts: [{ type: 'text', text: 'hello' }] })
+  })
+})
+
+describe('subagents and goals', () => {
+  const goal = (operation: string, patch: Record<string, unknown> = {}) => ({
+    type: 'goal/change',
+    data: { kind: 'goal/change', version: 1, operation, roundsStarted: 3, goal: { objective: 'Ship it', phase: 'active', maxGoalRounds: 10, ...patch } },
+  })
+
+  it('counts running subagents in the progress message and /status', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSubagentStatus('s1', 'c1', true)
+    bridge.onSubagentStatus('s1', 'c2', true)
+    await until(() => [...telegram.sent(), ...telegram.edits()].some(t => t.includes('2 subagent(s) running')), 2500)
+    bridge.onSubagentStatus('s1', 'c2', false)
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(telegram.sent().find(t => t.startsWith('Bot:'))).toContain('Subagents: 1 running')
+  })
+
+  it('forgets subagents when the turn ends', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSubagentStatus('s1', 'c1', true)
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(telegram.sent().find(t => t.startsWith('Bot:'))).not.toContain('Subagents')
+  })
+
+  it('tells bound and following chats when a goal is reached or blocked', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', goal('create'))
+    expect(telegram.sent()).toEqual([])
+    bridge.onSessionEvent('s1', goal('complete', { phase: 'complete' }))
+    await until(() => telegram.sent().some(t => t.includes('Goal reached (3 round(s)): Ship it')))
+    await store.update(KEY, { sessionId: undefined })
+    await store.setWatch(KEY, 's1', true)
+    bridge.onSessionEvent('s1', goal('block', { phase: 'blocked', blockedReason: { code: 'no-access', message: 'No access' } }))
+    await until(() => telegram.sent().some(t => t.includes('Goal blocked: Ship it\nReason: No access')))
+  })
+
+  it('shows the goal in /status until it is cleared', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', goal('create'))
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(telegram.sent().find(t => t.startsWith('Bot:'))).toContain('Goal: Ship it (active · 3/10 rounds)')
+    bridge.onSessionEvent('s1', { type: 'goal/change', data: { kind: 'goal/change', version: 1, operation: 'clear', cleared: {}, clearedAt: 1 } })
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().filter(t => t.startsWith('Bot:')).length === 2)
+    expect(telegram.sent().filter(t => t.startsWith('Bot:')).at(-1)).not.toContain('Goal')
   })
 })

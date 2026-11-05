@@ -35,6 +35,7 @@
       "@deepseek-ai/dsh-credentials": ["../deepseek-harness/packages/credentials/credentials"],
       "@deepseek-ai/dsh-experimental-speech-to-text": ["../deepseek-harness/packages/experimental/speech-to-text"],
       "@deepseek-ai/dsh-system-prompt": ["../deepseek-harness/packages/core/system-prompt"],
+      "@deepseek-ai/dsh-token-meter": ["../deepseek-harness/packages/llm/token-meter"],
       "@deepseek-ai/dsh-workspace-changes": ["../deepseek-harness/packages/deliverables/workspace-changes"],
       "@deepseek-ai/dsh-user-questions": ["../deepseek-harness/packages/interaction/user-questions"],
       "@deepseek-ai/dsh-workspace": ["../deepseek-harness/packages/workspace/workspace"],

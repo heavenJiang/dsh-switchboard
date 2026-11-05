@@ -18,13 +18,13 @@ import { randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
-import type { BindingStore, PendingChoice } from './bindings.ts'
+import type { BindingStore, DigestItem, PendingChoice } from './bindings.ts'
 import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
 import { createFeishuApi } from './channels/feishu-api.ts'
 import { TelegramChannel } from './channels/telegram.ts'
 import {
   undelivered,
-  type Button, type Channel, type ChannelChat, type ChannelSink, type ChannelUser, type InboundAction, type InboundAttachment,
+  type Button, type Channel, type ChannelChat, type ChannelSink, type OutMessage, type ChannelUser, type InboundAction, type InboundAttachment,
   type InboundMessage, type LineState, type SentMarkdown,
 } from './channels/types.ts'
 import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
@@ -78,6 +78,8 @@ export interface BridgeSettings {
   readonly alertAfterMin?: number
   /** Model for Sessions the bot creates; the Web default when undefined. */
   readonly model?: ModelChoice
+  /** Local time (`HH:MM`) of the daily digest of followed Sessions; empty sends each turn's notice instead. */
+  readonly watchDigestTime?: string
 }
 
 /** A provider route, model, and optional reasoning effort. */
@@ -196,6 +198,8 @@ export interface HarnessPort {
   queued(sessionId: string): QueuedItem[] | undefined
   /** Drop queued prompts by id, or all; returns how many were dropped. */
   dropQueued(sessionId: string, ids: readonly string[] | 'all'): number
+  /** How full a live Session's context is, in tokens; undefined when unknown. */
+  contextUsage?(sessionId: string): { used: number; window?: number } | undefined
   /** Files a finished turn changed, from the workspace-changes summary at `seq`; undefined when unknown. */
   changedFiles(sessionId: string, seq: number): string[] | undefined
   /**
@@ -234,13 +238,27 @@ export interface ChannelOptions {
 }
 
 /** Approval answer from a chat, or a hand-back to the next answerer. */
-export type TelegramApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'delegate'
+export type TelegramApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'delegate' | 'timeout'
+
+/** How long a chat has to answer: a reminder shortly before the end, which can buy more time. */
+interface Deadline {
+  /** Reminders sent, which the answer or an extension rewrites. */
+  readonly reminders: { chat: string; messageId: string }[]
+  /** Start the wait over. */
+  extend(): void
+  clear(): void
+}
 
 /** One question waiting on a button. */
 interface PendingApproval {
   readonly sessionId: string
+  readonly toolName: string
+  /** What "Allow for this turn" remembers. */
+  readonly grantKey: string
   readonly prompts: { chat: string; messageId: string }[]
   settle(outcome: TelegramApprovalOutcome, note: string, by?: string): void
+  /** Wait longer before handing the approval on. */
+  extend(): void
 }
 
 /** One question the Agent asked, as a chat shows it. */
@@ -251,6 +269,8 @@ export interface QuestionItem {
   readonly detail?: string
   readonly options?: readonly { readonly label: string }[]
   readonly multiSelect?: boolean
+  /** How a capable UI presents the question; `plan-review` asks to approve the plan in `detail`. */
+  readonly intent?: { readonly kind: string; readonly approve?: string }
 }
 
 /** The answer batch for one question request. */
@@ -262,6 +282,8 @@ export interface QuestionAnswer {
 interface PendingQuestions {
   readonly sessionId: string
   readonly chats: string[]
+  /** Wait longer before handing the questions on. */
+  extend(): void
   readonly items: {
     readonly item: QuestionItem
     /** Message id per chat key. */
@@ -298,6 +320,8 @@ interface Progress {
   segment: number
   /** Reply text being streamed. */
   text: string
+  /** The context is being compacted, which can take a while with nothing else to show. */
+  compacting: boolean
   /** Progress message per chat key. */
   messages: Map<string, string>
   timer: ReturnType<typeof setTimeout> | undefined
@@ -354,6 +378,27 @@ interface TurnState {
   lastText?: string
 }
 
+/** One entry of an Agent's todo list, as the `todo/write` event carries it. */
+interface TodoItem {
+  readonly content: string
+  readonly status: 'pending' | 'in_progress' | 'completed'
+}
+
+/** A goal as the `goal/change` event carries it. */
+interface GoalState {
+  readonly objective: string
+  readonly phase: string
+  readonly blockedReason?: { readonly message: string }
+  readonly maxGoalRounds?: number
+}
+
+/** A person who rejected an approval and may say why in their next message. */
+interface Rejection {
+  readonly userId: string
+  readonly tool: string
+  readonly at: number
+}
+
 /** One running line. */
 interface LiveLine {
   readonly line: LineSettings
@@ -377,7 +422,7 @@ export type BridgeState = LineState
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
   'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
-  'status', 'model', 'mode', 'get', 'whoami',
+  'status', 'model', 'mode', 'get', 'whoami', 'digest',
 ])
 /** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
 const WEB_ONLY_COMMANDS = new Set(['switchboard'])
@@ -416,6 +461,22 @@ const EXCERPT_LENGTH = 400
 const OUTBOX_INTERVAL_MS = 30_000
 /** Turns sent after a restart, newest last; older ones stay in the Web UI. */
 const CATCH_UP_TURNS = 3
+/** A waiting chat is reminded this long before its time runs out, or a quarter of the wait when that is shorter. */
+const REMINDER_LEAD_MS = 60_000
+/** Sessions whose todo list is remembered for progress and /status. */
+const TODO_SESSIONS = 64
+/** Tools "Allow for this turn" may cover. Never a shell: allowing one command says nothing about the next. */
+const TURN_GRANT_TOOLS = new Set(['edit', 'write'])
+/** How long the next message of someone who rejected an approval counts as the reason. */
+const REJECT_REASON_MS = 2 * 60 * 1000
+/** A question's detail longer than this goes as its own message: buttons cannot sit under a split message. */
+const QUESTION_DETAIL_LIMIT = 1500
+/** What /digest looks back on. */
+const DIGEST_WINDOW_MS = 24 * 60 * 60 * 1000
+/** A digest time; anything else counts as no digest, so notices are never held for one that cannot come. */
+const DIGEST_TIME = /^([01]\d|2[0-3]):[0-5]\d$/u
+/** Characters of a reply or failure a digest line quotes. */
+const DIGEST_EXCERPT = 80
 
 /** The bridge core. One instance lives for the plugin's lifetime; lines restart when their settings change. */
 export class Switchboard {
@@ -427,6 +488,16 @@ export class Switchboard {
   private readonly toolCalls = new Map<string, { name: string; arguments: string }>()
   /** The running turn's progress message per Session. */
   private readonly progress = new Map<string, Progress>()
+  /** The latest todo list per Session. */
+  private readonly todos = new Map<string, readonly TodoItem[]>()
+  /** The current goal per Session. */
+  private readonly goals = new Map<string, GoalState & { rounds: number }>()
+  /** Running subagents per top-level Session. */
+  private readonly subagents = new Map<string, Set<string>>()
+  /** Approvals allowed for the rest of the running turn, per Session: tool and reason → who allowed them. */
+  private readonly turnGrants = new Map<string, Map<string, string>>()
+  /** Rejections whose reason may still arrive, per chat key. */
+  private readonly rejections = new Map<string, Rejection>()
   /** Stop buttons: short id → Session. */
   private readonly stopIds = new Map<string, string>()
   /** Messages marked as being worked on, per Session. */
@@ -529,6 +600,9 @@ export class Switchboard {
     this.timer ??= setInterval(() => {
       this.checkOutages()
       void this.flushOutbox()
+      this.sendDailyDigest().catch((error: unknown) => {
+        this.logger.warn(`switchboard: daily digest failed: ${describe(error)}`)
+      })
     }, OUTBOX_INTERVAL_MS)
   }
 
@@ -737,9 +811,11 @@ export class Switchboard {
         if (turn.kind === 'completed' && turn.text !== '') {
           for (const key of chats) void this.durable(key, { kind: 'markdown', text: `${t.caughtUp(time)}\n\n${turn.text}` }, sessionId)
           const excerpt = `${t.caughtUp(time)}\n${shortId(sessionId)}: ${truncate(turn.text, EXCERPT_LENGTH)}`
-          for (const key of watchers) void this.durable(key, { kind: 'text', text: excerpt }, sessionId)
+          void this.store.addDigest(watchers, { sessionId, at: turn.at, kind: 'completed', text: truncate(turn.text, DIGEST_EXCERPT) })
+          if (!this.digestOn()) for (const key of watchers) void this.durable(key, { kind: 'text', text: excerpt }, sessionId)
         } else if (turn.kind !== 'completed' && turn.kind !== 'aborted') {
           const message = t.caughtUpFailed(time, turn.error ?? turn.kind)
+          void this.store.addDigest(watchers, { sessionId, at: turn.at, kind: turn.kind, text: truncate(turn.error ?? turn.kind, DIGEST_EXCERPT) })
           for (const key of [...chats, ...watchers]) void this.durable(key, { kind: 'text', text: message }, sessionId)
         }
       }
@@ -750,14 +826,16 @@ export class Switchboard {
   /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
   private async registerCommands(entry: LiveLine, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
     const t = this.t
-    const extra = (harnessCommands ?? await this.harness.listCommands(undefined).catch((error: unknown) => {
+    const listed = harnessCommands ?? await this.harness.listCommands(undefined).catch((error: unknown) => {
       this.logger.warn(`switchboard [${entry.line.id}]: Harness commands left out of the menu: ${describe(error)}`)
       return []
-    }))
+    })
+    const extra = listed
       .filter(command => MENU_NAME.test(command.name) && !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
       .slice(0, 20)
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
-    entry.menuHasHarness = extra.length > 0
+    // Set from the whole list: commands that all fail the filter need no further tries.
+    entry.menuHasHarness = listed.length > 0
     await entry.channel.setMenu([
       { command: 'menu', description: t.cmdMenu },
       { command: 'new', description: t.cmdNew },
@@ -767,11 +845,19 @@ export class Switchboard {
       { command: 'watch', description: t.cmdWatch },
       { command: 'get', description: t.cmdGet },
       { command: 'status', description: t.cmdStatus },
+      { command: 'digest', description: t.cmdDigest },
       { command: 'help', description: t.cmdHelp },
       ...extra,
     ]).catch((error: unknown) => {
       this.logger.debug(`switchboard [${entry.line.id}]: menu update failed: ${describe(error)}`)
     })
+  }
+
+  /** Add the Harness commands to menus registered before any Agent could name them. */
+  private refreshMenus(): void {
+    for (const entry of this.live.values()) {
+      if (entry.state.kind === 'running' && !entry.menuHasHarness) void this.registerCommands(entry)
+    }
   }
 
   // ─── inbound ────────────────────────────────────────────────────────────
@@ -845,7 +931,13 @@ export class Switchboard {
       if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
       if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
-      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], 'queue', actor, message.messageId)
+      const rejection = parsed.kind === 'text' ? this.takeRejection(key, from.id) : undefined
+      if (parsed.kind === 'text' && rejection !== undefined) {
+        const sessionId = this.store.get(key).sessionId
+        const mode = sessionId !== undefined && this.harness.live(sessionId)?.running === true ? 'steer' : 'queue'
+        return await this.promptFromChat(key, [{ type: 'text', text: t.rejectedBecause(rejection.tool, parsed.text) }], mode, actor, message.messageId)
+      }
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], this.promptMode(key, message.quote), actor, message.messageId)
       return await this.runCommand(key, parsed.name, parsed.args, actor)
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
@@ -918,7 +1010,28 @@ export class Switchboard {
     const text = this.withQuote(caption === '' ? transcript : `${caption}\n\n${transcript}`, message.quote)
     this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
     await this.reply(key, t.voiceHeard(transcript))
-    await this.promptFromChat(key, [{ type: 'text', text }], 'queue', actor, message.messageId)
+    await this.promptFromChat(key, [{ type: 'text', text }], this.promptMode(key, message.quote), actor, message.messageId)
+  }
+
+  /** The rejection a person's next message explains, once and only while it is fresh. */
+  private takeRejection(key: string, userId: string): Rejection | undefined {
+    const rejection = this.rejections.get(key)
+    if (rejection === undefined || rejection.userId !== userId) return undefined
+    this.rejections.delete(key)
+    return Date.now() - rejection.at <= REJECT_REASON_MS ? rejection : undefined
+  }
+
+  /**
+   * How a person's text joins the chat's Session: into the running turn on a
+   * line set to steer, else the queue. A quote points at something else, so it
+   * waits for its own turn.
+   */
+  private promptMode(key: string, quote: string | undefined): 'queue' | 'steer' {
+    if (quote !== undefined && quote.trim() !== '') return 'queue'
+    const line = this.settings().lines.find(candidate => candidate.id === splitChatKey(key).line)
+    if (line?.steerWhileBusy !== true) return 'queue'
+    const sessionId = this.store.get(key).sessionId
+    return sessionId !== undefined && this.harness.live(sessionId)?.running === true ? 'steer' : 'queue'
   }
 
   /** Prefix a prompt with the message it quotes, so the Agent knows what "this" refers to. */
@@ -1041,13 +1154,30 @@ export class Switchboard {
         const model = binding.sessionId === undefined ? undefined : this.modelOf(binding.sessionId)
         const entry = this.live.get(splitChatKey(key).line)
         const state = entry?.state ?? { kind: 'stopped' as const }
+        const sessionId = binding.sessionId
+        const turn = sessionId === undefined ? undefined : this.turns.get(sessionId)
+        const context = sessionId === undefined ? undefined : this.harness.contextUsage?.(sessionId)
+        const queued = sessionId === undefined ? undefined : this.harness.queued(sessionId)?.length
+        const todos = sessionId === undefined ? undefined : todoSummary(t, this.todos.get(sessionId))
+        const goal = sessionId === undefined ? undefined : this.goals.get(sessionId)
+        const subagents = sessionId === undefined ? 0 : this.subagents.get(sessionId)?.size ?? 0
         return this.reply(key, t.status({
           bot: state.kind === 'running' ? `${entry?.line.type === 'telegram' ? '@' : ''}${state.username}` : state.kind,
           ...(binding.sessionId === undefined ? {} : { session: binding.sessionId }),
           ...(live?.cwd === undefined ? {} : { cwd: live.cwd }),
           ...(live === undefined ? {} : { running: live.running }),
           ...(model === undefined ? {} : { model: modelLabel(model) }),
+          ...(context === undefined ? {} : { context: contextLabel(context) }),
+          ...(turn === undefined ? {} : { turn: t.statusTurn(duration((Date.now() - turn.startedAt) / 1000, this.settings().language), turn.tools) }),
+          ...(queued === undefined || queued === 0 ? {} : { queued }),
+          ...(todos === undefined ? {} : { todos }),
+          ...(goal === undefined ? {} : { goal: t.goalStatus(truncate(goal.objective, 80), goal.phase, goal.rounds, goal.maxGoalRounds) }),
+          ...(subagents === 0 ? {} : { subagents }),
         }))
+      }
+      case 'digest': {
+        const digest = await this.digestText(key, Date.now() - DIGEST_WINDOW_MS)
+        return this.reply(key, digest ?? ((binding.watch ?? []).length === 0 ? t.digestNoWatch : t.digestEmpty))
       }
       case 'model':
         if (actor.role === 'guest') return this.reply(key, t.adminOnly)
@@ -1397,11 +1527,13 @@ export class Switchboard {
       void this.store.setCursor(sessionId, event.seq)
     }
     if (event.type === 'turn/start') {
+      this.turnGrants.delete(sessionId)
       const startedAt = event.time ?? Date.now()
       this.turns.set(sessionId, { startedAt, tools: 0, scheduled: false })
       this.startProgress(sessionId, startedAt)
       this.clearReplyButtons(sessionId)
       this.updateQueuedNotices(sessionId)
+      this.refreshMenus()
       return
     }
     if (event.type === 'user/message') {
@@ -1415,6 +1547,25 @@ export class Switchboard {
     if (event.type === 'workspace/changes' && event.seq !== undefined) {
       const files = this.harness.changedFiles(sessionId, event.seq)
       if (files !== undefined && turn !== undefined) turn.files = files
+      return
+    }
+    if (event.type === 'todo/write') {
+      this.todos.delete(sessionId)
+      this.todos.set(sessionId, (event.data as { todos?: readonly TodoItem[] } | undefined)?.todos ?? [])
+      while (this.todos.size > TODO_SESSIONS) this.todos.delete(this.todos.keys().next().value as string)
+      const progress = this.progress.get(sessionId)
+      if (progress !== undefined) this.scheduleProgress(sessionId, progress)
+      return
+    }
+    if (event.type === 'goal/change') {
+      this.onGoalChange(sessionId, event.data as GoalChange | undefined)
+      return
+    }
+    if (event.type === 'compaction/start' || event.type === 'compaction/end') {
+      const progress = this.progress.get(sessionId)
+      if (progress === undefined) return
+      progress.compacting = event.type === 'compaction/start'
+      this.scheduleProgress(sessionId, progress)
       return
     }
     const chats = this.outputChats(sessionId)
@@ -1440,6 +1591,8 @@ export class Switchboard {
       }
     } else if (event.type === 'turn/end') {
       this.turns.delete(sessionId)
+      this.turnGrants.delete(sessionId)
+      this.subagents.delete(sessionId)
       const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } }).reason
       const kind = reason?.kind ?? 'completed'
       const endedAt = event.time ?? Date.now()
@@ -1455,6 +1608,42 @@ export class Switchboard {
     }
   }
 
+  /** Remember a Session's goal, and tell its chats when it is reached or stuck: they may be nowhere near the Web UI. */
+  private onGoalChange(sessionId: string, change: GoalChange | undefined): void {
+    if (change === undefined) return
+    if (change.goal === undefined) {
+      this.goals.delete(sessionId)
+      return
+    }
+    const rounds = change.roundsStarted ?? 0
+    this.goals.delete(sessionId)
+    this.goals.set(sessionId, { ...change.goal, rounds })
+    while (this.goals.size > TODO_SESSIONS) this.goals.delete(this.goals.keys().next().value as string)
+    const t = this.t
+    const objective = truncate(change.goal.objective, EXCERPT_LENGTH)
+    const text = change.operation === 'complete' ? t.goalComplete(objective, rounds)
+      : change.operation === 'block' ? t.goalBlocked(objective, change.goal.blockedReason?.message) : undefined
+    if (text === undefined) return
+    for (const key of new Set([...this.outputChats(sessionId), ...this.store.watchersOf(sessionId)])) void this.durable(key, { kind: 'text', text }, sessionId)
+  }
+
+  /**
+   * Follow a subagent's run state for its top-level Session's progress message.
+   * @param rootId - the top-level Session it works for.
+   * @param childId - the subagent's Session.
+   */
+  onSubagentStatus(rootId: string, childId: string, running: boolean): void {
+    if (this.live.size === 0) return
+    const children = this.subagents.get(rootId) ?? new Set<string>()
+    if (running === children.has(childId)) return
+    if (running) children.add(childId)
+    else children.delete(childId)
+    if (children.size === 0) this.subagents.delete(rootId)
+    else this.subagents.set(rootId, children)
+    const progress = this.progress.get(rootId)
+    if (progress !== undefined) this.scheduleProgress(rootId, progress)
+  }
+
   /** Turn-end notices: failures to everyone, summaries by setting, and always to followers. */
   private endTurn(
     sessionId: string, kind: string, error: string | undefined, turn: TurnState | undefined,
@@ -1465,6 +1654,7 @@ export class Switchboard {
     if (kind !== 'completed') {
       const message = t.turnEnded(kind, error)
       for (const key of chats) void this.durable(key, { kind: 'text', text: message }, sessionId)
+      void this.store.addDigest(watchers, { sessionId, at: endedAt, kind, text: truncate(error ?? kind, DIGEST_EXCERPT) })
       const watchMessage = kind === 'aborted' ? t.watchAborted(title) : t.watchFailed(title, error ?? kind)
       for (const key of watchers) void this.durable(key, { kind: 'text', text: watchMessage }, sessionId)
       return
@@ -1475,10 +1665,66 @@ export class Switchboard {
     const summary = { seconds, tools: turn.tools, files: turn.files ?? [] }
     const wanted = s.turnSummary === 'always' || (s.turnSummary === 'long' && seconds >= s.turnSummaryMinSec)
     if (wanted) for (const key of chats) void this.durable(key, { kind: 'text', text: t.turnDone(summary) }, sessionId)
-    if (watchers.length > 0) {
+    void this.store.addDigest(watchers, {
+      sessionId, at: endedAt, kind,
+      ...(turn.lastText === undefined ? {} : { text: truncate(turn.lastText, DIGEST_EXCERPT) }),
+    })
+    if (watchers.length > 0 && !this.digestOn()) {
       const excerpt = turn.lastText === undefined ? undefined : truncate(turn.lastText, EXCERPT_LENGTH)
       const message = t.turnDone({ ...summary, title, ...(excerpt === undefined ? {} : { excerpt }) })
       for (const key of watchers) void this.durable(key, { kind: 'text', text: message }, sessionId)
+    }
+  }
+
+  // ─── digest of followed Sessions ────────────────────────────────────────
+
+  /** Whether finished turns of followed Sessions wait for the daily digest. */
+  private digestOn(): boolean {
+    return DIGEST_TIME.test((this.settings().watchDigestTime ?? '').trim())
+  }
+
+  /**
+   * One message about a chat's followed Sessions: what finished, what failed,
+   * what waits for an answer, and what runs now.
+   * @param since - turns before this time are left out.
+   * @returns the message, or undefined when there is nothing to tell.
+   */
+  private async digestText(key: string, since: number): Promise<string | undefined> {
+    const t = this.t
+    const watched = this.store.get(key).watch ?? []
+    const items = this.store.digestItems(key).filter(item => item.at >= since)
+    if (watched.length === 0 && items.length === 0) return undefined
+    const rows = await this.harness.listSessions().catch(() => [])
+    const title = (sessionId: string): string => rows.find(row => row.sessionId === sessionId)?.title ?? shortId(sessionId)
+    const lines = (kept: readonly DigestItem[]): string[] => [...new Set(kept.map(item => item.sessionId))].map((sessionId) => {
+      const own = kept.filter(item => item.sessionId === sessionId)
+      return t.digestLine(title(sessionId), own.length, own.at(-1)?.text)
+    })
+    const approvals = [...this.approvals.values()]
+    const questions = [...this.questions.values()]
+    const waiting = watched.flatMap((sessionId) => {
+      const count = approvals.filter(item => item.sessionId === sessionId).length + questions.filter(item => item.sessionId === sessionId).length
+      return count === 0 ? [] : [t.digestWaitingLine(title(sessionId), count)]
+    })
+    const done = lines(items.filter(item => item.kind === 'completed'))
+    const failed = lines(items.filter(item => item.kind !== 'completed'))
+    const running = watched.filter(sessionId => this.harness.live(sessionId)?.running === true).map(sessionId => `· ${title(sessionId)}`)
+    if (done.length + failed.length + waiting.length + running.length === 0) return undefined
+    return t.digest({ done, failed, waiting, running })
+  }
+
+  /** Send each chat its waiting turns once a day, at the set time or the first check after it. */
+  async sendDailyDigest(now: Date = new Date()): Promise<void> {
+    if (!this.digestOn()) return
+    const time = (this.settings().watchDigestTime ?? '').trim()
+    const pad = (value: number): string => String(value).padStart(2, '0')
+    const day = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    if (`${pad(now.getHours())}:${pad(now.getMinutes())}` < time || this.store.digestDay() === day) return
+    void this.store.setDigestDay(day)
+    for (const key of this.store.digestChats()) {
+      const text = await this.digestText(key, 0)
+      await this.store.clearDigest(key)
+      if (text !== undefined) await this.durable(key, { kind: 'text', text })
     }
   }
 
@@ -1495,7 +1741,7 @@ export class Switchboard {
     this.stopIds.set(stopId, sessionId)
     while (this.stopIds.size > 64) this.stopIds.delete(this.stopIds.keys().next().value as string)
     const progress: Progress = {
-      startedAt, lines: [], count: 0, segment: 0, text: '', messages: new Map(), timer: undefined, delayed: true, ticker: undefined,
+      startedAt, lines: [], count: 0, segment: 0, text: '', compacting: false, messages: new Map(), timer: undefined, delayed: true, ticker: undefined,
       lastFlush: 0, pending: Promise.resolve(), stopId,
     }
     this.progress.set(sessionId, progress)
@@ -1569,8 +1815,14 @@ export class Switchboard {
     const hidden = progress.segment - progress.lines.length
     const elapsed = duration((Date.now() - progress.startedAt) / 1000, this.settings().language)
     const draft = progress.text.trim().length >= DRAFT_MIN_CHARS ? draftPreview(progress.text, 1500) : undefined
+    const todos = this.todos.get(sessionId)
+    const subagents = this.subagents.get(sessionId)?.size ?? 0
+    const todoLine = todos?.some(todo => todo.status !== 'completed') === true ? todoSummary(t, todos) : undefined
     const text = [
       t.progress(elapsed, progress.count),
+      ...(todoLine === undefined ? [] : [todoLine]),
+      ...(progress.compacting ? [t.compacting] : []),
+      ...(subagents === 0 ? [] : [t.subagents(subagents)]),
       ...(progress.lines.length > 0 && hidden > 0 ? ['…'] : []),
       ...progress.lines,
       ...(draft === undefined ? [] : ['', draft]),
@@ -1856,25 +2108,43 @@ export class Switchboard {
     const chats = this.reachable([...new Set([...this.outputChats(request.sessionId), ...this.store.watchersOf(request.sessionId)])])
     if (chats.length === 0) return 'delegate'
     if (request.signal?.aborted === true) return 'cancelled'
-    // The question should follow the reply that led to it.
-    this.flushProgress(request.sessionId)
     const t = this.t
-    const id = randomUUID().slice(0, 12)
     const call = request.callId === undefined ? undefined : this.toolCalls.get(request.callId)
     const detail = call === undefined ? '' : approvalDetail(call.name, call.arguments)
+    // A different reason is a different risk, so it asks again.
+    const grantKey = `${request.toolName}|${request.reason ?? ''}`
+    const granted = this.turnGrants.get(request.sessionId)?.get(grantKey)
+    if (granted !== undefined) {
+      for (const key of chats) {
+        this.log({ chatId: key }, {
+          dir: 'out', kind: 'approval',
+          approval: { tool: request.toolName, ...(detail === '' ? {} : { detail }), outcome: 'allowed-once', by: t.grantedBy(granted) },
+        }, request.sessionId)
+      }
+      return 'allowed-once'
+    }
+    // The question should follow the reply that led to it.
+    this.flushProgress(request.sessionId)
+    const id = randomUUID().slice(0, 12)
     const text = t.approvalAsk(request.toolName, detail, request.reason)
     const buttons: Button[][] = [[
       { text: t.allow, data: `ap:${id}:y` },
       { text: t.reject, data: `ap:${id}:n` },
     ]]
+    const grantable = TURN_GRANT_TOOLS.has(request.toolName) && this.turns.has(request.sessionId)
+    if (grantable) buttons.push([{ text: t.allowTurn, data: `ap:${id}:a` }])
 
     const answer = Promise.withResolvers<TelegramApprovalOutcome>()
     const pending: PendingApproval = {
       sessionId: request.sessionId,
+      toolName: request.toolName,
+      grantKey,
       prompts: [],
+      extend: () => { deadline.extend() },
       settle: (outcome, note, by) => {
         if (!this.approvals.delete(id)) return
-        clearTimeout(timer)
+        deadline.clear()
+        this.closeReminders(deadline, note)
         request.signal?.removeEventListener('abort', onAbort)
         for (const prompt of pending.prompts) {
           void this.channelOf(prompt.chat)?.edit(splitChatKey(prompt.chat).chat, prompt.messageId, { text: `${text}\n\n${note}` }).catch(() => {})
@@ -1893,7 +2163,10 @@ export class Switchboard {
       },
     }
     const onAbort = (): void => { pending.settle('cancelled', t.approvalCancelled) }
-    const timer = setTimeout(() => { pending.settle('delegate', t.approvalTimedOut) }, s.approvalTimeoutSec * 1000)
+    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('timeout', t.approvalTimedOut) }, left => ({
+      text: t.approvalReminder(request.toolName, left),
+      buttons: [...buttons, [{ text: t.waitMore(this.waitLabel(s.approvalTimeoutSec)), data: `ap:${id}:w` }]],
+    }))
     request.signal?.addEventListener('abort', onAbort, { once: true })
     this.approvals.set(id, pending)
 
@@ -1904,6 +2177,64 @@ export class Switchboard {
     })))
     if (pending.prompts.length === 0) pending.settle('delegate', '')
     return answer.promise
+  }
+
+  /** The wait a reminder's button buys, as the chat reads it. */
+  private waitLabel(seconds: number): string {
+    return duration(seconds, this.settings().language)
+  }
+
+  /**
+   * Time a chat's answer, reminding the chats shortly before the end.
+   * @param seconds - how long to wait, and how long each extension adds.
+   * @param onExpire - called when nobody answered in time.
+   * @param reminder - the reminder, given the time left as text.
+   */
+  private startDeadline(seconds: number, chats: readonly string[], sessionId: string, onExpire: () => void, reminder: (left: string) => OutMessage): Deadline {
+    const wait = seconds * 1000
+    const lead = Math.min(REMINDER_LEAD_MS, wait / 4)
+    let expiry: ReturnType<typeof setTimeout>
+    let nudge: ReturnType<typeof setTimeout>
+    const arm = (): void => {
+      expiry = setTimeout(onExpire, wait)
+      nudge = setTimeout(() => {
+        const message = reminder(duration(lead / 1000, this.settings().language))
+        for (const key of chats) {
+          void this.enqueue(key, async (channel, chat) => {
+            deadline.reminders.push({ chat: key, messageId: await channel.send(chat, message) })
+          })
+          this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: message.text }, sessionId)
+        }
+      }, wait - lead)
+    }
+    const deadline: Deadline = {
+      reminders: [],
+      clear: () => {
+        clearTimeout(expiry)
+        clearTimeout(nudge)
+      },
+      extend: () => {
+        deadline.clear()
+        this.closeReminders(deadline, this.t.waitExtended(this.waitLabel(seconds)))
+        arm()
+      },
+    }
+    arm()
+    return deadline
+  }
+
+  /** Replace sent reminders, and their buttons, with what became of the wait. */
+  private closeReminders(deadline: Deadline, note: string): void {
+    for (const reminder of deadline.reminders.splice(0)) {
+      if (note === '') continue
+      void this.channelOf(reminder.chat)?.edit(splitChatKey(reminder.chat).chat, reminder.messageId, { text: note }).catch(() => {})
+    }
+  }
+
+  /** Tell the chats that an approval nobody answered left its tool call undone. */
+  noteUnanswered(sessionId: string, toolName: string): void {
+    const chats = this.reachable([...new Set([...this.outputChats(sessionId), ...this.store.watchersOf(sessionId)])])
+    for (const key of chats) void this.durable(key, { kind: 'text', text: this.t.approvalUnanswered(toolName) }, sessionId)
   }
 
   /**
@@ -1924,14 +2255,17 @@ export class Switchboard {
       sessionId: request.sessionId,
       chats,
       items: request.questions.map(item => ({ item, messages: new Map(), selected: new Set(), done: false })),
+      extend: () => { deadline.extend() },
       settle: (outcome, note) => {
         if (!this.questions.delete(id)) return
-        clearTimeout(timer)
+        deadline.clear()
+        this.closeReminders(deadline, note ?? t.questionClosed)
         request.signal?.removeEventListener('abort', onAbort)
         for (const entry of pending.items) {
+          const picked = [...entry.selected].map(label => optionText(t, entry.item, label))
           const summary = note ?? (entry.custom !== undefined
-            ? t.questionAnswered([...entry.selected, entry.custom].join(', '))
-            : entry.selected.size > 0 ? t.questionAnswered([...entry.selected].join(', ')) : t.questionSkipped)
+            ? t.questionAnswered([...picked, entry.custom].join(', '))
+            : picked.length > 0 ? t.questionAnswered(picked.join(', ')) : t.questionSkipped)
           for (const [key, messageId] of entry.messages) {
             void this.channelOf(key)?.edit(splitChatKey(key).chat, messageId, { text: `${questionText(t, entry.item)}\n\n${summary}` }).catch(() => {})
           }
@@ -1940,12 +2274,17 @@ export class Switchboard {
       },
     }
     const onAbort = (): void => { pending.settle('cancelled', t.questionWithdrawn) }
-    const timer = setTimeout(() => { pending.settle('delegate', t.questionTimedOut) }, s.approvalTimeoutSec * 1000)
+    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('delegate', t.questionTimedOut) }, left => ({
+      text: t.questionReminder(left),
+      buttons: [[{ text: t.waitMore(this.waitLabel(s.approvalTimeoutSec)), data: `qw:${id}` }]],
+    }))
     request.signal?.addEventListener('abort', onAbort, { once: true })
     this.questions.set(id, pending)
     for (const [index, entry] of pending.items.entries()) {
       const text = questionText(t, entry.item)
       for (const key of chats) {
+        // The long part goes first as Markdown, in pieces or as a file; the buttons stay on one short message.
+        if (detachedDetail(entry.item) && entry.item.detail !== undefined) await this.durable(key, { kind: 'markdown', text: entry.item.detail }, request.sessionId)
         await this.enqueue(key, async (channel, chat) => {
           entry.messages.set(key, await channel.send(chat, { text, buttons: questionButtons(t, id, index, entry) }))
         })
@@ -1983,12 +2322,17 @@ export class Switchboard {
     }
   }
 
-  private async handleQuestionPress(channel: Channel, action: InboundAction): Promise<void> {
+  private async handleQuestionPress(channel: Channel, action: InboundAction, actor: Actor): Promise<void> {
     const [, id = '', index = '', choice = ''] = action.data.split(':')
     const pending = this.questions.get(id)
     const entry = pending?.items[Number(index)]
     if (pending === undefined || entry === undefined || entry.done) {
       await channel.ack(action, this.t.approvalGone)
+      return
+    }
+    // Approving a plan lets the Agent start changing things, so it takes what an approval takes.
+    if (entry.item.intent?.kind === 'plan-review' && actor.role === 'guest') {
+      await channel.ack(action, this.t.approvalNotYours)
       return
     }
     await channel.ack(action)
@@ -2029,8 +2373,14 @@ export class Switchboard {
     if (action.data.startsWith('qs:') || action.data.startsWith('qx:')) return this.handleQueued(line, action)
     if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action, actor)
     if (action.data.startsWith('mn:')) return this.handleMenu(line, action, actor)
-    if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action)
-    const match = /^ap:([\w-]+):([yn])$/u.exec(action.data)
+    if (action.data.startsWith('qa:')) return this.handleQuestionPress(channel, action, actor)
+    if (action.data.startsWith('qw:')) {
+      const waiting = this.questions.get(action.data.slice(3))
+      waiting?.extend()
+      await channel.ack(action, waiting === undefined ? t.approvalGone : undefined)
+      return
+    }
+    const match = /^ap:([\w-]+):([ynwa])$/u.exec(action.data)
     if (match === null) {
       await channel.ack(action)
       return
@@ -2045,9 +2395,30 @@ export class Switchboard {
       await channel.ack(action, t.approvalNotYours)
       return
     }
+    if (match[2] === 'w') {
+      pending.extend()
+      await channel.ack(action)
+      return
+    }
+    // Skipping later approvals is a bigger decision than answering this one.
+    if (match[2] === 'a' && actor.role !== 'admin') {
+      await channel.ack(action, t.adminOnly)
+      return
+    }
     const who = action.from.username === undefined ? action.from.name : `@${action.from.username}`
-    if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who), who)
-    else pending.settle('rejected', t.approvalRejected(who), who)
+    if (match[2] === 'a') {
+      const grants = this.turnGrants.get(pending.sessionId) ?? new Map<string, string>()
+      grants.set(pending.grantKey, who)
+      this.turnGrants.set(pending.sessionId, grants)
+      pending.settle('allowed-once', t.approvalAllowedTurn(who, pending.toolName), who)
+    } else if (match[2] === 'y') pending.settle('allowed-once', t.approvalAllowed(who), who)
+    else {
+      // A follower's next message goes to its own Session, so only the chat bound to this one can explain.
+      const key = action.chat === undefined ? undefined : chatKey(line.line.id, action.chat.id)
+      const bound = key !== undefined && this.store.get(key).sessionId === pending.sessionId
+      if (bound) this.rejections.set(key, { userId: action.from.id, tool: pending.toolName, at: Date.now() })
+      pending.settle('rejected', bound ? `${t.approvalRejected(who)}\n${t.rejectReasonHint}` : t.approvalRejected(who), who)
+    }
     await channel.ack(action)
   }
 
@@ -2165,21 +2536,58 @@ export class Switchboard {
 }
 
 /** Restart key of a line: only connection settings restart it; the rest is read per message. */
+/** The parts of a `goal/change` event the chats use; a cleared goal has no `goal`. */
+interface GoalChange {
+  readonly operation: string
+  readonly goal?: GoalState
+  readonly roundsStarted?: number
+}
+
+/** A todo list as one line: how far it got and what runs now; undefined for no list. */
+function todoSummary(t: Messages, todos: readonly TodoItem[] | undefined): string | undefined {
+  if (todos === undefined || todos.length === 0) return undefined
+  const done = todos.filter(todo => todo.status === 'completed').length
+  const current = todos.find(todo => todo.status === 'in_progress')?.content
+  return t.todoLine(done, todos.length, current === undefined ? undefined : truncate(current, 60))
+}
+
+/** Context use as `42% (84k / 200k)`, or the bare size when the window is unknown. */
+function contextLabel(usage: { used: number; window?: number }): string {
+  const size = (tokens: number): string => tokens < 1000 ? String(tokens) : `${Math.round(tokens / 1000)}k`
+  if (usage.window === undefined || usage.window <= 0) return size(usage.used)
+  return `${Math.round(usage.used / usage.window * 100)}% (${size(usage.used)} / ${size(usage.window)})`
+}
+
 function lineKey(line: LineSettings): string {
   return JSON.stringify([line.type, line.secret, line.apiBaseUrl, line.pollTimeoutSec, line.appId, line.domain])
 }
 
 /** The text of one question message. */
 function questionText(t: Messages, item: QuestionItem): string {
-  return t.question(item.header, item.question, item.detail, item.multiSelect === true)
+  if (item.intent?.kind === 'plan-review') return t.planReview
+  return t.question(item.header, item.question, detachedDetail(item) ? undefined : item.detail, item.multiSelect === true)
 }
+
+/** Whether a question's detail goes as its own message before the question. */
+function detachedDetail(item: QuestionItem): boolean {
+  return item.intent?.kind === 'plan-review' || (item.detail?.length ?? 0) > QUESTION_DETAIL_LIMIT
+}
+
+/** An option as the chat reads it; the answer keeps the label the asker gave. */
+function optionText(t: Messages, item: QuestionItem, label: string): string {
+  if (item.intent?.kind !== 'plan-review') return label
+  return label === item.intent.approve ? t.planApprove : t.planKeep
+}
+
 
 /** Option buttons, ticked for a multi-select question, plus Done/Skip. */
 function questionButtons(t: Messages, id: string, index: number, entry: { item: QuestionItem; selected: Set<string> }): Button[][] {
   const rows: Button[][] = (entry.item.options ?? []).slice(0, PICKER_BUTTONS).map((option, optionIndex) => [{
-    text: `${entry.item.multiSelect === true && entry.selected.has(option.label) ? '☑ ' : entry.item.multiSelect === true ? '☐ ' : ''}${option.label}`.slice(0, 60),
+    text: `${entry.item.multiSelect === true && entry.selected.has(option.label) ? '☑ ' : entry.item.multiSelect === true ? '☐ ' : ''}${optionText(t, entry.item, option.label)}`.slice(0, 60),
     data: `qa:${id}:${index}:${optionIndex}`,
   }])
+  // A plan is approved or sent back; skipping it would mean nothing.
+  if (entry.item.intent?.kind === 'plan-review') return rows
   const tail: Button[] = []
   if (entry.item.multiSelect === true) tail.push({ text: t.questionDone, data: `qa:${id}:${index}:d` })
   tail.push({ text: t.questionSkip, data: `qa:${id}:${index}:s` })

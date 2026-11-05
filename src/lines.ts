@@ -21,6 +21,8 @@ export interface LineSettings {
   readonly allowedChats: readonly string[]
   /** In groups, answer only commands, @mentions, and replies to the bot. */
   readonly groupMentionOnly: boolean
+  /** While a turn runs, plain text and voice join it instead of waiting in the queue. */
+  readonly steerWhileBusy?: boolean
   /** Working directory for new Sessions on this line; empty uses the plugin-wide default. */
   readonly workspacePath: string
   /** Telegram bot token, or Feishu app secret; undefined until resolved. */

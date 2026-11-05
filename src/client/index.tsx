@@ -91,6 +91,7 @@ interface BridgeValues {
   scheduleChats?: string[]
   alertChats?: string[]
   alertAfterMin?: number
+  watchDigestTime?: string
   longReplyChars?: number
   transcribeVoice?: boolean
   ffmpegPath?: string
@@ -110,7 +111,7 @@ interface ModelDraft { provider?: string; model?: string; effort?: string }
 
 type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
-  | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'longReplyChars'
+  | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'watchDigestTime' | 'longReplyChars'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
   | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
@@ -131,6 +132,10 @@ const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; pars
   scheduleChats: listField(v => v.scheduleChats),
   alertChats: listField(v => v.alertChats),
   alertAfterMin: intField(v => v.alertAfterMin, 0, 1440),
+  watchDigestTime: {
+    format: v => v.watchDigestTime ?? '',
+    parse: (text) => { const value = text.trim(); return value === '' || /^([01]\d|2[0-3]):[0-5]\d$/u.test(value) ? value : undefined },
+  },
   longReplyChars: intField(v => v.longReplyChars, 0, 100000),
   turnSummaryMinSec: intField(v => v.turnSummaryMinSec, 0, 86400),
   turnSummary: { format: v => v.turnSummary ?? 'long', parse: text => ['off', 'long', 'always'].includes(text) ? text : undefined },
@@ -297,7 +302,7 @@ function legacyLine(v: BridgeValues): LineValue {
     id: 'telegram', type: 'telegram', name: '', enabled: true,
     secretRef: (v.botTokenRef ?? '').trim() || 'TELEGRAM_BOT_TOKEN',
     allowedUsers: v.allowedUsers ?? [], allowedChats: v.allowedChats ?? [],
-    groupMentionOnly: v.groupMentionOnly ?? true, workspacePath: '',
+    groupMentionOnly: v.groupMentionOnly ?? true, steerWhileBusy: false, workspacePath: '',
     apiBaseUrl: v.apiBaseUrl ?? 'https://api.telegram.org', appId: '', domain: 'feishu',
   }
 }
@@ -663,6 +668,7 @@ export function createSettings(form: ConfigForm<BridgeValues>, describe: Setting
         {valueField('scheduleChats', 'schedule-chats', { placeholder: '123456789' })}
         {valueField('alertChats', 'alert-chats', { placeholder: '123456789, feishu:oc_xxx' })}
         {valueField('alertAfterMin', 'alert-after', { numeric: true })}
+        {valueField('watchDigestTime', 'watch-digest', { placeholder: '20:00' })}
 
         <h3 style={styles.section}>{t('groupApproval')}</h3>
         {toggle('approvalViaTelegram')}
