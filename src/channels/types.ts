@@ -140,8 +140,11 @@ export interface Channel {
   download(attachment: InboundAttachment, limit: number): Promise<Uint8Array>
   /** Show that the bot is working, where the platform can. */
   typing(chat: string): Promise<void>
-  /** Publish the command menu, where the platform has one. */
-  setMenu(commands: readonly { command: string; description: string }[]): Promise<void>
+  /**
+   * Publish the command menu, where the platform has one.
+   * @param clearOthers - also remove lists set for other scopes or languages.
+   */
+  setMenu(commands: readonly { command: string; description: string }[], clearOthers?: boolean): Promise<void>
   /** Acknowledge a button press, optionally with a short notice. */
   ack(action: InboundAction, notice?: string): Promise<void>
 }

@@ -851,6 +851,9 @@ export class Switchboard {
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
     // Set from the whole list: commands that all fail the filter need no further tries.
     entry.menuHasHarness = listed.length > 0
+    // Old lists stay gone once cleared, so reconnecting need not ask again; another bot on the line starts over.
+    const bot = `${entry.line.id}:${entry.channel.username ?? ''}`
+    const clearOthers = !this.store.menuCleared(bot)
     await entry.channel.setMenu([
       { command: 'menu', description: t.cmdMenu },
       { command: 'new', description: t.cmdNew },
@@ -863,7 +866,9 @@ export class Switchboard {
       { command: 'digest', description: t.cmdDigest },
       { command: 'help', description: t.cmdHelp },
       ...extra,
-    ]).catch((error: unknown) => {
+    ], clearOthers).then(async () => {
+      if (clearOthers) await this.store.setMenuCleared(bot)
+    }).catch((error: unknown) => {
       this.logger.debug(`switchboard [${entry.line.id}]: menu update failed: ${describe(error)}`)
     })
   }

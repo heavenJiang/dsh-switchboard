@@ -1169,6 +1169,44 @@ describe('/status details', () => {
 })
 
 describe('menu', () => {
+  it('clears lists left in other scopes and languages, then sets its own', async () => {
+    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
+    const deleted = telegram.calls.filter(c => c.method === 'deleteMyCommands').map(c => `${(c.params['scope'] as { type: string }).type}/${String(c.params['language_code'])}`)
+    expect(deleted).toEqual(expect.arrayContaining(['all_private_chats/undefined', 'all_group_chats/zh', 'all_chat_administrators/en', 'default/zh']))
+    // The default list with no language is replaced, never deleted.
+    expect(deleted).not.toContain('default/undefined')
+    const methods = telegram.calls.map(c => c.method).filter(method => method.endsWith('MyCommands'))
+    expect(methods.at(-1)).toBe('setMyCommands')
+  })
+
+  it('clears them once per bot, across reconnects and restarts', async () => {
+    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
+    await until(() => telegram.calls.filter(c => c.method === 'deleteMyCommands').length === 11)
+    await store.settled()
+    await bridge.stop()
+    telegram.calls.length = 0
+    await store.load()
+    await bridge.reconcile()
+    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
+    expect(telegram.calls.filter(c => c.method === 'deleteMyCommands')).toEqual([])
+  })
+
+  it('tries again next time when the menu could not be set', async () => {
+    await bridge.stop()
+    const cleanStore = new BindingStore(join(dir, 'fresh.json'))
+    const refused: typeof fetch = async (input, init) => String(input).endsWith('/setMyCommands')
+      ? Response.json({ ok: false, error_code: 400, description: 'Bad Request' })
+      : telegram.fetch(input, init)
+    bridge = new Switchboard(() => settings, harness, cleanStore, quiet, { fetch: refused }, chatLog)
+    telegram.calls.length = 0
+    await bridge.reconcile()
+    await until(() => telegram.calls.filter(c => c.method === 'deleteMyCommands').length === 11)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(cleanStore.menuCleared('telegram:testbot')).toBe(false)
+    await bridge.stop()
+    await cleanStore.settled()
+  })
+
   it('adds Harness commands at the first turn when none were listed at connect', async () => {
     await bridge.stop()
     const commands = harness.commands

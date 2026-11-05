@@ -52,6 +52,8 @@ interface BindingsFile {
   offsets?: Record<string, number>
   /** Last Session event seq the bridge mirrored, per linked Session, so a restart can catch up. */
   cursors?: Record<string, number>
+  /** Bots whose old command lists were cleared, as `line:username`. */
+  menusCleared?: string[]
   /** The Session each sent message speaks for, per chat key, so a reply to it reaches that Session. */
   routes?: Record<string, Record<string, string>>
   /** Turns of followed Sessions not yet sent in a digest, per chat key. */
@@ -121,6 +123,7 @@ export class BindingStore {
       ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
       ...(parsed.offsets === undefined ? {} : { offsets: parsed.offsets }),
       ...(parsed.cursors === undefined ? {} : { cursors: parsed.cursors }),
+      ...(parsed.menusCleared === undefined ? {} : { menusCleared: parsed.menusCleared }),
       ...(parsed.routes === undefined ? {} : { routes: parsed.routes }),
       ...(parsed.digests === undefined ? {} : { digests: parsed.digests }),
       ...(parsed.digestDay === undefined ? {} : { digestDay: parsed.digestDay }),
@@ -230,6 +233,17 @@ export class BindingStore {
   setCursor(sessionId: string, seq: number): Promise<void> {
     if (seq <= (this.data.cursors?.[sessionId] ?? -1)) return this.writing
     this.data.cursors = { ...this.data.cursors, [sessionId]: seq }
+    return this.flush()
+  }
+
+  /** @returns whether a bot's old command lists were already cleared. */
+  menuCleared(bot: string): boolean {
+    return this.data.menusCleared?.includes(bot) === true
+  }
+
+  /** Record that a bot's old command lists are gone, and persist. */
+  setMenuCleared(bot: string): Promise<void> {
+    this.data.menusCleared = [...this.data.menusCleared ?? [], bot]
     return this.flush()
   }
 

@@ -255,7 +255,14 @@ export class TelegramChannel implements Channel {
     await this.client.sendTyping(Number(chatId))
   }
 
-  async setMenu(commands: readonly { command: string; description: string }[]): Promise<void> {
+  /** Set the menu; lists left in other scopes or languages would take precedence over it, so `clearOthers` removes them. */
+  async setMenu(commands: readonly { command: string; description: string }[], clearOthers = false): Promise<void> {
+    for (const scope of clearOthers ? MENU_SCOPES : []) {
+      for (const language of MENU_LANGUAGES) {
+        // Telegram has no call that lists them, and the default list must still go out if one fails.
+        if (scope !== 'default' || language !== undefined) await this.client.deleteMyCommands(scope, language).catch(() => {})
+      }
+    }
     await this.client.setMyCommands(commands)
   }
 
@@ -263,6 +270,11 @@ export class TelegramChannel implements Channel {
     await this.client.answerCallbackQuery(action.id, notice)
   }
 }
+
+/** Command scopes a bot may have set lists for, broadest first. */
+const MENU_SCOPES = ['default', 'all_private_chats', 'all_group_chats', 'all_chat_administrators']
+/** Languages cleared in each scope; the bot's replies come in these two. */
+const MENU_LANGUAGES = [undefined, 'zh', 'en']
 
 function keyboard(rows: readonly (readonly Button[])[]): TgInlineButton[][] {
   return rows.map(row => row.map(button => ({ text: button.text.slice(0, 60), callback_data: button.data })))

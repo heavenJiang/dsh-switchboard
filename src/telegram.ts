@@ -314,4 +314,9 @@ export class TelegramClient {
   setMyCommands(commands: readonly { command: string; description: string }[]): Promise<unknown> {
     return this.call('setMyCommands', { commands })
   }
+
+  /** Remove the commands of one scope and language; a narrower list would otherwise hide the default one. */
+  deleteMyCommands(scope: string, language?: string): Promise<unknown> {
+    return this.call('deleteMyCommands', { scope: { type: scope }, ...(language === undefined ? {} : { language_code: language }) })
+  }
 }
