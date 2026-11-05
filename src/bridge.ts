@@ -194,6 +194,11 @@ export interface HarnessPort {
    * @returns the command's result, or undefined when no Harness command has that name.
    */
   runCommand(sessionId: string, line: string): Promise<HarnessCommandResult | undefined>
+  /**
+   * Branch a Session at its latest completed turn; the original stays as it is.
+   * @returns the new Session.
+   */
+  forkSession(sessionId: string): Promise<string>
   /** Prompts waiting in a live Session's inbox; undefined when it is not loaded. */
   queued(sessionId: string): QueuedItem[] | undefined
   /** Drop queued prompts by id, or all; returns how many were dropped. */
@@ -376,6 +381,8 @@ interface TurnState {
   /** Started by the schedule subsystem: results also go to the schedule chats. */
   scheduled: boolean
   lastText?: string
+  /** Tokens the turn's model calls reported. */
+  usage?: { input: number; cached: number; output: number }
 }
 
 /** One entry of an Agent's todo list, as the `todo/write` event carries it. */
@@ -422,7 +429,7 @@ export type BridgeState = LineState
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
   'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
-  'status', 'model', 'mode', 'get', 'whoami', 'digest',
+  'status', 'model', 'mode', 'get', 'whoami', 'digest', 'fork',
 ])
 /** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
 const WEB_ONLY_COMMANDS = new Set(['switchboard'])
@@ -496,6 +503,8 @@ export class Switchboard {
   private readonly subagents = new Map<string, Set<string>>()
   /** Approvals allowed for the rest of the running turn, per Session: tool and reason → who allowed them. */
   private readonly turnGrants = new Map<string, Map<string, string>>()
+  /** Chats that see a Session's next turns because they replied to it: chat key → turns left. */
+  private readonly routed = new Map<string, Map<string, number>>()
   /** Rejections whose reason may still arrive, per chat key. */
   private readonly rejections = new Map<string, Rejection>()
   /** Stop buttons: short id → Session. */
@@ -725,6 +734,7 @@ export class Switchboard {
         await channel.sendFile(chat, { data: new TextEncoder().encode(payload.text), name: `${this.t.longReplyName}-${stamp}.md`, photo: false })
       }
       this.log({ chatId: key }, { dir: 'out', kind: 'assistant', text: payload.text }, sessionId)
+      if (sent !== undefined) this.noteRoute(key, sent.messageId, sessionId)
       // A live reply may get the turn's buttons; a late one does not.
       if (sent !== undefined && sessionId !== undefined && note === undefined) {
         const replies = this.lastReplies.get(sessionId) ?? new Map<string, SentMarkdown>()
@@ -733,8 +743,13 @@ export class Switchboard {
       }
       return
     }
-    for (const chunk of chunkText(text)) await channel.send(chat, { text: chunk })
+    for (const chunk of chunkText(text)) this.noteRoute(key, await channel.send(chat, { text: chunk }), sessionId)
     this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: payload.text }, sessionId)
+  }
+
+  /** Remember the Session a sent message speaks for, so a reply to it reaches that Session. */
+  private noteRoute(key: string, messageId: string, sessionId: string | undefined): void {
+    if (sessionId !== undefined) void this.store.addRoute(key, messageId, sessionId)
   }
 
   /** Send queued messages whose line is connected, oldest first, each in order with its chat. */
@@ -926,18 +941,19 @@ export class Switchboard {
       return
     }
     try {
-      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(key, message, actor)
-      if (attachments.length > 0) return await this.promptWithMedia(key, message, actor)
+      const target = parsed?.kind === 'command' ? undefined : await this.replyTarget(key, message, actor)
+      if (message.voice !== undefined && this.settings().transcribeVoice) return await this.promptWithVoice(key, message, actor, target)
+      if (attachments.length > 0) return await this.promptWithMedia(key, message, actor, undefined, target)
       if (text === undefined) return await this.reply(key, t.unsupported)
       if (parsed === undefined) return
-      if (parsed.kind === 'text' && this.answerByText(key, parsed.text)) return
-      const rejection = parsed.kind === 'text' ? this.takeRejection(key, from.id) : undefined
+      if (parsed.kind === 'text' && this.answerByText(key, parsed.text, target)) return
+      const rejection = parsed.kind === 'text' && target === undefined ? this.takeRejection(key, from.id) : undefined
       if (parsed.kind === 'text' && rejection !== undefined) {
         const sessionId = this.store.get(key).sessionId
         const mode = sessionId !== undefined && this.harness.live(sessionId)?.running === true ? 'steer' : 'queue'
         return await this.promptFromChat(key, [{ type: 'text', text: t.rejectedBecause(rejection.tool, parsed.text) }], mode, actor, message.messageId)
       }
-      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], this.promptMode(key, message.quote), actor, message.messageId)
+      if (parsed.kind === 'text') return await this.promptFromChat(key, [{ type: 'text', text: this.withQuote(parsed.text, message.quote) }], this.promptMode(key, message.quote), actor, message.messageId, target)
       return await this.runCommand(key, parsed.name, parsed.args, actor)
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
@@ -948,11 +964,11 @@ export class Switchboard {
    * Download every attachment of one message (or album), stage it into the
    * chat's Session, and prompt with the text plus the receipts.
    */
-  private async promptWithMedia(key: string, message: InboundMessage, actor: Actor, note?: string): Promise<void> {
+  private async promptWithMedia(key: string, message: InboundMessage, actor: Actor, note?: string, target?: string): Promise<void> {
     const channel = this.channelOf(key)
     if (channel === undefined) return
     const t = this.t
-    const sessionId = await this.ensureSession(key, actor)
+    const sessionId = target ?? await this.ensureSession(key, actor)
     if (sessionId === undefined) return
     const limit = this.settings().maxDownloadMb * 1024 * 1024
     const parts: PromptPart[] = []
@@ -985,6 +1001,7 @@ export class Switchboard {
       return
     }
     if (caption !== '') parts.unshift({ type: 'text', text: caption })
+    if (target !== undefined) await this.followReply(key, target)
     await this.promptSession(key, sessionId, parts, 'queue', message.messageId)
   }
 
@@ -992,7 +1009,7 @@ export class Switchboard {
    * Transcribe a voice note and prompt with the text; when the host cannot
    * transcribe, the note goes to the Agent as an audio file instead.
    */
-  private async promptWithVoice(key: string, message: InboundMessage, actor: Actor): Promise<void> {
+  private async promptWithVoice(key: string, message: InboundMessage, actor: Actor, target?: string): Promise<void> {
     const channel = this.channelOf(key)
     const voice: InboundAttachment | undefined = message.voice
     if (channel === undefined || voice === undefined) return
@@ -1003,14 +1020,48 @@ export class Switchboard {
       const audio = await channel.download(voice, limit)
       transcript = (await this.harness.transcribe(audio, this.lifetime.signal)).trim()
     } catch (error: unknown) {
-      return this.promptWithMedia(key, message, actor, t.voiceUnavailable(describe(error)))
+      return this.promptWithMedia(key, message, actor, t.voiceUnavailable(describe(error)), target)
     }
     if (transcript === '') return this.reply(key, t.voiceEmpty)
     const caption = (message.text ?? '').trim()
     const text = this.withQuote(caption === '' ? transcript : `${caption}\n\n${transcript}`, message.quote)
     this.log(chatInfo(key, message.chat), { dir: 'in', kind: 'text', from: sender(message.from), text: `🎤 ${text}` })
     await this.reply(key, t.voiceHeard(transcript))
-    await this.promptFromChat(key, [{ type: 'text', text }], this.promptMode(key, message.quote), actor, message.messageId)
+    await this.promptFromChat(key, [{ type: 'text', text }], this.promptMode(key, message.quote), actor, message.messageId, target)
+  }
+
+  /**
+   * The Session a reply is meant for, when it is not the one the chat talks to.
+   * @throws when the person may not use that Session: sending it to the bound
+   *   Session instead would put the words in the wrong conversation.
+   */
+  private async replyTarget(key: string, message: InboundMessage, actor: Actor): Promise<string | undefined> {
+    if (message.replyToId === undefined) return undefined
+    const sessionId = this.store.routeOf(key, message.replyToId)
+    if (sessionId === undefined || sessionId === this.store.get(key).sessionId) return undefined
+    if (!(await this.mayUseSession(actor, sessionId))) throw new Error(this.t.dirDenied(actor.dirs ?? []))
+    return sessionId
+  }
+
+  /** Show a chat the turn its reply starts, and say where the reply went: it is not the chat's own Session. */
+  private async followReply(key: string, sessionId: string): Promise<void> {
+    const chats = this.routed.get(sessionId) ?? new Map<string, number>()
+    // A reply to a busy Session waits behind the running turn, which ends first.
+    chats.set(key, (chats.get(key) ?? 0) + (this.harness.live(sessionId)?.running === true ? 2 : 1))
+    this.routed.set(sessionId, chats)
+    const title = (await this.harness.listSessions().catch(() => [])).find(row => row.sessionId === sessionId)?.title ?? shortId(sessionId)
+    await this.reply(key, this.t.routedTo(title))
+  }
+
+  /** Take a turn off the chats following a Session because they replied to it. */
+  private spendRouted(sessionId: string): void {
+    const chats = this.routed.get(sessionId)
+    if (chats === undefined) return
+    for (const [key, left] of chats) {
+      if (left <= 1) chats.delete(key)
+      else chats.set(key, left - 1)
+    }
+    if (chats.size === 0) this.routed.delete(sessionId)
   }
 
   /** The rejection a person's next message explains, once and only while it is fresh. */
@@ -1168,7 +1219,7 @@ export class Switchboard {
           ...(live === undefined ? {} : { running: live.running }),
           ...(model === undefined ? {} : { model: modelLabel(model) }),
           ...(context === undefined ? {} : { context: contextLabel(context) }),
-          ...(turn === undefined ? {} : { turn: t.statusTurn(duration((Date.now() - turn.startedAt) / 1000, this.settings().language), turn.tools) }),
+          ...(turn === undefined ? {} : { turn: t.statusTurn(duration((Date.now() - turn.startedAt) / 1000, this.settings().language), turn.tools, turnTokens(t, turn)) }),
           ...(queued === undefined || queued === 0 ? {} : { queued }),
           ...(todos === undefined ? {} : { todos }),
           ...(goal === undefined ? {} : { goal: t.goalStatus(truncate(goal.objective, 80), goal.phase, goal.rounds, goal.maxGoalRounds) }),
@@ -1179,6 +1230,9 @@ export class Switchboard {
         const digest = await this.digestText(key, Date.now() - DIGEST_WINDOW_MS)
         return this.reply(key, digest ?? ((binding.watch ?? []).length === 0 ? t.digestNoWatch : t.digestEmpty))
       }
+      case 'fork':
+        if (binding.sessionId === undefined) return this.reply(key, t.noSession)
+        return this.forkSession(key, binding.sessionId, actor)
       case 'model':
         if (actor.role === 'guest') return this.reply(key, t.adminOnly)
         return this.modelCommand(key, binding.sessionId, args)
@@ -1204,6 +1258,18 @@ export class Switchboard {
         return this.promptFromChat(key, [{ type: 'text', text: line }], 'queue', actor)
       }
     }
+  }
+
+  /** Branch a Session at its latest completed turn and move the chat to the branch; the original stays. */
+  private async forkSession(key: string, sessionId: string, actor: Actor): Promise<void> {
+    const t = this.t
+    if (actor.role === 'guest') return this.reply(key, t.adminOnly)
+    if (!(await this.mayUseSession(actor, sessionId))) return this.reply(key, t.dirDenied(actor.dirs ?? []))
+    const forked = await this.harness.forkSession(sessionId)
+    await this.store.update(key, { sessionId: forked })
+    await this.chatLog?.bind(key, forked).catch(() => {})
+    this.attachToWorkspace(forked)
+    return this.reply(key, t.forked(shortId(forked), shortId(sessionId)))
   }
 
   /** Put a linked Session into its directory's Web Workspace; a failure is logged, never shown in the chat. */
@@ -1431,8 +1497,9 @@ export class Switchboard {
    * while it is worked on.
    * @param source - the person's message, for its reaction.
    */
-  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', actor: Actor, source?: string): Promise<void> {
-    const sessionId = await this.ensureSession(key, actor)
+  private async promptFromChat(key: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', actor: Actor, source?: string, target?: string): Promise<void> {
+    if (target !== undefined) await this.followReply(key, target)
+    const sessionId = target ?? await this.ensureSession(key, actor)
     if (sessionId === undefined) return
     await this.promptSession(key, sessionId, parts, mode, source)
   }
@@ -1506,7 +1573,7 @@ export class Switchboard {
 
   /** Chats that see a Session's output: bound chats, plus the schedule chats during a scheduled run. */
   private outputChats(sessionId: string): string[] {
-    const chats = new Set(this.store.chatsFor(sessionId))
+    const chats = new Set([...this.store.chatsFor(sessionId), ...this.routed.get(sessionId)?.keys() ?? []])
     if (this.turns.get(sessionId)?.scheduled === true) {
       for (const id of this.settings().scheduleChats) if (id.trim() !== '') chats.add(id.trim())
     }
@@ -1569,8 +1636,9 @@ export class Switchboard {
       return
     }
     const chats = this.outputChats(sessionId)
-    const watchers = this.store.watchersOf(sessionId)
+    const watchers = this.store.watchersOf(sessionId).filter(key => !chats.includes(key))
     if (event.type === 'assistant/message') {
+      if (turn !== undefined) addUsage(turn, event.data)
       const text = assistantText(event.data)
       if (text === '') return
       if (turn !== undefined) turn.lastText = text
@@ -1593,6 +1661,7 @@ export class Switchboard {
       this.turns.delete(sessionId)
       this.turnGrants.delete(sessionId)
       this.subagents.delete(sessionId)
+      this.spendRouted(sessionId)
       const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } }).reason
       const kind = reason?.kind ?? 'completed'
       const endedAt = event.time ?? Date.now()
@@ -1662,7 +1731,8 @@ export class Switchboard {
     if (turn === undefined) return
     const seconds = (endedAt - turn.startedAt) / 1000
     const s = this.settings()
-    const summary = { seconds, tools: turn.tools, files: turn.files ?? [] }
+    const tokens = turnTokens(t, turn)
+    const summary = { seconds, tools: turn.tools, files: turn.files ?? [], ...(tokens === undefined ? {} : { tokens }) }
     const wanted = s.turnSummary === 'always' || (s.turnSummary === 'long' && seconds >= s.turnSummaryMinSec)
     if (wanted) for (const key of chats) void this.durable(key, { kind: 'text', text: t.turnDone(summary) }, sessionId)
     void this.store.addDigest(watchers, {
@@ -1831,7 +1901,11 @@ export class Switchboard {
     // Each chat's send queue is serial, so an edit runs after the send that created its message.
     const sends = this.outputChats(sessionId).map(key => this.enqueue(key, async (channel, chat) => {
       const messageId = progress.messages.get(key)
-      if (messageId === undefined) progress.messages.set(key, await channel.send(chat, { text, buttons, editable: true }))
+      if (messageId === undefined) {
+        const sent = await channel.send(chat, { text, buttons, editable: true })
+        progress.messages.set(key, sent)
+        this.noteRoute(key, sent, sessionId)
+      }
       else await channel.edit(chat, messageId, { text, buttons, editable: true }).catch(() => {})
     }))
     progress.pending = Promise.all(sends).then(() => {})
@@ -1937,17 +2011,19 @@ export class Switchboard {
         ...(cwd === undefined ? {} : { cwd }),
         ...(retry === undefined ? {} : { retry }),
       })
-      const row = [
+      const rows = [[
         { text: t.actContinue, data: `ab:${id}:c` },
         ...(retry === undefined ? [] : [{ text: t.actRetry, data: `ab:${id}:r` }]),
         ...(files.length > 0 ? [{ text: t.actChanges, data: `ab:${id}:d` }] : []),
+      ], [
+        { text: t.actFork, data: `ab:${id}:f` },
         { text: t.actNew, data: `ab:${id}:n` },
-      ]
+      ]]
       const previous = this.buttoned.get(key)
       this.buttoned.set(key, sent)
       void this.enqueue(key, async (channel, chat) => {
         if (previous !== undefined && previous.messageId !== sent.messageId) await channel.addButtons(chat, previous, []).catch(() => {})
-        await channel.addButtons(chat, sent, [row])
+        await channel.addButtons(chat, sent, rows)
       })
     }
   }
@@ -2174,6 +2250,7 @@ export class Switchboard {
     await Promise.all(chats.map(key => this.enqueue(key, async (channel, chat) => {
       const messageId = await channel.send(chat, { text, buttons })
       pending.prompts.push({ chat: key, messageId })
+      this.noteRoute(key, messageId, request.sessionId)
     })))
     if (pending.prompts.length === 0) pending.settle('delegate', '')
     return answer.promise
@@ -2201,7 +2278,9 @@ export class Switchboard {
         const message = reminder(duration(lead / 1000, this.settings().language))
         for (const key of chats) {
           void this.enqueue(key, async (channel, chat) => {
-            deadline.reminders.push({ chat: key, messageId: await channel.send(chat, message) })
+            const messageId = await channel.send(chat, message)
+            deadline.reminders.push({ chat: key, messageId })
+            this.noteRoute(key, messageId, sessionId)
           })
           this.log({ chatId: key }, { dir: 'out', kind: 'notice', text: message.text }, sessionId)
         }
@@ -2286,7 +2365,9 @@ export class Switchboard {
         // The long part goes first as Markdown, in pieces or as a file; the buttons stay on one short message.
         if (detachedDetail(entry.item) && entry.item.detail !== undefined) await this.durable(key, { kind: 'markdown', text: entry.item.detail }, request.sessionId)
         await this.enqueue(key, async (channel, chat) => {
-          entry.messages.set(key, await channel.send(chat, { text, buttons: questionButtons(t, id, index, entry) }))
+          const messageId = await channel.send(chat, { text, buttons: questionButtons(t, id, index, entry) })
+          entry.messages.set(key, messageId)
+          this.noteRoute(key, messageId, request.sessionId)
         })
         this.log({ chatId: key }, { dir: 'out', kind: 'notice', text }, request.sessionId)
       }
@@ -2295,10 +2376,13 @@ export class Switchboard {
     return answer.promise
   }
 
-  /** Take free text in a chat as the answer to its oldest unanswered question. */
-  private answerByText(key: string, text: string): boolean {
+  /**
+   * Take free text in a chat as the answer to its oldest unanswered question.
+   * @param target - the Session the text replies to, when it is not the chat's own; only its questions count.
+   */
+  private answerByText(key: string, text: string, target?: string): boolean {
     for (const pending of this.questions.values()) {
-      if (!pending.chats.includes(key)) continue
+      if (!pending.chats.includes(key) || (target !== undefined && pending.sessionId !== target)) continue
       const entry = pending.items.find(candidate => !candidate.done)
       if (entry === undefined) continue
       entry.custom = text
@@ -2489,6 +2573,7 @@ export class Switchboard {
       else if (verb === 'r' && actions.retry !== undefined) await this.promptSession(key, actions.sessionId, actions.retry, 'queue')
       else if (verb === 'd') await this.sendChanges(key, actions)
       else if (verb === 'n') await this.runCommand(key, 'new', '', actor)
+      else if (verb === 'f') await this.forkSession(key, actions.sessionId, actor)
     } catch (error: unknown) {
       await this.reply(key, this.t.failed(describe(error)))
     }
@@ -2551,11 +2636,33 @@ function todoSummary(t: Messages, todos: readonly TodoItem[] | undefined): strin
   return t.todoLine(done, todos.length, current === undefined ? undefined : truncate(current, 60))
 }
 
+/** A token count as people read it: `840`, `84k`. */
+function tokenSize(tokens: number): string {
+  return tokens < 1000 ? String(tokens) : `${Math.round(tokens / 1000)}k`
+}
+
 /** Context use as `42% (84k / 200k)`, or the bare size when the window is unknown. */
 function contextLabel(usage: { used: number; window?: number }): string {
-  const size = (tokens: number): string => tokens < 1000 ? String(tokens) : `${Math.round(tokens / 1000)}k`
-  if (usage.window === undefined || usage.window <= 0) return size(usage.used)
-  return `${Math.round(usage.used / usage.window * 100)}% (${size(usage.used)} / ${size(usage.window)})`
+  if (usage.window === undefined || usage.window <= 0) return tokenSize(usage.used)
+  return `${Math.round(usage.used / usage.window * 100)}% (${tokenSize(usage.used)} / ${tokenSize(usage.window)})`
+}
+
+/** Add one model call's tokens to its turn. The provider's buckets do not overlap. */
+function addUsage(turn: TurnState, data: unknown): void {
+  const usage = (data as { usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number } } | undefined)?.usage
+  if (usage === undefined) return
+  const sum = turn.usage ?? { input: 0, cached: 0, output: 0 }
+  turn.usage = {
+    input: sum.input + (usage.inputTokens ?? 0) + (usage.cacheWriteTokens ?? 0),
+    cached: sum.cached + (usage.cacheReadTokens ?? 0),
+    output: sum.output + (usage.outputTokens ?? 0),
+  }
+}
+
+/** A turn's tokens as text; undefined when no call reported any. */
+function turnTokens(t: Messages, turn: TurnState): string | undefined {
+  const usage = turn.usage
+  return usage === undefined ? undefined : t.turnTokens(tokenSize(usage.input), tokenSize(usage.cached), tokenSize(usage.output))
 }
 
 function lineKey(line: LineSettings): string {

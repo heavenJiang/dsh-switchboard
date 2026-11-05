@@ -654,7 +654,7 @@ describe('interaction', () => {
     bridge.onSessionEvent('s1', { type: 'turn/end', data: { reason: { kind: 'completed' } } })
     await until(() => telegram.calls.some(c => c.method === 'editMessageReplyMarkup'))
     const markup = telegram.calls.find(c => c.method === 'editMessageReplyMarkup')!.params['reply_markup'] as { inline_keyboard: { text: string }[][] }
-    expect(markup.inline_keyboard[0]!.map(button => button.text)).toEqual(['Continue', 'Retry', 'Show changes', 'New session'])
+    expect(markup.inline_keyboard.map(row => row.map(button => button.text))).toEqual([['Continue', 'Retry', 'Show changes'], ['🌿 Try another way', 'New session']])
     telegram.push({ callback_query: { id: 'q', from: USER, data: pressFrom(markup, 'Continue') } })
     await until(() => harness.prompts.length === 2)
     expect(harness.prompts[1]).toMatchObject({ sessionId: 's1', parts: [{ type: 'text', text: 'Continue' }], mode: 'queue' })
@@ -1479,5 +1479,216 @@ describe('subagents and goals', () => {
     telegram.push(text(USER, '/status'))
     await until(() => telegram.sent().filter(t => t.startsWith('Bot:')).length === 2)
     expect(telegram.sent().filter(t => t.startsWith('Bot:')).at(-1)).not.toContain('Goal')
+  })
+})
+
+describe('replying to a message reaches its Session', () => {
+  const noticeId = (match: string): number => {
+    const index = telegram.calls.filter(c => c.method === 'sendMessage').findIndex(c => String(c.params['text']).includes(match))
+    expect(index).toBeGreaterThanOrEqual(0)
+    return sentIds[index]!
+  }
+  /** Message ids in send order, from the fake's counter. */
+  let sentIds: number[] = []
+  const reply = (replyTo: number, body: string) => {
+    telegram.push({ message: { message_id: 90, from: USER, chat: CHAT, date: 0, text: body, reply_to_message: { message_id: replyTo, chat: CHAT, date: 0, text: 'earlier' } } })
+  }
+  const finish = (sessionId: string, body: string): void => {
+    bridge.onSessionEvent(sessionId, { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent(sessionId, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: body }] } } })
+    bridge.onSessionEvent(sessionId, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+  }
+
+  beforeEach(async () => {
+    // Two bridges polling one fake would take each other's messages.
+    await bridge.stop()
+    sentIds = []
+    const send = telegram.fetch
+    const counted: typeof fetch = async (input, init) => {
+      const response = await send(input, init)
+      if (String(input).endsWith('/sendMessage')) {
+        const body = await response.clone().json() as { result?: { message_id?: number } }
+        sentIds.push(body.result?.message_id ?? 0)
+      }
+      return response
+    }
+    bridge = new Switchboard(() => settings, harness, store, quiet, { fetch: counted }, chatLog)
+  })
+
+  beforeEach(async () => {
+    await bridge.reconcile()
+    await until(() => bridge.state.kind === 'running')
+  })
+
+  afterEach(async () => { await bridge.stop() })
+
+  it('sends a reply to a followed Session, and shows that turn here', async () => {
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.setWatch(KEY, 'other', true)
+    finish('other', 'Deployed.')
+    await until(() => telegram.sent().some(t => t.startsWith('✅')))
+    reply(noticeId('✅'), 'now run the tests')
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]!.sessionId).toBe('other')
+    expect(store.get(KEY).sessionId).toBe('mine')
+    await until(() => telegram.sent().some(t => t.startsWith('↪️')))
+
+    finish('other', 'All tests pass.')
+    await until(() => telegram.sent().includes('All tests pass.'))
+    // Only that turn: the next one is a follower's notice again.
+    finish('other', 'Another turn.')
+    await until(() => telegram.sent().filter(t => t.startsWith('✅')).length === 2)
+    expect(telegram.sent()).not.toContain('Another turn.')
+  })
+
+  it('shows the reply despite a daily digest', async () => {
+    settings = { ...settings, watchDigestTime: '20:00' }
+    await store.setWatch(KEY, 'other', true)
+    await store.addRoute(KEY, '77', 'other')
+    reply(77, 'continue')
+    await until(() => harness.prompts.length === 1)
+    finish('other', 'Done here.')
+    await until(() => telegram.sent().includes('Done here.'))
+  })
+
+  it('covers the running turn and the queued one', async () => {
+    harness.running = true
+    await store.addRoute(KEY, '77', 'other')
+    reply(77, 'next')
+    await until(() => harness.prompts.length === 1)
+    harness.running = false
+    finish('other', 'First.')
+    finish('other', 'Second.')
+    await until(() => telegram.sent().includes('Second.'))
+    expect(telegram.sent()).toContain('First.')
+  })
+
+  it('stays in the chat\'s Session for its own messages, unknown ones, and commands', async () => {
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.addRoute(KEY, '77', 'mine')
+    await store.addRoute(KEY, '78', 'other')
+    reply(77, 'own')
+    await until(() => harness.prompts.length === 1)
+    reply(5, 'unknown')
+    await until(() => harness.prompts.length === 2)
+    expect(harness.prompts.map(p => p.sessionId)).toEqual(['mine', 'mine'])
+    expect(telegram.sent().some(t => t.startsWith('↪️'))).toBe(false)
+    reply(78, '/status')
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(harness.prompts).toHaveLength(2)
+  })
+
+  it('refuses a Session outside the person\'s directories instead of using their own', async () => {
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'member', dirs: ['/nowhere'] }] }
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.addRoute(KEY, '78', 'other')
+    reply(78, 'do it')
+    await until(() => telegram.sent().some(t => t.includes('/nowhere')))
+    expect(harness.prompts).toEqual([])
+  })
+
+  it('leaves a question in the chat unanswered by a reply to another Session', async () => {
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.addRoute(KEY, '78', 'other')
+    const answer = bridge.requestAnswers({ sessionId: 'mine', questions: [{ id: 'q', question: 'Which?' }] })
+    await until(() => telegram.sent().some(t => t.includes('Which?')))
+    reply(78, 'for the other one')
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]!.sessionId).toBe('other')
+    telegram.push(text(USER, 'this one'))
+    await expect(answer).resolves.toEqual({ answers: [{ id: 'q', selected: [], custom: 'this one' }] })
+  })
+
+  it('answers a followed Session\'s question when replying to it', async () => {
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.setWatch(KEY, 'other', true)
+    const answer = bridge.requestAnswers({ sessionId: 'other', questions: [{ id: 'q', question: 'Which?' }] })
+    await until(() => telegram.sent().some(t => t.includes('Which?')))
+    reply(noticeId('Which?'), 'B')
+    await expect(answer).resolves.toEqual({ answers: [{ id: 'q', selected: [], custom: 'B' }] })
+    expect(harness.prompts).toEqual([])
+  })
+
+  it('remembers routes across restarts, and only the latest ones', async () => {
+    for (let id = 0; id < 205; id++) await store.addRoute(KEY, String(id), 's')
+    await store.settled()
+    const reloaded = new BindingStore(join(dir, 'state.json'))
+    await reloaded.load()
+    expect(reloaded.routeOf(KEY, '204')).toBe('s')
+    expect(reloaded.routeOf(KEY, '0')).toBeUndefined()
+  })
+})
+
+describe('forking', () => {
+  it('moves the chat to a branch and keeps the original', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/fork'))
+    await until(() => telegram.sent().some(t => t.startsWith('🌿')))
+    expect(harness.forked).toEqual(['s1'])
+    expect(store.get(KEY).sessionId).toBe('s1-fork')
+    expect(harness.workspaced).toContain('s1-fork')
+  })
+
+  it('offers it under a finished reply', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Done.' }] } } })
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    const hasMarkup = (c: { params: Record<string, unknown> }) => JSON.stringify(c.params['reply_markup'] ?? '').includes(':f"')
+    await until(() => telegram.calls.some(hasMarkup))
+    const markup = telegram.calls.find(hasMarkup)!.params['reply_markup'] as { inline_keyboard: { callback_data: string }[][] }
+    const fork = markup.inline_keyboard.flat().find(b => b.callback_data.endsWith(':f'))!
+    telegram.push({ callback_query: { id: 'q1', from: USER, message: { message_id: 1, chat: CHAT, date: 0 }, data: fork.callback_data } })
+    await until(() => harness.forked.length === 1)
+  })
+
+  it('needs a Session and is not for guests', async () => {
+    telegram.push(text(USER, '/fork'))
+    await until(() => telegram.sent().length === 1)
+    expect(harness.forked).toEqual([])
+    settings = { ...settings, people: [{ line: 'telegram', id: '42', role: 'guest' }] }
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/fork'))
+    await until(() => telegram.sent().length === 2)
+    expect(harness.forked).toEqual([])
+    expect(store.get(KEY).sessionId).toBe('s1')
+  })
+
+  it('says why a fork failed and stays in the Session', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    harness.forkSession = async () => { throw new Error('no completed turn to fork from') }
+    telegram.push(text(USER, '/fork'))
+    await until(() => telegram.sent().some(t => t.includes('no completed turn')))
+    expect(store.get(KEY).sessionId).toBe('s1')
+  })
+})
+
+describe('token use', () => {
+  const usage = (input: number, cacheRead: number, output: number) => ({
+    type: 'assistant/message',
+    data: { message: { content: [] }, usage: { inputTokens: input, cacheReadTokens: cacheRead, outputTokens: output } },
+  })
+
+  it('adds up the turn\'s calls in the summary, including calls without text', async () => {
+    settings = { ...settings, turnSummary: 'always' }
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', usage(1000, 40_000, 500))
+    bridge.onSessionEvent('s1', usage(2000, 60_000, 1500))
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    await until(() => telegram.sent().some(t => t.startsWith('✅')))
+    expect(telegram.sent().find(t => t.startsWith('✅'))).toContain('Tokens: 3k in · 100k cached · 2k out')
+  })
+
+  it('shows the running turn in /status, and nothing without usage', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().some(t => t.startsWith('Bot:')))
+    expect(telegram.sent().find(t => t.startsWith('Bot:'))).not.toContain('Tokens')
+    bridge.onSessionEvent('s1', usage(840, 0, 10))
+    telegram.push(text(USER, '/status'))
+    await until(() => telegram.sent().filter(t => t.startsWith('Bot:')).length === 2)
+    expect(telegram.sent().filter(t => t.startsWith('Bot:')).at(-1)).toContain('Tokens: 840 in · 0 cached · 10 out')
   })
 })

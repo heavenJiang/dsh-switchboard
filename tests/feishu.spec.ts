@@ -295,6 +295,15 @@ describe('Feishu line', () => {
     expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: '> Build failed: missing env\n\nwhy?' }])
   })
 
+  it('sends a reply to the Session of the message it answers', async () => {
+    await store.update(KEY, { sessionId: 'mine' })
+    await store.addRoute(KEY, 'om_other', 'other')
+    feishu.deliver(message(DM, 'text', { text: 'go on' }, { parent_id: 'om_other' }))
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.sessionId).toBe('other')
+    expect(store.get(KEY).sessionId).toBe('mine')
+  })
+
   it('needs an app id and secret', async () => {
     settings = { ...settings, lines: [{ ...FEISHU_LINE, appId: '' }] }
     await bridge.reconcile()

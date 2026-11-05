@@ -201,6 +201,7 @@ export class FeishuChannel implements Channel {
       attachments: parsed.attachments,
       ...(parsed.voice === undefined ? {} : { voice: parsed.voice }),
       ...(quoted === undefined || quoted.trim() === '' ? {} : { quote: quoted.trim().slice(0, QUOTE_LIMIT) }),
+      ...(parent === undefined || parent === '' ? {} : { replyToId: parent }),
     }
     await sink.message(inbound)
   }

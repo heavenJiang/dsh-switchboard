@@ -34,6 +34,9 @@ export interface DigestItem {
   readonly text?: string
 }
 
+/** Sent messages a chat remembers the Session of; older ones fall off. */
+const MESSAGE_ROUTES = 200
+
 /** Digest items a chat keeps; older ones fall off. */
 const DIGEST_ITEMS = 100
 
@@ -49,6 +52,8 @@ interface BindingsFile {
   offsets?: Record<string, number>
   /** Last Session event seq the bridge mirrored, per linked Session, so a restart can catch up. */
   cursors?: Record<string, number>
+  /** The Session each sent message speaks for, per chat key, so a reply to it reaches that Session. */
+  routes?: Record<string, Record<string, string>>
   /** Turns of followed Sessions not yet sent in a digest, per chat key. */
   digests?: Record<string, DigestItem[]>
   /** Local day (`YYYY-MM-DD`) the last daily digest went out. */
@@ -116,6 +121,7 @@ export class BindingStore {
       ...(parsed.pending === undefined ? {} : { pending: parsed.pending }),
       ...(parsed.offsets === undefined ? {} : { offsets: parsed.offsets }),
       ...(parsed.cursors === undefined ? {} : { cursors: parsed.cursors }),
+      ...(parsed.routes === undefined ? {} : { routes: parsed.routes }),
       ...(parsed.digests === undefined ? {} : { digests: parsed.digests }),
       ...(parsed.digestDay === undefined ? {} : { digestDay: parsed.digestDay }),
     }
@@ -224,6 +230,20 @@ export class BindingStore {
   setCursor(sessionId: string, seq: number): Promise<void> {
     if (seq <= (this.data.cursors?.[sessionId] ?? -1)) return this.writing
     this.data.cursors = { ...this.data.cursors, [sessionId]: seq }
+    return this.flush()
+  }
+
+  /** @returns the Session a sent message speaks for, if it is still remembered. */
+  routeOf(chat: string, messageId: string): string | undefined {
+    return this.data.routes?.[chat]?.[messageId]
+  }
+
+  /** Remember which Session a sent message speaks for, and persist. */
+  addRoute(chat: string, messageId: string, sessionId: string): Promise<void> {
+    const routes = { ...this.data.routes?.[chat], [messageId]: sessionId }
+    const ids = Object.keys(routes)
+    for (const id of ids.slice(0, Math.max(0, ids.length - MESSAGE_ROUTES))) delete routes[id]
+    this.data.routes = { ...this.data.routes, [chat]: routes }
     return this.flush()
   }
 

@@ -47,6 +47,8 @@ export interface InboundMessage {
   readonly voice?: InboundAttachment
   /** Text of the message this one replies to (quotes), for context. */
   readonly quote?: string
+  /** Id of the message this one replies to. */
+  readonly replyToId?: string
 }
 
 /** A button press. */

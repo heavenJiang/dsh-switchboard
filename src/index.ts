@@ -621,6 +621,9 @@ export function apply(ctx: Context, config: Config): void {
       const { result } = execution
       return { kind: result.kind, ...(result.text === undefined ? {} : { text: result.text }) }
     },
+    async forkSession(sessionId) {
+      return (await sessionController.fork({ sessionId: sessionId as SessionId })).sessionId
+    },
     contextUsage(sessionId) {
       const agent = agents.get(sessionId as SessionId)
       if (agent === undefined || optional.tokenMeter === undefined) return undefined

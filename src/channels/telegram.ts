@@ -135,6 +135,7 @@ export class TelegramChannel implements Channel {
       addressed,
       attachments,
       ...(quoted === '' ? {} : { quote: quoted.slice(0, QUOTE_LIMIT) }),
+      ...(first.reply_to_message === undefined ? {} : { replyToId: String(first.reply_to_message.message_id) }),
       ...(voice === undefined || messages.length > 1 ? {} : {
         voice: { ref: voice.file_id, name: `voice_${first.message_id}.ogg`, mediaType: 'audio/ogg', ...(voice.file_size === undefined ? {} : { size: voice.file_size }) },
       }),
