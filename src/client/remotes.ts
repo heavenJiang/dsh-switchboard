@@ -9,10 +9,20 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 /** Remote answers carry either a value or an error. */
 export type RemoteResult<V> = { ok: true; value: V } | { ok: false; error: { message: string } }
 
+/** The parts of the plugin manager's change result the page reads. */
+export interface ChangeResult {
+  application: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled'
+  error?: { code: string; diagnostic?: string }
+  pendingBuilds?: string[]
+  version?: string
+  packageResult?: { output?: string }
+}
+
 /** The plugin manager remote namespace, as far as this page uses it. */
 export interface PluginManagerRemote {
   /** `updatable` is absent on a Host whose Plugins page has no update dialog. */
   listBundles(): Promise<RemoteResult<{ name: string; version?: string; source?: string; installed: boolean; updatable?: boolean }[]>>
+  installBundle(spec: string, options: Record<string, unknown>): Promise<RemoteResult<ChangeResult>>
 }
 
 /** The credentials remote namespace, as far as this page uses it. */
