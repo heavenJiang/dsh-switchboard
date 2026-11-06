@@ -16,6 +16,23 @@ export interface ChatBinding {
   workspacePath?: string
   /** Sessions this chat follows for completion and approval notices without talking to them. */
   watch?: string[]
+  /** Set while the chat's people are away from the Web UI. */
+  away?: AwayState
+  /** The chat's live board. */
+  board?: BoardState
+}
+
+/** A chat's away mode. */
+export interface AwayState {
+  readonly since: number
+  readonly until: number
+}
+
+/** The message a chat's board lives in. */
+export interface BoardState {
+  readonly messageId: string
+  /** Directories it may show, those of whoever opened it; undefined shows every Session. */
+  readonly dirs?: readonly string[]
 }
 
 /** A choice made in Telegram for a Session that was not loaded at the time. */
@@ -60,6 +77,10 @@ interface BindingsFile {
   digests?: Record<string, DigestItem[]>
   /** Local day (`YYYY-MM-DD`) the last daily digest went out. */
   digestDay?: string
+  /** Turns that ended while a chat was away, per chat key. */
+  awayLogs?: Record<string, DigestItem[]>
+  /** Chats that hear each scheduled task, by task id. */
+  schedulePush?: Record<string, string[]>
 }
 
 /**
@@ -127,6 +148,8 @@ export class BindingStore {
       ...(parsed.routes === undefined ? {} : { routes: parsed.routes }),
       ...(parsed.digests === undefined ? {} : { digests: parsed.digests }),
       ...(parsed.digestDay === undefined ? {} : { digestDay: parsed.digestDay }),
+      ...(parsed.awayLogs === undefined ? {} : { awayLogs: parsed.awayLogs }),
+      ...(parsed.schedulePush === undefined ? {} : { schedulePush: parsed.schedulePush }),
     }
   }
 
@@ -296,6 +319,80 @@ export class BindingStore {
   /** Record the day of a daily digest and persist. */
   setDigestDay(day: string): Promise<void> {
     this.data.digestDay = day
+    return this.flush()
+  }
+
+  /** Turn a chat's away mode on, or off with undefined, and persist. */
+  setAway(chat: string, away: AwayState | undefined): Promise<void> {
+    const binding: ChatBinding = { ...this.data.chats[chat] }
+    if (away === undefined) delete binding.away
+    else binding.away = away
+    this.data.chats[chat] = binding
+    return this.flush()
+  }
+
+  /** @returns the chats in away mode. */
+  awayChats(): string[] {
+    return Object.entries(this.data.chats).filter(([, binding]) => binding.away !== undefined).map(([chat]) => chat)
+  }
+
+  /** Keep a finished turn for each chat's report on return and persist. */
+  addAwayItem(chats: readonly string[], item: DigestItem): Promise<void> {
+    if (chats.length === 0) return this.writing
+    const logs = { ...this.data.awayLogs }
+    for (const chat of chats) logs[chat] = [...logs[chat] ?? [], item].slice(-DIGEST_ITEMS)
+    this.data.awayLogs = logs
+    return this.flush()
+  }
+
+  /** @returns the turns kept for a chat's return, forgetting them. */
+  async takeAwayItems(chat: string): Promise<readonly DigestItem[]> {
+    const items = this.data.awayLogs?.[chat] ?? []
+    if (items.length === 0) return items
+    const logs = { ...this.data.awayLogs }
+    delete logs[chat]
+    this.data.awayLogs = logs
+    await this.flush()
+    return items
+  }
+
+  /** Record a chat's board, or its end with undefined, and persist. */
+  setBoard(chat: string, board: BoardState | undefined): Promise<void> {
+    const binding: ChatBinding = { ...this.data.chats[chat] }
+    if (board === undefined) delete binding.board
+    else binding.board = board
+    this.data.chats[chat] = binding
+    return this.flush()
+  }
+
+  /** @returns the chats with a board. */
+  boardChats(): string[] {
+    return Object.entries(this.data.chats).filter(([, binding]) => binding.board !== undefined).map(([chat]) => chat)
+  }
+
+  /** @returns the chats that hear a scheduled task. */
+  schedulePush(taskId: string): readonly string[] {
+    return this.data.schedulePush?.[taskId] ?? []
+  }
+
+  /** Make a chat hear a scheduled task or stop, and persist. */
+  setSchedulePush(taskId: string, chat: string, on: boolean): Promise<void> {
+    const chats = new Set(this.schedulePush(taskId))
+    if (on) chats.add(chat)
+    else chats.delete(chat)
+    const pushes = { ...this.data.schedulePush }
+    if (chats.size === 0) delete pushes[taskId]
+    else pushes[taskId] = [...chats]
+    this.data.schedulePush = pushes
+    return this.flush()
+  }
+
+  /** Forget who hears a deleted task and persist. */
+  dropSchedulePush(taskId: string): Promise<void> {
+    if (this.data.schedulePush?.[taskId] === undefined) return this.writing
+    const pushes = { ...this.data.schedulePush }
+    delete pushes[taskId]
+    this.data.schedulePush = pushes
     return this.flush()
   }
 

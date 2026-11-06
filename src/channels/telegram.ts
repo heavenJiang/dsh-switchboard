@@ -177,6 +177,10 @@ export class TelegramChannel implements Channel {
     })
   }
 
+  async pin(chatId: string, messageId: string): Promise<void> {
+    await this.client.call('pinChatMessage', { chat_id: Number(chatId), message_id: Number(messageId), disable_notification: true })
+  }
+
   /** Deleting leaves no trace in Telegram; a message too old to delete is shrunk instead. */
   async retire(chatId: string, messageId: string, summary: string): Promise<void> {
     await this.client.deleteMessage(Number(chatId), Number(messageId)).catch(() =>

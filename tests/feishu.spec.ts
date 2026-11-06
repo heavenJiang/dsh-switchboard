@@ -200,8 +200,8 @@ describe('Feishu line', () => {
     await until(() => harness.prompts.length === 2)
     // The two messages are handled concurrently; order is not part of the contract.
     expect(harness.prompts.map(p => p.parts).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual([
-      [{ type: 'text', text: '@Bob hi' }],
-      [{ type: 'text', text: 'please deploy' }],
+      [{ type: 'text', text: '[group chat | role: admin | from: Ann]\n@Bob hi' }],
+      [{ type: 'text', text: '[group chat | role: admin | from: Ann]\nplease deploy' }],
     ])
     await chatLog.settled()
     expect((await chatLog.chats())[0]).toMatchObject({ chatId: `feishu:${GROUP}`, title: 'Team', type: 'group' })

@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { ChatEntry, ChatSummary } from '../history-types.ts'
+import { QrCode } from './FeishuScan.tsx'
 import type { TelegramBridgeLocaleKey } from './locales.ts'
 
 type T = (key: TelegramBridgeLocaleKey) => string
@@ -16,6 +17,13 @@ interface SessionView {
   links: { chatId: string; mode: 'active' | 'watch'; title: string; line?: string }[]
   chats: ChatSummary[]
   entries: (ChatEntry & { chatId: string })[]
+}
+
+/** A pairing code and where each connected line can be opened. */
+interface Claim {
+  code: string
+  expiresAt: number
+  lines: { id: string; name: string; type: 'telegram' | 'feishu'; url?: string }[]
 }
 
 const POLL_MS = 4000
@@ -43,6 +51,7 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
   const [picked, setPicked] = useState('')
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
+  const [claim, setClaim] = useState<Claim | undefined>(undefined)
 
   const load = useCallback(async () => {
     try {
@@ -79,6 +88,7 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
     }
   }
   const link = (chatId: string, mode: 'active' | 'watch' | 'none'): Promise<void> => act(() => post('link', { chatId, sessionId, mode }))
+  const makeClaim = (): Promise<void> => act(async () => { setClaim(await post<Claim>('claim', { sessionId })) })
 
   if (view === undefined) return <div className="tgb-tab"><p className="tgb-status">{error ?? t('loading')}</p></div>
   const titleOf = (chatId: string): string => view.chats.find(chat => chat.chatId === String(chatId))?.title ?? String(chatId)
@@ -92,6 +102,31 @@ export function SessionTab({ sessionId, t }: { sessionId: string; t: T }): React
     <div className="tgb-tab">
       {!view.connected && <p className="tgb-tab-warn">{t('tabDisconnected')}</p>}
       {error !== undefined && <p className="tgb-tab-warn">{error}</p>}
+
+      <section className="tgb-card">
+        <h3>{t('tabClaim')}</h3>
+        {claim === undefined || claim.expiresAt <= Date.now()
+          ? (
+            <>
+              <p className="tgb-muted">{t('tabClaimHint')}</p>
+              <button type="button" className="tgb-button" disabled={busy || !view.connected} onClick={() => { void makeClaim() }}>{t('tabClaimMake')}</button>
+            </>
+          )
+          : (
+            <>
+              <div className="tgb-claims">
+                {claim.lines.filter(line => line.url !== undefined).map(line => (
+                  <figure key={line.id} className="tgb-claim">
+                    <QrCode text={line.url ?? ''} />
+                    <figcaption>{line.name}</figcaption>
+                  </figure>
+                ))}
+              </div>
+              <p className="tgb-muted">{t('tabClaimCode')} <code className="tgb-claim-code">/link {claim.code}</code></p>
+              <p className="tgb-muted">{t('tabClaimNote')}</p>
+            </>
+          )}
+      </section>
 
       <section className="tgb-card">
         <h3>{t('tabLinked')}</h3>

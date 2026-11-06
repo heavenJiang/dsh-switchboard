@@ -145,6 +145,8 @@ export interface Channel {
    * @param clearOthers - also remove lists set for other scopes or languages.
    */
   setMenu(commands: readonly { command: string; description: string }[], clearOthers?: boolean): Promise<void>
+  /** Keep a message in view at the top of the chat, where the platform can, without notifying anyone. */
+  pin?(chat: string, messageId: string): Promise<void>
   /** Acknowledge a button press, optionally with a short notice. */
   ack(action: InboundAction, notice?: string): Promise<void>
 }

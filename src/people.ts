@@ -29,6 +29,8 @@ export interface Actor {
   readonly preset?: string
   /** Directories they may use; undefined means anywhere. */
   readonly dirs?: readonly string[]
+  /** In a group, the line telling the Agent who is speaking. */
+  readonly speaker?: string
 }
 
 export const ADMIN: Actor = { role: 'admin' }
@@ -59,6 +61,22 @@ export function actorFor(
     preset: role === 'guest' ? GUEST_PRESET : (record?.preset?.trim() || MEMBER_PRESET),
     dirs,
   }
+}
+
+/** Characters of a display name a speaker line keeps. */
+const SPEAKER_NAME_LENGTH = 40
+
+/**
+ * The line that tells the Agent who said a group message. Names are chosen by
+ * their owners, so the role comes first and a name cannot close the bracket,
+ * start a new line, or pass for a field.
+ * @param name - display name.
+ * @param username - platform handle, when there is one.
+ */
+export function speakerLine(role: Role, name: string, username?: string): string {
+  const clean = (text: string): string => text.replace(/[\p{C}\p{Zl}\p{Zp}[\]|]+/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, SPEAKER_NAME_LENGTH)
+  const handle = username === undefined ? '' : ` @${clean(username)}`
+  return `[group chat | role: ${role} | from: ${clean(name) || 'unknown'}${handle}]`
 }
 
 /** Whether a path lies inside one of an actor's directories (anywhere for admins). */

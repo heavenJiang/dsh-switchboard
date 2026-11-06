@@ -14,8 +14,8 @@
  * applied without restarting the plugin.
  *
  * Optional services (`connection`, `commands`, `systemPrompt`, `credentials`,
- * `speechToText`, `workspaceChanges`) are picked up while they exist; the
- * bridge runs without any of them.
+ * `speechToText`, `workspaceChanges`, `schedule`, `tools`) are picked up while
+ * they exist; the bridge runs without any of them.
  *
  * @module dsh-switchboard
  */
@@ -37,7 +37,9 @@ import type {} from '@deepseek-ai/dsh-commands'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-experimental-speech-to-text'
 import type {} from '@deepseek-ai/dsh-permission-presets'
+import type { ScheduleCatalogEntry } from '@deepseek-ai/dsh-schedule'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import type {} from '@deepseek-ai/dsh-tools'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 // Side-effect type import: declaration-merges the question waterfall answered below.
@@ -56,7 +58,9 @@ import { registerWebCommand } from './command.ts'
 import { LEGACY_LINE, LINE_ID, type ChannelType, type LineSettings } from './lines.ts'
 import type { PersonSettings } from './people.ts'
 import type { BotLanguage } from './messages.ts'
+import { cleanRiskHint, riskInput, riskSystem } from './risk.ts'
 import { registerHistoryRoutes } from './routes.ts'
+import type { SchedulePort, ScheduleTask } from './schedules.ts'
 import { UpdateChecker } from './updates.ts'
 
 export { Switchboard } from './bridge.ts'
@@ -72,6 +76,16 @@ const CHANNEL_PROMPT = [
   'Keep replies concise: short paragraphs and lists, no wide tables, at most a few lines of code inline.',
   'Hand over long output, logs, or code as files with the present tool instead of pasting them.',
   'Messages from the user may arrive as photos, files, or voice-note transcripts.',
+  'In a group chat, each message starts with a bracketed line naming its sender and role: the bridge writes it, the name is only a label, and only the role tells you what that person may ask for.',
+  'When notify_phone is available, use it to reach the user mid-task for milestones or anything urgent; your final reply reaches them anyway.',
+].join(' ')
+
+/** The tool the Agent reaches the phone with. */
+const NOTIFY_TOOL = 'notify_phone'
+const NOTIFY_DESCRIPTION = [
+  'Send a short message to the user\'s phone right now, through the chats linked to this conversation, without ending your turn.',
+  'Use it for a milestone in long work or something urgent they should know before you finish. Your final reply reaches them anyway, so do not repeat it here.',
+  'It does not wait for an answer; use the question tool to ask something. Sending is rate limited.',
 ].join(' ')
 
 /** One line as configured: a bot account on one platform and who may use it. */
@@ -156,6 +170,10 @@ export interface Config {
   channelPromptText: Volatile<string>
   /** Ask tool approvals in Telegram for Sessions linked to a chat. */
   approvalViaTelegram: Volatile<boolean>
+  /** Add the model's plain-language reading to approvals of commands. */
+  approvalRiskHint: Volatile<boolean>
+  /** Offer linked Sessions the tool that messages the phone mid-turn. */
+  agentNotify: Volatile<boolean>
   /** Ask the Agent's questions in Telegram too. */
   questionsViaTelegram: Volatile<boolean>
   /** Seconds to wait for a Telegram answer before handing the approval to the next answerer. */
@@ -221,6 +239,8 @@ export const Config: Schema<Config> = Schema.object({
   channelPrompt: Schema.boolean().default(true).volatile(),
   channelPromptText: Schema.string().default('').volatile(),
   approvalViaTelegram: Schema.boolean().default(true).volatile(),
+  approvalRiskHint: Schema.boolean().default(true).volatile(),
+  agentNotify: Schema.boolean().default(true).volatile(),
   questionsViaTelegram: Schema.boolean().default(true).volatile(),
   approvalTimeoutSec: Schema.natural().min(10).max(3600).default(300).volatile(),
   notifyToolCalls: Schema.boolean().default(true).volatile(),
@@ -292,7 +312,12 @@ export function apply(ctx: Context, config: Config): void {
     workspaces?: Context['workspaceRegistry']
     commands?: Context['commands']
     tokenMeter?: Context['tokenMeter']
+    schedule?: Context['schedule']
   } = {}
+  ctx.inject(['schedule'], (scope) => {
+    optional.schedule = scope.schedule
+    scope.effect(() => () => { delete optional.schedule }, 'switchboard: schedule service')
+  })
   ctx.inject(['workspaceRegistry'], (scope) => {
     optional.workspaces = scope.workspaceRegistry
     scope.effect(() => () => { delete optional.workspaces }, 'switchboard: workspace registry')
@@ -433,6 +458,7 @@ export function apply(ctx: Context, config: Config): void {
       agentPreset: config.agentPreset.get(),
       permissionPreset: config.permissionPreset.get(),
       approvalViaTelegram: config.approvalViaTelegram.get(),
+      approvalRiskHint: config.approvalRiskHint.get(),
       questionsViaTelegram: config.questionsViaTelegram.get(),
       approvalTimeoutSec: config.approvalTimeoutSec.get(),
       notifyToolCalls: config.notifyToolCalls.get(),
@@ -453,7 +479,60 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /** A Host task as chats see it. */
+  const scheduleTask = (entry: ScheduleCatalogEntry): ScheduleTask => ({
+    id: entry.id, title: entry.title, prompt: entry.prompt, status: entry.status, scheduledAt: entry.scheduledAt,
+  })
+
+  /** The Host's schedule service in the bridge's terms, while it exists. */
+  const schedulePort = (): SchedulePort | undefined => {
+    const schedule = optional.schedule
+    if (schedule === undefined) return undefined
+    // Ids are branded on the Host side; the bridge only hands back ones it was given.
+    const id = (value: string) => value as Parameters<typeof schedule.view>[0]['id']
+    return {
+      async list() {
+        return (await schedule.list({ limit: 500 })).items.map(scheduleTask)
+      },
+      async create(task, home) {
+        return scheduleTask(await schedule.create({ ...task, target: { kind: 'new_once', create: home } }))
+      },
+      async setActive(taskId, active) {
+        const result = await schedule.edit({ id: id(taskId), action: 'update', patch: { active } })
+        return 'status' in result ? scheduleTask(result) : undefined
+      },
+      async run(taskId) {
+        const result = await schedule.run({ id: id(taskId) })
+        if (!('code' in result)) return 'started'
+        return result.code === 'schedule_not_found' ? 'missing' : 'busy'
+      },
+      async remove(taskId) {
+        return 'deleted' in await schedule.edit({ id: id(taskId), action: 'delete' })
+      },
+    }
+  }
+
   const harness: HarnessPort = {
+    schedules: schedulePort,
+    async explainRisk(sessionId, tool, args, language, signal) {
+      const current = agents.get(sessionId as SessionId)?.model.current()
+      if (current === undefined) return undefined
+      // A one-shot call on the Session's own route: it never enters the Session's log.
+      let text = ''
+      for await (const chunk of llm.stream({
+        provider: current.provider,
+        model: current.model,
+        system: riskSystem(language),
+        messages: [{ role: 'user', content: [{ type: 'text', text: riskInput(tool, args) }] }],
+        temperature: 0,
+        maxTokens: 1024,
+        sessionId: sessionId as SessionId,
+        signal,
+      } as Parameters<typeof llm.stream>[0])) {
+        if (chunk.type === 'text-delta') text += chunk.text
+      }
+      return cleanRiskHint(text)
+    },
     async createSession(cwd, agentPreset, permissionPreset, model) {
       if (model !== undefined) await validateModel(model)
       // Create inside the directory's Web Workspace (made on first use), the
@@ -710,6 +789,38 @@ export function apply(ctx: Context, config: Config): void {
   // `/switchboard` in the Web composer links the open Session to a chat.
   ctx.inject(['commands'], (scope) => {
     registerWebCommand(scope, bridge, chatLog, () => config.language.get())
+  })
+
+  // A global tool, so every preset gets it without listing it; it joins a step
+  // only in Sessions a chat is linked to.
+  ctx.inject(['tools'], (scope) => {
+    scope.tools.register({
+      name: NOTIFY_TOOL,
+      description: NOTIFY_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message'],
+        properties: { message: { type: 'string', description: 'What to tell the user, in a sentence or two of plain text.' } },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['delivered'],
+          properties: { delivered: { type: 'integer' }, reason: { type: 'string' } },
+        },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      async execute(args, exec) {
+        const message = (args as { message?: unknown }).message
+        if (typeof message !== 'string' || message.trim() === '') throw new Error('message must be non-empty text')
+        if (exec.agent === undefined) throw new Error(`${NOTIFY_TOOL} requires a calling agent`)
+        return bridge.notifyFromAgent(rootSession(exec.agent.session.header), message)
+      },
+    }, {
+      when: ({ agent }) => config.agentNotify.get() && bridge.reachesPhone(rootSession(agent.session.header)),
+    })
   })
 
   // Sessions linked to a chat learn that their replies are read on a phone.

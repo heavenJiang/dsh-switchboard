@@ -14,11 +14,12 @@
  */
 
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomInt, randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
-import type { BindingStore, DigestItem, PendingChoice } from './bindings.ts'
+import type { BindingStore, BoardState, DigestItem, PendingChoice } from './bindings.ts'
+import { boardMessage, type BoardRow } from './board.ts'
 import { FeishuChannel, type FeishuApi } from './channels/feishu.ts'
 import { createFeishuApi } from './channels/feishu-api.ts'
 import { TelegramChannel } from './channels/telegram.ts'
@@ -31,9 +32,10 @@ import type { ChatAttachment, ChatEntry, ChatInfo, ChatLog } from './chatlog.ts'
 import { chatKey, splitChatKey, type LineSettings } from './lines.ts'
 import { outgoingKind, promptImageType, sniffImageType } from './media.ts'
 import { duration, MESSAGES, type BotLanguage, type Messages } from './messages.ts'
-import { actorFor, mayRunCommand, mayUse, type Actor, type PersonSettings } from './people.ts'
+import { actorFor, mayRunCommand, mayUse, speakerLine, type Actor, type PersonSettings } from './people.ts'
 import type { Outbox, OutboxPayload } from './outbox.ts'
-import { chunkText, isAllowed, parseInput, previewArguments, truncate } from './text.ts'
+import { parseScheduleAdd, scheduleIdsIn, type SchedulePort, type ScheduleTask } from './schedules.ts'
+import { chunkText, isAllowed, parseDuration, parseInput, previewArguments, truncate } from './text.ts'
 
 export type { LineState } from './channels/types.ts'
 
@@ -80,6 +82,8 @@ export interface BridgeSettings {
   readonly model?: ModelChoice
   /** Local time (`HH:MM`) of the daily digest of followed Sessions; empty sends each turn's notice instead. */
   readonly watchDigestTime?: string
+  /** Add the model's plain-language reading to approvals of commands. */
+  readonly approvalRiskHint?: boolean
 }
 
 /** A provider route, model, and optional reasoning effort. */
@@ -218,6 +222,13 @@ export interface HarnessPort {
    * loading the Session; undefined when its log cannot be read.
    */
   eventsSince?(sessionId: string, afterSeq: number): Promise<readonly SessionLogEvent[] | undefined>
+  /**
+   * Have the Session's model explain one pending tool call in a sentence.
+   * @returns the sentence, or undefined when it has none to give.
+   */
+  explainRisk?(sessionId: string, tool: string, args: string, language: BotLanguage, signal: AbortSignal): Promise<string | undefined>
+  /** The Host's scheduled tasks; undefined while the deployment has none. */
+  schedules?(): SchedulePort | undefined
 }
 
 /** One committed Session event as the log stores it. */
@@ -250,8 +261,12 @@ export type TelegramApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' 
 interface Deadline {
   /** Reminders sent, which the answer or an extension rewrites. */
   readonly reminders: { chat: string; messageId: string }[]
+  /** The chats it waits on. */
+  readonly chats: readonly string[]
   /** Start the wait over. */
   extend(): void
+  /** Go back to the normal wait after away mode stretched it. */
+  relax(): void
   clear(): void
 }
 
@@ -262,6 +277,8 @@ interface PendingApproval {
   /** What "Allow for this turn" remembers. */
   readonly grantKey: string
   readonly prompts: { chat: string; messageId: string }[]
+  /** The question as shown, which the model's reading may extend. */
+  text: string
   settle(outcome: TelegramApprovalOutcome, note: string, by?: string): void
   /** Wait longer before handing the approval on. */
   extend(): void
@@ -400,6 +417,8 @@ interface TurnState {
   files?: string[]
   /** Started by the schedule subsystem: results also go to the schedule chats. */
   scheduled: boolean
+  /** Chats that asked to hear the tasks behind this scheduled turn. */
+  pushChats?: readonly string[]
   lastText?: string
   /** Tokens the turn's model calls reported. */
   usage?: { input: number; cached: number; output: number }
@@ -449,7 +468,7 @@ export type BridgeState = LineState
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
   'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
-  'status', 'model', 'mode', 'get', 'whoami', 'digest', 'fork',
+  'status', 'model', 'mode', 'get', 'whoami', 'digest', 'fork', 'board', 'away', 'schedule', 'link',
 ])
 /** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
 const WEB_ONLY_COMMANDS = new Set(['switchboard'])
@@ -506,6 +525,31 @@ const DIGEST_WINDOW_MS = 24 * 60 * 60 * 1000
 const DIGEST_TIME = /^([01]\d|2[0-3]):[0-5]\d$/u
 /** Characters of a reply or failure a digest line quotes. */
 const DIGEST_EXCERPT = 80
+/** Boards repaint at most this often, however busy the Sessions are. */
+const BOARD_INTERVAL_MS = 5000
+/** Telegram's limit on a button's data. */
+const BUTTON_DATA_BYTES = 64
+/** The most a wait may stretch to between reminders in away mode. */
+const AWAY_WAIT_MAX_MS = 60 * 60 * 1000
+/** Durations `/away` offers as buttons, in hours. */
+const AWAY_CHOICES = [1, 4, 12]
+/** How long a pairing code from the Web UI works. */
+const CLAIM_TTL_MS = 10 * 60 * 1000
+const CLAIM_LENGTH = 6
+/** Letters and digits nobody mistakes for one another when typing a code. */
+const CLAIM_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+/** How long the model may take to explain an approval before the chat goes without. */
+const RISK_TIMEOUT_MS = 20_000
+/** An approval this long has no room left for the model's reading. */
+const RISK_TEXT_LIMIT = 3800
+/** Tasks `/schedule` lists. */
+const SCHEDULE_LIST_LIMIT = 10
+/** Characters of a task's instruction its detail shows. */
+const SCHEDULE_PROMPT_LENGTH = 800
+/** The Agent may reach the phone at most this often per Session, so a loop cannot flood it. */
+const AGENT_NOTICE_INTERVAL_MS = 30_000
+/** Characters of one message from the Agent. */
+const AGENT_NOTICE_LENGTH = 2000
 
 /** The bridge core. One instance lives for the plugin's lifetime; lines restart when their settings change. */
 export class Switchboard {
@@ -553,6 +597,18 @@ export class Switchboard {
   private readonly lifetime = new AbortController()
   /** Outbox items being sent now. */
   private readonly sending = new Set<string>()
+  /** Waits for an answer now running. */
+  private readonly deadlines = new Set<Deadline>()
+  /** How each Session's last turn failed, until its next turn starts. */
+  private readonly failures = new Map<string, string>()
+  /** What each board last showed, so an unchanged one is not edited. */
+  private readonly boardShown = new Map<string, string>()
+  private boardTimer: ReturnType<typeof setTimeout> | undefined
+  private boardPaintedAt = 0
+  /** Pairing codes from the Web UI: code → Session and expiry. */
+  private readonly claims = new Map<string, { sessionId: string; expiresAt: number }>()
+  /** When the Agent last reached the phone, per Session. */
+  private readonly agentNotices = new Map<string, number>()
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(
@@ -632,7 +688,11 @@ export class Switchboard {
     }
     this.timer ??= setInterval(() => {
       this.checkOutages()
+      this.checkAway()
       void this.flushOutbox()
+      this.refreshBoards().catch((error: unknown) => {
+        this.logger.warn(`switchboard: board update failed: ${describe(error)}`)
+      })
       this.sendDailyDigest().catch((error: unknown) => {
         this.logger.warn(`switchboard: daily digest failed: ${describe(error)}`)
       })
@@ -701,6 +761,8 @@ export class Switchboard {
     for (const pending of this.questions.values()) pending.settle('delegate', this.t.questionTimedOut)
     for (const timer of this.typing.values()) clearInterval(timer)
     this.typing.clear()
+    clearTimeout(this.boardTimer)
+    this.boardTimer = undefined
     for (const progress of this.progress.values()) {
       clearTimeout(progress.timer)
       clearInterval(progress.ticker)
@@ -890,6 +952,9 @@ export class Switchboard {
       { command: 'get', description: t.cmdGet },
       { command: 'status', description: t.cmdStatus },
       { command: 'digest', description: t.cmdDigest },
+      { command: 'board', description: t.cmdBoard },
+      { command: 'away', description: t.cmdAway },
+      { command: 'schedule', description: t.cmdSchedule },
       { command: 'help', description: t.cmdHelp },
       ...extra,
     ], clearOthers).then(async () => {
@@ -914,12 +979,16 @@ export class Switchboard {
     return chat !== undefined && line.allowedChats.some(id => id.trim() === chat.id)
   }
 
-  /** What a person may do on a line. */
-  private actorOf(line: LineSettings, user: ChannelUser): Actor {
+  /**
+   * What a person may do on a line.
+   * @param chat - where they are; in a group the Agent is told who speaks.
+   */
+  private actorOf(line: LineSettings, user: ChannelUser, chat?: ChannelChat): Actor {
     const ids = [user.id, ...(user.aliases ?? []), ...(user.username === undefined ? [] : [`@${user.username}`])]
     const byName = ids.some(id => isAllowed(line.allowedUsers, id))
     const fallback = line.workspacePath.trim() || this.settings().workspacePath.trim() || undefined
-    return actorFor(this.settings().people, line.id, ids, !byName, fallback)
+    const actor = actorFor(this.settings().people, line.id, ids, !byName, fallback)
+    return chat?.type === 'group' ? { ...actor, speaker: speakerLine(actor.role, user.name, user.username) } : actor
   }
 
   /** Whether an actor may use a Session: admins any, others only in their directories. */
@@ -937,7 +1006,7 @@ export class Switchboard {
   private async handleMessage(entry: LiveLine, message: InboundMessage): Promise<void> {
     const { channel } = entry
     const line = this.settingsOf(entry)
-    const actor = this.actorOf(line, message.from)
+    const actor = this.actorOf(line, message.from, message.chat)
     const key = chatKey(line.id, message.chat.id)
     const from = message.from
     const t = this.t
@@ -1033,7 +1102,7 @@ export class Switchboard {
     }
     if (caption !== '') parts.unshift({ type: 'text', text: caption })
     if (target !== undefined) await this.followReply(key, target)
-    await this.promptSession(key, sessionId, parts, 'queue', message.messageId)
+    await this.promptSession(key, sessionId, spoken(parts, actor), 'queue', message.messageId)
   }
 
   /**
@@ -1139,7 +1208,19 @@ export class Switchboard {
     switch (name) {
       case 'start':
       case 'menu':
+        // `t.me/<bot>?start=link_<code>` from the QR on a Web Session.
+        if (name === 'start' && args.startsWith('link_')) return this.claimSession(key, args.slice('link_'.length), actor)
         return this.sendMenu(key, name === 'start')
+      case 'link':
+        if (args === '') return this.reply(key, t.linkUsage)
+        return this.claimSession(key, args, actor)
+      case 'board':
+        return args.trim().toLowerCase() === 'off' ? this.closeBoard(key) : this.openBoard(key, actor)
+      case 'away':
+        return this.awayCommand(key, args, actor)
+      case 'schedule':
+        if (actor.role !== 'admin') return this.reply(key, t.adminOnly)
+        return this.scheduleCommand(key, args, actor)
       case 'help': {
         const commands = (await this.harness.listCommands(binding.sessionId).catch(() => []))
           .filter(command => !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
@@ -1257,6 +1338,7 @@ export class Switchboard {
           ...(todos === undefined ? {} : { todos }),
           ...(goal === undefined ? {} : { goal: t.goalStatus(truncate(goal.objective, 80), goal.phase, goal.rounds, goal.maxGoalRounds) }),
           ...(subagents === 0 ? {} : { subagents }),
+          ...(binding.away === undefined ? {} : { away: clock(binding.away.until) }),
         }))
       }
       case 'digest': {
@@ -1405,9 +1487,11 @@ export class Switchboard {
     const text = withHelp ? `${t.help}\n\n${t.menu(title)}` : t.menu(title)
     const buttons: Button[][] = [
       [{ text: t.menuNew, data: 'mn:new' }, { text: t.menuSessions, data: 'mn:sessions' }],
+      [{ text: t.menuBoard, data: 'mn:board' }, { text: t.menuAway, data: 'mn:away' }],
       [{ text: t.menuModel, data: 'mn:model' }, { text: t.menuMode, data: 'mn:mode' }],
       [{ text: t.menuStop, data: 'mn:stop' }, { text: t.menuCompact, data: 'mn:compact' }],
-      [{ text: t.menuStatus, data: 'mn:status' }, { text: t.menuHelp, data: 'mn:help' }],
+      [{ text: t.menuStatus, data: 'mn:status' }, { text: t.menuSchedule, data: 'mn:schedule' }],
+      [{ text: t.menuHelp, data: 'mn:help' }],
     ]
     await this.enqueue(key, async (channel, chat) => { await channel.send(chat, { text, buttons }) })
     this.log({ chatId: key }, { dir: 'out', kind: 'notice', text })
@@ -1618,7 +1702,7 @@ export class Switchboard {
     if (target !== undefined) await this.followReply(key, target)
     const sessionId = target ?? await this.ensureSession(key, actor)
     if (sessionId === undefined) return
-    await this.promptSession(key, sessionId, parts, mode, source)
+    await this.promptSession(key, sessionId, spoken(parts, actor), mode, source)
   }
 
   private async promptSession(key: string, sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer', source?: string): Promise<void> {
@@ -1693,6 +1777,7 @@ export class Switchboard {
     const chats = new Set([...this.store.chatsFor(sessionId), ...this.routed.get(sessionId)?.keys() ?? []])
     if (this.turns.get(sessionId)?.scheduled === true) {
       for (const id of this.settings().scheduleChats) if (id.trim() !== '') chats.add(id.trim())
+      for (const id of this.turns.get(sessionId)?.pushChats ?? []) chats.add(id)
     }
     return [...chats]
   }
@@ -1712,19 +1797,25 @@ export class Switchboard {
     }
     if (event.type === 'turn/start') {
       this.turnGrants.delete(sessionId)
+      this.failures.delete(sessionId)
       const startedAt = event.time ?? Date.now()
       this.turns.set(sessionId, { startedAt, tools: 0, scheduled: false })
       this.startProgress(sessionId, startedAt)
       this.clearReplyButtons(sessionId)
       this.updateQueuedNotices(sessionId)
       this.refreshMenus()
+      this.markBoards()
       return
     }
     if (event.type === 'user/message') {
       // The event's data is the committed message itself.
-      const source = (event.data as { source?: { kind?: string } } | undefined)?.source?.kind
+      const message = event.data as { source?: { kind?: string }; content?: readonly { type: string; text?: string }[] } | undefined
       const turn = this.turns.get(sessionId)
-      if (source === 'schedule' && turn !== undefined) turn.scheduled = true
+      if (message?.source?.kind === 'schedule' && turn !== undefined) {
+        turn.scheduled = true
+        const text = (message.content ?? []).map(block => block.text ?? '').join('\n')
+        turn.pushChats = [...new Set(scheduleIdsIn(text).flatMap(id => this.store.schedulePush(id)))]
+      }
       return
     }
     const turn = this.turns.get(sessionId)
@@ -1782,6 +1873,12 @@ export class Switchboard {
       const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } }).reason
       const kind = reason?.kind ?? 'completed'
       const endedAt = event.time ?? Date.now()
+      if (kind !== 'completed' && kind !== 'aborted') this.noteFailure(sessionId, reason?.error?.message ?? kind)
+      const excerpt = kind === 'completed' ? turn?.lastText : reason?.error?.message ?? kind
+      void this.store.addAwayItem(this.awayAmong([...chats, ...watchers]), {
+        sessionId, at: endedAt, kind, ...(excerpt === undefined ? {} : { text: truncate(excerpt, DIGEST_EXCERPT) }),
+      })
+      this.markBoards()
       const shown = this.endProgress(sessionId, kind, reason?.error?.message, endedAt)
       this.finishReceipts(sessionId, kind, turn?.startedAt ?? endedAt)
       const delivered = this.replyDeliveries.get(sessionId) ?? Promise.resolve()
@@ -1877,10 +1974,18 @@ export class Switchboard {
    * @returns the message, or undefined when there is nothing to tell.
    */
   private async digestText(key: string, since: number): Promise<string | undefined> {
-    const t = this.t
     const watched = this.store.get(key).watch ?? []
     const items = this.store.digestItems(key).filter(item => item.at >= since)
     if (watched.length === 0 && items.length === 0) return undefined
+    return this.roundup(items, watched)
+  }
+
+  /**
+   * What became of some Sessions: the turns given, plus what waits and runs now.
+   * @returns the message, or undefined when there is nothing to tell.
+   */
+  private async roundup(items: readonly DigestItem[], sessions: readonly string[]): Promise<string | undefined> {
+    const t = this.t
     const rows = await this.harness.listSessions().catch(() => [])
     const title = (sessionId: string): string => rows.find(row => row.sessionId === sessionId)?.title ?? shortId(sessionId)
     const lines = (kept: readonly DigestItem[]): string[] => [...new Set(kept.map(item => item.sessionId))].map((sessionId) => {
@@ -1889,13 +1994,13 @@ export class Switchboard {
     })
     const approvals = [...this.approvals.values()]
     const questions = [...this.questions.values()]
-    const waiting = watched.flatMap((sessionId) => {
+    const waiting = sessions.flatMap((sessionId) => {
       const count = approvals.filter(item => item.sessionId === sessionId).length + questions.filter(item => item.sessionId === sessionId).length
       return count === 0 ? [] : [t.digestWaitingLine(title(sessionId), count)]
     })
     const done = lines(items.filter(item => item.kind === 'completed'))
     const failed = lines(items.filter(item => item.kind !== 'completed'))
-    const running = watched.filter(sessionId => this.harness.live(sessionId)?.running === true).map(sessionId => `· ${title(sessionId)}`)
+    const running = sessions.filter(sessionId => this.harness.live(sessionId)?.running === true).map(sessionId => `· ${title(sessionId)}`)
     if (done.length + failed.length + waiting.length + running.length === 0) return undefined
     return t.digest({ done, failed, waiting, running })
   }
@@ -1913,6 +2018,346 @@ export class Switchboard {
       await this.store.clearDigest(key)
       if (text !== undefined) await this.durable(key, { kind: 'text', text })
     }
+  }
+
+  // ─── the live board ─────────────────────────────────────────────────────
+
+  /** Remember how a Session's turn failed, for the board. */
+  private noteFailure(sessionId: string, error: string): void {
+    this.failures.delete(sessionId)
+    this.failures.set(sessionId, error)
+    while (this.failures.size > TODO_SESSIONS) this.failures.delete(this.failures.keys().next().value as string)
+  }
+
+  /** What a board shows: Sessions needing something, and idle ones the chat is linked to. */
+  private boardRows(key: string, sessions: readonly SessionRow[], dirs: readonly string[] | undefined): BoardRow[] {
+    const t = this.t
+    const binding = this.store.get(key)
+    const linked = new Set([binding.sessionId, ...binding.watch ?? []])
+    const pending = [...this.approvals.values(), ...this.questions.values()]
+    const scope: Actor = dirs === undefined ? { role: 'admin' } : { role: 'member', dirs }
+    return sessions.filter(row => mayUse(scope, row.cwd)).flatMap((row): BoardRow[] => {
+      const { sessionId } = row
+      const title = row.title ?? shortId(sessionId)
+      const waiting = pending.filter(item => item.sessionId === sessionId).length
+      const failure = this.failures.get(sessionId)
+      if (waiting > 0) return [{ sessionId, title, state: 'waiting', detail: t.boardWaiting(waiting) }]
+      if (row.running || this.harness.live(sessionId)?.running === true) {
+        const turn = this.turns.get(sessionId)
+        const todos = todoSummary(t, this.todos.get(sessionId))
+        const elapsed = turn === undefined ? t.boardBusy : t.boardRunning(duration((Date.now() - turn.startedAt) / 1000, this.settings().language), turn.tools)
+        return [{ sessionId, title, state: 'running', detail: todos === undefined ? elapsed : `${elapsed} · ${todos}` }]
+      }
+      if (failure !== undefined) return [{ sessionId, title, state: 'failed', detail: truncate(failure, DIGEST_EXCERPT) }]
+      return linked.has(sessionId) ? [{ sessionId, title, state: 'idle', detail: t.boardIdle }] : []
+    })
+  }
+
+  /** Open a board in a chat, replacing the one it has. */
+  private async openBoard(key: string, actor: Actor): Promise<void> {
+    const t = this.t
+    const message = boardMessage(t, this.boardRows(key, await this.harness.listSessions(), actor.dirs))
+    const old = this.store.get(key).board
+    await this.enqueue(key, async (channel, chat) => {
+      if (old !== undefined) await channel.retire(chat, old.messageId, t.boardClosed).catch(() => {})
+      const messageId = await channel.send(chat, message)
+      await this.store.setBoard(key, { messageId, ...(actor.dirs === undefined ? {} : { dirs: actor.dirs }) })
+      this.boardShown.set(key, JSON.stringify(message))
+      // A group may not let the bot pin; the board works unpinned.
+      await channel.pin?.(chat, messageId).catch((error: unknown) => {
+        this.logger.debug(`switchboard: board not pinned in ${key}: ${describe(error)}`)
+      })
+    })
+  }
+
+  private async closeBoard(key: string): Promise<void> {
+    const t = this.t
+    const board = this.store.get(key).board
+    if (board === undefined) return this.reply(key, t.boardNone)
+    await this.store.setBoard(key, undefined)
+    this.boardShown.delete(key)
+    await this.enqueue(key, async (channel, chat) => { await channel.retire(chat, board.messageId, t.boardClosed) })
+  }
+
+  /** Repaint boards soon, no more often than {@link BOARD_INTERVAL_MS}. */
+  private markBoards(): void {
+    if (this.boardTimer !== undefined || this.store.boardChats().length === 0) return
+    const wait = Math.max(0, this.boardPaintedAt + BOARD_INTERVAL_MS - Date.now())
+    this.boardTimer = setTimeout(() => {
+      this.boardTimer = undefined
+      this.refreshBoards().catch((error: unknown) => {
+        this.logger.warn(`switchboard: board update failed: ${describe(error)}`)
+      })
+    }, wait)
+  }
+
+  /** Bring every board up to date; one that did not change is left alone. */
+  async refreshBoards(): Promise<void> {
+    const chats = this.store.boardChats().filter(key => this.channelOf(key) !== undefined)
+    if (chats.length === 0) return
+    this.boardPaintedAt = Date.now()
+    const sessions = await this.harness.listSessions()
+    for (const key of chats) {
+      const board = this.store.get(key).board
+      if (board !== undefined) await this.paintBoard(key, board, sessions)
+    }
+  }
+
+  private async paintBoard(key: string, board: BoardState, sessions: readonly SessionRow[]): Promise<void> {
+    const message = boardMessage(this.t, this.boardRows(key, sessions, board.dirs))
+    const shown = JSON.stringify(message)
+    if (this.boardShown.get(key) === shown) return
+    this.boardShown.set(key, shown)
+    await this.enqueue(key, async (channel, chat) => {
+      if (this.store.get(key).board?.messageId === board.messageId) await channel.edit(chat, board.messageId, message)
+    }, (error) => {
+      // Someone deleted it: there is nothing left to keep up to date.
+      if (!/message to edit not found|message_id_invalid/iu.test(describe(error))) return
+      this.boardShown.delete(key)
+      void this.store.setBoard(key, undefined)
+    })
+  }
+
+  private async handleBoard(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
+    await line.channel.ack(action)
+    if (action.chat === undefined) return
+    const key = chatKey(line.line.id, action.chat.id)
+    try {
+      if (action.data === 'bd:x') return await this.closeBoard(key)
+      if (action.data === 'bd:r') {
+        const board = this.store.get(key).board
+        if (board !== undefined) await this.paintBoard(key, board, await this.harness.listSessions())
+        return
+      }
+      if (action.data.startsWith('bd:s:')) await this.runCommand(key, 'use', action.data.slice('bd:s:'.length), actor)
+    } catch (error: unknown) {
+      await this.reply(key, this.t.failed(describe(error)))
+    }
+  }
+
+  // ─── away mode ──────────────────────────────────────────────────────────
+
+  /** Those of some chats whose people are away now. */
+  private awayAmong(chats: readonly string[], now: number = Date.now()): string[] {
+    return chats.filter((key) => {
+      const away = this.store.get(key).away
+      return away !== undefined && away.until > now
+    })
+  }
+
+  private async awayCommand(key: string, args: string, actor: Actor): Promise<void> {
+    const t = this.t
+    // Guests cannot answer approvals, so nothing should wait on them.
+    if (actor.role === 'guest') return this.reply(key, t.adminOnly)
+    const away = this.store.get(key).away
+    const word = args.trim().toLowerCase()
+    if (word === '') {
+      const buttons: Button[][] = away !== undefined
+        ? [[{ text: t.awayOffButton, data: 'aw:off' }]]
+        : [AWAY_CHOICES.map(hours => ({ text: t.awayHours(hours), data: `aw:${hours}h` }))]
+      await this.enqueue(key, async (channel, chat) => {
+        await channel.send(chat, { text: away !== undefined ? t.awayStatus(clock(away.until)) : t.awayPick, buttons })
+      })
+      return
+    }
+    if (word === 'off') return away === undefined ? this.reply(key, t.awayNotOn) : this.endAway(key, false)
+    const span = parseDuration(word)
+    if (span === undefined) return this.reply(key, t.awayUsage)
+    const now = Date.now()
+    await this.store.setAway(key, { since: away?.since ?? now, until: now + span })
+    return this.reply(key, t.awayStarted(clock(now + span)))
+  }
+
+  private async handleAway(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
+    await line.channel.ack(action)
+    if (action.chat === undefined) return
+    const key = chatKey(line.line.id, action.chat.id)
+    try {
+      await this.awayCommand(key, action.data.slice('aw:'.length), actor)
+    } catch (error: unknown) {
+      await this.reply(key, this.t.failed(describe(error)))
+    }
+  }
+
+  /** End away modes whose time is up. */
+  checkAway(now: number = Date.now()): void {
+    for (const key of this.store.awayChats()) {
+      const away = this.store.get(key).away
+      if (away === undefined || away.until > now) continue
+      this.endAway(key, true).catch((error: unknown) => {
+        this.logger.warn(`switchboard: away report for ${key} failed: ${describe(error)}`)
+      })
+    }
+  }
+
+  /** Leave away mode: waits go back to normal, and the chat hears what it missed. */
+  private async endAway(key: string, expired: boolean): Promise<void> {
+    const t = this.t
+    const binding = this.store.get(key)
+    await this.store.setAway(key, undefined)
+    for (const deadline of [...this.deadlines]) if (this.awayAmong(deadline.chats).length === 0) deadline.relax()
+    const items = await this.store.takeAwayItems(key)
+    const sessions = [...new Set([...binding.sessionId === undefined ? [] : [binding.sessionId], ...binding.watch ?? []])]
+    const report = await this.roundup(items, sessions)
+    await this.durable(key, { kind: 'text', text: `${expired ? t.awayExpired : t.awayEnded}\n\n${report ?? t.awayQuiet}` })
+  }
+
+  // ─── scheduled tasks ────────────────────────────────────────────────────
+
+  private async scheduleCommand(key: string, args: string, actor: Actor): Promise<void> {
+    const t = this.t
+    const port = this.harness.schedules?.()
+    if (port === undefined) return this.reply(key, t.scheduleUnavailable)
+    const [verb = ''] = args.trim().split(/\s+/u)
+    if (verb === '') return this.listSchedules(key, port)
+    if (verb.toLowerCase() !== 'add') return this.reply(key, t.scheduleUsage)
+    const task = parseScheduleAdd(args.trim().slice(verb.length), Intl.DateTimeFormat().resolvedOptions().timeZone)
+    if (task === undefined) return this.reply(key, t.scheduleUsage)
+    const cwd = this.workspaceFor(key, actor)
+    if (cwd === undefined) return this.reply(key, t.noWorkspace)
+    const agentPreset = this.settings().agentPreset
+    const created = await port.create(task, { cwd, ...(agentPreset === '' ? {} : { agentPreset }) })
+    await this.store.setSchedulePush(created.id, key, true)
+    return this.reply(key, t.scheduleCreated(created.title, clock(Date.parse(created.scheduledAt)), cwd))
+  }
+
+  private async listSchedules(key: string, port: SchedulePort): Promise<void> {
+    const t = this.t
+    const tasks = (await port.list()).filter(task => task.status !== 'ended').slice(0, SCHEDULE_LIST_LIMIT)
+    if (tasks.length === 0) return this.reply(key, t.scheduleNone)
+    const lines = tasks.map((task, index) => t.scheduleLine(
+      index + 1, truncate(task.title, 40), clock(Date.parse(task.scheduledAt)), task.status === 'paused', this.store.schedulePush(task.id).includes(key),
+    ))
+    const buttons = tasks.flatMap((task, index) => {
+      const data = `sc:v:${task.id}`
+      return Buffer.byteLength(data) > BUTTON_DATA_BYTES ? [] : [[{ text: `${index + 1}. ${truncate(task.title, 30)}`, data }]]
+    })
+    await this.enqueue(key, async (channel, chat) => { await channel.send(chat, { text: t.scheduleList(lines), buttons }) })
+  }
+
+  /** A task's detail and the buttons that act on it. */
+  private scheduleView(key: string, task: ScheduleTask): OutMessage {
+    const t = this.t
+    const paused = task.status === 'paused'
+    const pushed = this.store.schedulePush(task.id).includes(key)
+    return {
+      text: t.scheduleDetail({
+        title: task.title,
+        prompt: truncate(task.prompt, SCHEDULE_PROMPT_LENGTH),
+        next: task.status === 'active' ? clock(Date.parse(task.scheduledAt)) : '—',
+        status: task.status === 'active' ? t.scheduleActive : paused ? t.schedulePaused : t.scheduleEnded,
+        pushed,
+      }),
+      buttons: [
+        [{ text: t.scheduleRun, data: `sc:r:${task.id}` }, { text: paused ? t.scheduleResume : t.schedulePause, data: `sc:${paused ? 'u' : 'p'}:${task.id}` }],
+        [{ text: pushed ? t.schedulePushOff : t.schedulePushOn, data: `sc:n:${task.id}` }, { text: t.scheduleDelete, data: `sc:d:${task.id}` }],
+      ],
+    }
+  }
+
+  private async handleSchedule(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
+    const t = this.t
+    const { channel } = line
+    const port = this.harness.schedules?.()
+    if (actor.role !== 'admin' || port === undefined || action.chat === undefined) {
+      await channel.ack(action, port === undefined ? t.scheduleUnavailable : t.adminOnly)
+      return
+    }
+    const key = chatKey(line.line.id, action.chat.id)
+    const chat = action.chat.id
+    const verb = action.data.slice(3, 4)
+    const id = action.data.slice(5)
+    const show = async (message: OutMessage): Promise<void> => {
+      if (action.messageId === undefined || verb === 'v') await channel.send(chat, message)
+      else await channel.edit(chat, action.messageId, message)
+    }
+    try {
+      const task = (await port.list()).find(item => item.id === id)
+      if (task === undefined) {
+        await channel.ack(action, t.scheduleGone)
+        return
+      }
+      if (verb === 'r') {
+        const result = await port.run(id)
+        await channel.ack(action, result === 'started' ? t.scheduleStarted : result === 'busy' ? t.scheduleBusy : t.scheduleGone)
+        return
+      }
+      await channel.ack(action)
+      if (verb === 'd') {
+        await show({
+          text: this.scheduleView(key, task).text,
+          buttons: [[{ text: t.scheduleDeleteConfirm, data: `sc:D:${id}` }, { text: t.scheduleBack, data: `sc:b:${id}` }]],
+        })
+      } else if (verb === 'D') {
+        await port.remove(id)
+        await this.store.dropSchedulePush(id)
+        await show({ text: t.scheduleDeleted(task.title) })
+      } else if (verb === 'p' || verb === 'u') {
+        await show(this.scheduleView(key, await port.setActive(id, verb === 'u') ?? task))
+      } else {
+        if (verb === 'n') await this.store.setSchedulePush(id, key, !this.store.schedulePush(id).includes(key))
+        await show(this.scheduleView(key, task))
+      }
+    } catch (error: unknown) {
+      await this.reply(key, t.failed(describe(error)))
+    }
+  }
+
+  // ─── taking over a Session from the Web UI ──────────────────────────────
+
+  /**
+   * A short-lived code that binds whichever chat sends it to a Session.
+   * @returns the code, and per connected line the link a QR code can carry.
+   */
+  createClaim(sessionId: string, now: number = Date.now()): { code: string; expiresAt: number; lines: { id: string; name: string; type: LineSettings['type']; url?: string }[] } {
+    for (const [code, claim] of this.claims) if (claim.expiresAt <= now) this.claims.delete(code)
+    const code = Array.from({ length: CLAIM_LENGTH }, () => CLAIM_ALPHABET[randomInt(CLAIM_ALPHABET.length)]).join('')
+    const expiresAt = now + CLAIM_TTL_MS
+    this.claims.set(code, { sessionId, expiresAt })
+    const lines = [...this.live.values()].flatMap((entry) => {
+      if (entry.state.kind !== 'running') return []
+      const { line } = entry
+      const url = line.type === 'telegram' ? `https://t.me/${entry.state.username}?start=link_${code}`
+        : line.appId === undefined ? undefined
+          : `https://applink.${line.domain === 'lark' ? 'larksuite.com' : 'feishu.cn'}/client/bot/open?appId=${encodeURIComponent(line.appId)}`
+      return [{ id: line.id, name: line.name, type: line.type, ...(url === undefined ? {} : { url }) }]
+    })
+    return { code, expiresAt, lines }
+  }
+
+  /** Bind a chat to the Session a pairing code stands for; each code works once. */
+  private async claimSession(key: string, text: string, actor: Actor): Promise<void> {
+    const t = this.t
+    const code = text.trim().toUpperCase()
+    const claim = this.claims.get(code)
+    if (claim === undefined || claim.expiresAt <= Date.now()) return this.reply(key, t.linkInvalid)
+    if (!(await this.mayUseSession(actor, claim.sessionId))) return this.reply(key, t.dirDenied(actor.dirs ?? []))
+    this.claims.delete(code)
+    await this.linkChat(key, claim.sessionId, 'active')
+  }
+
+  // ─── the Agent reaching out ─────────────────────────────────────────────
+
+  /** Whether a chat would hear from a Session. */
+  reachesPhone(sessionId: string): boolean {
+    return this.outputChats(sessionId).length > 0 || this.store.watchersOf(sessionId).length > 0
+  }
+
+  /**
+   * Send the chats linked to a Session a message from its Agent, mid-turn.
+   * @returns how many chats it went to, or why it did not go out.
+   */
+  notifyFromAgent(sessionId: string, text: string, now: number = Date.now()): { delivered: number; reason?: 'no-chat' | 'too-soon' } {
+    const chats = [...new Set([...this.outputChats(sessionId), ...this.store.watchersOf(sessionId)])]
+    if (chats.length === 0) return { delivered: 0, reason: 'no-chat' }
+    const last = this.agentNotices.get(sessionId)
+    if (last !== undefined && now - last < AGENT_NOTICE_INTERVAL_MS) return { delivered: 0, reason: 'too-soon' }
+    this.agentNotices.delete(sessionId)
+    this.agentNotices.set(sessionId, now)
+    while (this.agentNotices.size > TODO_SESSIONS) this.agentNotices.delete(this.agentNotices.keys().next().value as string)
+    const message = this.t.agentNotice(truncate(text.trim(), AGENT_NOTICE_LENGTH))
+    for (const key of chats) void this.durable(key, { kind: 'text', text: message }, sessionId)
+    return { delivered: chats.length }
   }
 
   // ─── progress, reactions, and reply buttons ─────────────────────────────
@@ -2333,14 +2778,16 @@ export class Switchboard {
       toolName: request.toolName,
       grantKey,
       prompts: [],
+      text,
       extend: () => { deadline.extend() },
       settle: (outcome, note, by) => {
         if (!this.approvals.delete(id)) return
+        this.markBoards()
         deadline.clear()
         this.closeReminders(deadline, note)
         request.signal?.removeEventListener('abort', onAbort)
         for (const prompt of pending.prompts) {
-          void this.channelOf(prompt.chat)?.edit(splitChatKey(prompt.chat).chat, prompt.messageId, { text: `${text}\n\n${note}` }).catch(() => {})
+          void this.channelOf(prompt.chat)?.edit(splitChatKey(prompt.chat).chat, prompt.messageId, { text: `${pending.text}\n\n${note}` }).catch(() => {})
           this.log({ chatId: prompt.chat }, {
             dir: 'out', kind: 'approval',
             ...(request.reason === undefined ? {} : { text: request.reason }),
@@ -2356,12 +2803,13 @@ export class Switchboard {
       },
     }
     const onAbort = (): void => { pending.settle('cancelled', t.approvalCancelled) }
-    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('timeout', t.approvalTimedOut) }, left => ({
-      text: t.approvalReminder(request.toolName, left),
+    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('timeout', t.approvalTimedOut) }, (left, away) => ({
+      text: away ? t.approvalReminderAway(request.toolName) : t.approvalReminder(request.toolName, left),
       buttons: [...buttons, [{ text: t.waitMore(this.waitLabel(s.approvalTimeoutSec)), data: `ap:${id}:w` }]],
     }))
     request.signal?.addEventListener('abort', onAbort, { once: true })
     this.approvals.set(id, pending)
+    this.markBoards()
 
     // Through each chat's queue, so the question follows the messages that led to it.
     await Promise.all(chats.map(key => this.enqueue(key, async (channel, chat) => {
@@ -2370,7 +2818,32 @@ export class Switchboard {
       this.noteRoute(key, messageId, request.sessionId)
     })))
     if (pending.prompts.length === 0) pending.settle('delegate', '')
+    else if (call !== undefined) this.explainApproval(id, pending, call, buttons)
     return answer.promise
+  }
+
+  /**
+   * Add the model's reading of a command to its approval once it arrives. The
+   * question has already gone out, so a slow or failed call costs nothing.
+   */
+  private explainApproval(id: string, pending: PendingApproval, call: { name: string; arguments: string }, buttons: readonly (readonly Button[])[]): void {
+    const s = this.settings()
+    // File changes come with their diff, which says more than a sentence could.
+    if (s.approvalRiskHint !== true || this.harness.explainRisk === undefined || TURN_GRANT_TOOLS.has(call.name)) return
+    const signal = AbortSignal.any([AbortSignal.timeout(RISK_TIMEOUT_MS), this.lifetime.signal])
+    this.harness.explainRisk(pending.sessionId, call.name, call.arguments, s.language, signal).then((hint) => {
+      if (hint === undefined || this.approvals.get(id) !== pending) return
+      const text = `${pending.text}\n\n${this.t.riskHint(hint)}`
+      if (text.length > RISK_TEXT_LIMIT) return
+      pending.text = text
+      for (const prompt of pending.prompts) {
+        void this.enqueue(prompt.chat, async (channel, chat) => {
+          if (this.approvals.get(id) === pending) await channel.edit(chat, prompt.messageId, { text, buttons })
+        })
+      }
+    }).catch((error: unknown) => {
+      this.logger.debug(`switchboard: no reading of ${call.name}: ${describe(error)}`)
+    })
   }
 
   /** The wait a reminder's button buys, as the chat reads it. */
@@ -2382,17 +2855,26 @@ export class Switchboard {
    * Time a chat's answer, reminding the chats shortly before the end.
    * @param seconds - how long to wait, and how long each extension adds.
    * @param onExpire - called when nobody answered in time.
-   * @param reminder - the reminder, given the time left as text.
+   * @param reminder - the reminder, given the time left as text and whether a chat is away.
    */
-  private startDeadline(seconds: number, chats: readonly string[], sessionId: string, onExpire: () => void, reminder: (left: string) => OutMessage): Deadline {
-    const wait = seconds * 1000
-    const lead = Math.min(REMINDER_LEAD_MS, wait / 4)
+  private startDeadline(seconds: number, chats: readonly string[], sessionId: string, onExpire: () => void, reminder: (left: string, away: boolean) => OutMessage): Deadline {
+    const base = seconds * 1000
+    let wait = base
     let expiry: ReturnType<typeof setTimeout>
     let nudge: ReturnType<typeof setTimeout>
     const arm = (): void => {
-      expiry = setTimeout(onExpire, wait)
+      const lead = Math.min(REMINDER_LEAD_MS, wait / 4)
+      this.deadlines.add(deadline)
+      expiry = setTimeout(() => {
+        if (this.awayAmong(chats).length === 0) return onExpire()
+        // Nobody is at the Web UI to take this over, so it keeps waiting, reminding less and less often.
+        deadline.clear()
+        this.closeReminders(deadline, this.t.awayStillWaiting)
+        wait = Math.max(base, Math.min(wait * 2, AWAY_WAIT_MAX_MS))
+        arm()
+      }, wait)
       nudge = setTimeout(() => {
-        const message = reminder(duration(lead / 1000, this.settings().language))
+        const message = reminder(duration(lead / 1000, this.settings().language), this.awayAmong(chats).length > 0)
         for (const key of chats) {
           void this.enqueue(key, async (channel, chat) => {
             const messageId = await channel.send(chat, message)
@@ -2405,13 +2887,22 @@ export class Switchboard {
     }
     const deadline: Deadline = {
       reminders: [],
+      chats,
       clear: () => {
         clearTimeout(expiry)
         clearTimeout(nudge)
+        this.deadlines.delete(deadline)
       },
       extend: () => {
         deadline.clear()
+        wait = base
         this.closeReminders(deadline, this.t.waitExtended(this.waitLabel(seconds)))
+        arm()
+      },
+      relax: () => {
+        if (wait === base) return
+        deadline.clear()
+        wait = base
         arm()
       },
     }
@@ -2454,6 +2945,7 @@ export class Switchboard {
       extend: () => { deadline.extend() },
       settle: (outcome, note) => {
         if (!this.questions.delete(id)) return
+        this.markBoards()
         deadline.clear()
         this.closeReminders(deadline, note ?? t.questionClosed)
         request.signal?.removeEventListener('abort', onAbort)
@@ -2470,12 +2962,13 @@ export class Switchboard {
       },
     }
     const onAbort = (): void => { pending.settle('cancelled', t.questionWithdrawn) }
-    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('delegate', t.questionTimedOut) }, left => ({
-      text: t.questionReminder(left),
+    const deadline = this.startDeadline(s.approvalTimeoutSec, chats, request.sessionId, () => { pending.settle('delegate', t.questionTimedOut) }, (left, away) => ({
+      text: away ? t.questionReminderAway : t.questionReminder(left),
       buttons: [[{ text: t.waitMore(this.waitLabel(s.approvalTimeoutSec)), data: `qw:${id}` }]],
     }))
     request.signal?.addEventListener('abort', onAbort, { once: true })
     this.questions.set(id, pending)
+    this.markBoards()
     for (const [index, entry] of pending.items.entries()) {
       const text = questionText(t, entry.item)
       for (const key of chats) {
@@ -2568,7 +3061,10 @@ export class Switchboard {
       await channel.ack(action, t.unauthorized(action.from.id))
       return
     }
-    const actor = this.actorOf(this.settingsOf(line), action.from)
+    const actor = this.actorOf(this.settingsOf(line), action.from, action.chat)
+    if (action.data.startsWith('bd:')) return this.handleBoard(line, action, actor)
+    if (action.data.startsWith('aw:')) return this.handleAway(line, action, actor)
+    if (action.data.startsWith('sc:')) return this.handleSchedule(line, action, actor)
     if (action.data.startsWith('pk:')) return this.handlePick(line, action, actor)
     if (action.data.startsWith('st:')) return this.handleStop(line, action)
     if (action.data.startsWith('cc:')) return this.handleCommandCancel(line, action, actor)
@@ -2681,7 +3177,7 @@ export class Switchboard {
     if (action.chat === undefined) return
     const key = chatKey(line.line.id, action.chat.id)
     const command = action.data.slice(3)
-    if (!['new', 'sessions', 'model', 'mode', 'stop', 'compact', 'status', 'help'].includes(command)) return
+    if (!['new', 'sessions', 'model', 'mode', 'stop', 'compact', 'status', 'help', 'board', 'away', 'schedule'].includes(command)) return
     // Compact is a Harness command: without a Session it would reach the Agent as text.
     if (command === 'compact' && this.store.get(key).sessionId === undefined) return this.reply(key, this.t.noSession)
     try {
@@ -2843,6 +3339,14 @@ export function modelLabel(choice: ModelChoice): string {
 function shortId(sessionId: string): string {
   const core = sessionId.replace(/^session-/u, '')
   return core.length > 8 ? core.slice(0, 8) : core
+}
+
+/** A prompt with the group's speaker named at its start; other prompts stay as they are. */
+function spoken(parts: readonly PromptPart[], actor: Actor): readonly PromptPart[] {
+  if (actor.speaker === undefined) return parts
+  const [first, ...rest] = parts
+  if (first?.type === 'text') return [{ type: 'text', text: `${actor.speaker}\n${first.text}` }, ...rest]
+  return [{ type: 'text', text: actor.speaker }, ...parts]
 }
 
 /** Local wall-clock time of a timestamp, for notes about late messages. */

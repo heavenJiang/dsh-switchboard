@@ -4,6 +4,14 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
+/** The part of a tool definition the Host's registry consumes. */
+interface ToolUnderTest {
+  name: string
+  parameters: unknown
+  output: { schema: unknown }
+  execute(args: unknown, exec: unknown): Promise<unknown>
+}
+
 // Runs only with a sibling deepseek-harness checkout (see vitest.config.ts).
 const enabled = process.env['DSH_HARNESS_CHECKOUT'] !== ''
 
@@ -36,6 +44,7 @@ describe.skipIf(!enabled)('real Loader composition', () => {
     ].join('\n'))
 
     const routes = new Map<string, (request: Request) => Promise<Response>>()
+    const tools: { definition: ToolUnderTest; options: { when: (context: { agent: unknown }) => boolean } }[] = []
     const services = {
       name: 'fixture-services',
       apply(ctx: InstanceType<typeof Context>) {
@@ -45,6 +54,12 @@ describe.skipIf(!enabled)('real Loader composition', () => {
         ctx.provide('permissionPresets' as never, fake({ catalog: () => ({ options: [] }) }))
         ctx.provide('fileUploads' as never, fake({}))
         ctx.provide('llm' as never, fake({}))
+        ctx.provide('tools' as never, fake({
+          register: (definition: ToolUnderTest, options: (typeof tools)[number]['options']) => {
+            tools.push({ definition, options })
+            return () => {}
+          },
+        }))
         ctx.provide('connection' as never, fake({
           fetch: {
             register: (route: { path: string; fetch: (request: Request) => Promise<Response> }) => {
@@ -74,7 +89,7 @@ describe.skipIf(!enabled)('real Loader composition', () => {
 
     expect([...context.loader.entries()].filter(entry => entry.fiber === undefined && !entry.disabled)).toEqual([])
     expect([...routes.keys()].sort()).toEqual([
-      '/api/switchboard/feishu/register', '/api/switchboard/history', '/api/switchboard/link', '/api/switchboard/media',
+      '/api/switchboard/claim', '/api/switchboard/feishu/register', '/api/switchboard/history', '/api/switchboard/link', '/api/switchboard/media',
       '/api/switchboard/models', '/api/switchboard/overview', '/api/switchboard/send',
       '/api/switchboard/session', '/api/switchboard/update-check',
     ])
@@ -87,5 +102,21 @@ describe.skipIf(!enabled)('real Loader composition', () => {
     expect(overview.lines).toEqual([{ id: 'telegram', type: 'telegram', name: 'Telegram', state: { kind: 'stopped' }, queued: 0 }])
     expect(overview.chats).toEqual([])
     expect(overview.stats.series).toHaveLength(14)
+
+    // The tool must satisfy the real registry's schema rules, or registering it would throw on a live Host.
+    const { assertObjectJsonSchema, assertSupportedJsonSchema, validateJsonSchemaValue } = await import(/* @vite-ignore */ '../../deepseek-harness/packages/core/tools/src/json-schema.ts')
+    expect(tools.map(tool => tool.definition.name)).toEqual(['notify_phone'])
+    const { definition, options } = tools[0]!
+    assertObjectJsonSchema(definition.parameters)
+    assertSupportedJsonSchema(definition.output.schema)
+    expect(validateJsonSchemaValue(definition.parameters, { message: 'done' }, '')).toEqual([])
+    expect(validateJsonSchemaValue(definition.parameters, {}, '')).not.toEqual([])
+    const agent = { session: { header: { id: 'nobody' } } }
+    // Without a linked chat the tool stays out of the step, and nothing goes out.
+    expect(options.when({ agent })).toBe(false)
+    const result = await definition.execute({ message: 'done' }, { agent })
+    expect(validateJsonSchemaValue(definition.output.schema, result, '')).toEqual([])
+    expect(result).toEqual({ delivered: 0, reason: 'no-chat' })
+    await expect(definition.execute({ message: ' ' }, { agent })).rejects.toThrow('non-empty')
   })
 })

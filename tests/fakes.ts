@@ -1,6 +1,7 @@
 /** Test doubles shared by the bridge specs. */
 
-import type { HarnessPort, ModelChoice, PromptPart, StagedFileInput } from '../src/bridge.ts'
+import type { HarnessPort, ModelChoice, PromptPart, SessionRow, StagedFileInput } from '../src/bridge.ts'
+import type { NewSchedule, ScheduleHome, SchedulePort, ScheduleTask } from '../src/schedules.ts'
 
 /** In-memory Harness: records prompts, staged files, created Sessions, and command runs. */
 export class FakeHarness implements HarnessPort {
@@ -121,7 +122,45 @@ export class FakeHarness implements HarnessPort {
   live() {
     return { running: this.running, cwd: '/tmp' }
   }
+  /** Sessions /sessions and the board list. */
+  sessionRows: SessionRow[] = [{ sessionId: 's1', cwd: '/tmp', updatedAt: 1, running: false }]
   async listSessions() {
-    return [{ sessionId: 's1', cwd: '/tmp', updatedAt: 1, running: false }]
+    return this.sessionRows
+  }
+  /** Set to answer approvals' readings; undefined leaves the method unavailable. */
+  explainRisk?: HarnessPort['explainRisk']
+  /** Set to give the deployment scheduled tasks. */
+  schedules?: HarnessPort['schedules']
+}
+
+/** In-memory Host schedule service. */
+export class FakeSchedules implements SchedulePort {
+  tasks: ScheduleTask[] = []
+  readonly created: { task: NewSchedule; home: ScheduleHome }[] = []
+  readonly ran: string[] = []
+  async list() {
+    return this.tasks
+  }
+  async create(task: NewSchedule, home: ScheduleHome) {
+    this.created.push({ task, home })
+    const entry: ScheduleTask = { id: `schedule-${this.created.length}`, title: task.title, prompt: task.prompt, status: 'active', scheduledAt: '2030-01-02T03:04:00.000Z' }
+    this.tasks.push(entry)
+    return entry
+  }
+  async setActive(id: string, active: boolean) {
+    const index = this.tasks.findIndex(task => task.id === id)
+    if (index < 0) return undefined
+    const next: ScheduleTask = { ...this.tasks[index]!, status: active ? 'active' : 'paused' }
+    this.tasks[index] = next
+    return next
+  }
+  async run(id: string) {
+    this.ran.push(id)
+    return 'started' as const
+  }
+  async remove(id: string) {
+    const before = this.tasks.length
+    this.tasks = this.tasks.filter(task => task.id !== id)
+    return this.tasks.length < before
   }
 }

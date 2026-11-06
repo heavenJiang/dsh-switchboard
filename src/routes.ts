@@ -130,6 +130,17 @@ export function registerHistoryRoutes(
   }), 'switchboard: link route')
 
   ctx.effect(() => fetchRoutes.register({
+    path: `${API_PREFIX}/claim`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const { sessionId } = await body(request)
+      if (typeof sessionId !== 'string' || sessionId === '') return json({ error: 'sessionId required' }, 400)
+      return json(bridge.createClaim(sessionId))
+    },
+  }), 'switchboard: claim route')
+
+  ctx.effect(() => fetchRoutes.register({
     path: `${API_PREFIX}/send`,
     methods: ['POST'],
     requestBody: 'buffered',

@@ -28,6 +28,21 @@ export function parseInput(text: string, botUsername?: string): ParsedInput | un
   return { kind: 'command', name: name.toLowerCase(), args: args.trim() }
 }
 
+/** Longest span {@link parseDuration} accepts, so a typo cannot mean years. */
+const DURATION_LIMIT_MS = 30 * 24 * 60 * 60 * 1000
+const DURATION_UNIT_MS: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+
+/**
+ * Read a span like `45s`, `30m`, `2h`, or `1d`; a bare number means minutes.
+ * @returns milliseconds, or undefined when it is not a positive span of at most 30 days.
+ */
+export function parseDuration(text: string): number | undefined {
+  const match = /^(\d{1,5})([smhd]?)$/iu.exec(text.trim())
+  if (match === null) return undefined
+  const ms = Number(match[1]) * (DURATION_UNIT_MS[(match[2] || 'm').toLowerCase()] ?? 0)
+  return ms > 0 && ms <= DURATION_LIMIT_MS ? ms : undefined
+}
+
 /**
  * Whether a user may drive the harness. An empty list admits no one: the
  * bridge runs tools on this machine, so access is opt-in per user id.

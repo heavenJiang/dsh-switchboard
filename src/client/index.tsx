@@ -70,6 +70,8 @@ interface BridgeValues {
   agentPreset?: string
   permissionPreset?: string
   approvalViaTelegram?: boolean
+  approvalRiskHint?: boolean
+  agentNotify?: boolean
   approvalTimeoutSec?: number
   notifyToolCalls?: boolean
   language?: 'zh' | 'en'
@@ -112,7 +114,7 @@ interface ModelDraft { provider?: string; model?: string; effort?: string }
 type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
   | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'watchDigestTime' | 'longReplyChars'
-type ToggleField = 'enabled' | 'approvalViaTelegram' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
+type ToggleField = 'enabled' | 'approvalViaTelegram' | 'approvalRiskHint' | 'agentNotify' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
   | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
 /** A comma- or space-separated list field. */
@@ -175,6 +177,8 @@ const TEXT_FIELDS: Record<TextField, { format: (v: BridgeValues) => string; pars
 const TOGGLES: Record<ToggleField, { field: keyof BridgeValues; read: (v: BridgeValues) => boolean; write: (on: boolean) => boolean | string }> = {
   enabled: { field: 'enabled', read: v => v.enabled ?? true, write: on => on },
   approvalViaTelegram: { field: 'approvalViaTelegram', read: v => v.approvalViaTelegram ?? true, write: on => on },
+  approvalRiskHint: { field: 'approvalRiskHint', read: v => v.approvalRiskHint ?? true, write: on => on },
+  agentNotify: { field: 'agentNotify', read: v => v.agentNotify ?? true, write: on => on },
   notifyToolCalls: { field: 'notifyToolCalls', read: v => v.notifyToolCalls ?? true, write: on => on },
   sendDeliverables: { field: 'sendDeliverables', read: v => v.sendDeliverables ?? true, write: on => on },
   englishReplies: { field: 'language', read: v => v.language === 'en', write: on => on ? 'en' : 'zh' },
@@ -672,7 +676,9 @@ export function createSettings(form: ConfigForm<BridgeValues>, describe: Setting
 
         <h3 style={styles.section}>{t('groupApproval')}</h3>
         {toggle('approvalViaTelegram')}
+        {toggleOn('approvalViaTelegram') && toggle('approvalRiskHint')}
         {toggle('questionsViaTelegram')}
+        {toggle('agentNotify')}
         {(toggleOn('approvalViaTelegram') || toggleOn('questionsViaTelegram')) && valueField('approvalTimeoutSec', 'approval-timeout', { numeric: true })}
 
         <details className="tgb-more tgb-advanced">

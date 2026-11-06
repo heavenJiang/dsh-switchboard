@@ -56,6 +56,10 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | `/status` | Session, model, directory, run state, line, context use, this turn's time, goal, todos, subagents, and queue |
 | Reply to a notice or reply | Goes to the Session that message belongs to, without `/use`; the chat's own Session stays, and that turn's replies come back here |
 | `/digest` | Roundup of followed Sessions over 24 hours: finished, failed, waiting for you, and running. Set **Daily digest of followed Sessions** to get it once a day instead of a notice per turn; failures, approvals, and questions still arrive at once |
+| `/board`, `/board off` | Live board: one message that keeps showing every Session's state, with buttons to switch; close it |
+| `/away [duration\|off]` | Away mode: approvals and questions wait for you instead of going to the Web UI, with a report when you are back. Durations like `30m`, `2h`, `1d` |
+| `/schedule`, `/schedule add …` | Manage scheduled tasks (admins); see below |
+| `/link <code>` | Take over a Web Session; the code is on its **Switchboard** tab |
 | `/whoami` | Your user and chat id (anyone) |
 | Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer; a slow one shows its progress with a Cancel button; `/help` lists them |
 | other `/xxx` | Not a command: sent to the Agent as text |
@@ -67,16 +71,21 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
 - **Context and long content**: replying to (quoting) a message sends its text along. Replies over **Long reply as a file** (6000 characters) arrive as a preview plus a Markdown file; Feishu cards fold code blocks over 15 lines.
 - **Approvals and questions**: **Allow once / Reject** buttons, with a diff for file edits; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.
+- **Approval readings**: a moment after a command's approval appears, the Session's own model adds a sentence on what it would do and whether that can be undone. Advice only: it never answers the approval, the command stays on screen, and a slow or failed call changes nothing. File edits are left out, since they come with a diff. Turn it off with `approvalRiskHint`.
+- **Live board**: `/board` keeps one message up to date, with what waits for you first, then failures, running work, and the chat's idle Sessions. Buttons switch to a Session. It is pinned on Telegram (Feishu has no pin) and shows only what the person who opened it may see.
+- **Away mode**: normally an unanswered approval goes to the Web UI, and with nobody there the step does not run. After `/away 2h` it keeps waiting, with reminders further and further apart (at most hourly), and the task stays on hold at that step. When the time is up or you send `/away off`, waits return to normal and you get a report of what finished, failed, and still waits.
+- **The Agent reaches you**: Sessions linked to a chat get a `notify_phone` tool for milestones and urgent news mid-turn, at most once every 30 seconds per Session. Reply to such a message to answer that Session. Turn it off with `agentNotify`.
+- **Scheduled tasks** (admins, when the Harness has them): `/schedule` lists every Host task, with buttons to run, pause, resume, delete (two presses), and choose whether it reports to this chat. `/schedule add daily 09:00 <instruction>`, `every 30m`, `in 2h`, or `cron 0 9 * * 1-5` creates one, in Host time; it uses the chat's working directory and one Session of its own, and reports back here, approvals included.
 - **Media**: photos and files are staged through `ctx.fileUploads`; images reach the model as images. Voice notes are transcribed by the Harness speech service via ffmpeg. Files the Agent presents are sent back.
 - **Nothing lost**: replies, turn notices, and presented files that cannot be sent (line down, or a send that certainly failed) wait in an outbox and go out, marked late, once the line is back; sends with an unknown outcome are not repeated. After a plugin restart, the final reply of each turn that ended meanwhile is sent (up to 3 per Session). A line down longer than **Outage alert after** (5 min) is reported to the **Line outage alert chats** through another line.
 - **Per-person rights** (console → Members): admins do everything; members get their own permission preset (workspace-write by default) and directories, and cannot change the mode or run permission-related Harness commands; guests are read-only and cannot answer approvals. Listed people start as admins, people allowed from the Members page as members; directory limits apply to new Sessions, `/cwd`, `/sessions`, `/use`, `/watch`, and buttons (checked against whoever pressed).
-- **Groups**: by default only commands, @mentions, and replies to the bot are answered. Authorize users or whole chats per line.
+- **Groups**: by default only commands, @mentions, and replies to the bot are answered. Authorize users or whole chats per line. The Agent is told who said what with a line like `[group chat | role: member | from: Ann @ann]`; names are cleaned so they cannot forge a role.
 - **Security**: only a line's allowed users (or members of its allowed chats) can use its bot. Secrets live in the Harness credentials store (`TELEGRAM_BOT_TOKEN`, `FEISHU_APP_SECRET`, or environment variables of those names), never in the profile file or the browser.
 
 ## In the Web UI
 
 - **Switchboard console** (sidebar), four tabs: **Chats** (every line's chats, an overview with a 14-day chart, full threads with **Open Session**); **Lines** (one-line summaries that open for editing, Feishu added by QR); **Members** (people waiting for approval, allowed with one click and told so, and everyone allowed per line); **Settings** (common options first, the rest under **Advanced**).
-- **Switchboard tab in every Session**: linked chats on any line, bind or follow another chat, send as the bot, and the Session's chat activity.
+- **Switchboard tab in every Session**: linked chats on any line, bind or follow another chat, send as the bot, and the Session's chat activity. **Continue on your phone** shows a QR code: scan it and that chat takes over the Session, or send the bot `/link <code>`. A code works once, for 10 minutes, and only for a line's allowed users. On Feishu the QR only opens the bot, so send the code there.
 - **`/switchboard` in the composer**: `bind`, `watch`, `unbind`, and `send` for the open Session.
 - **Channel note**: Sessions bound to a chat get a short note asking for phone-friendly replies.
 

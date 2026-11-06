@@ -125,7 +125,7 @@ export function FeishuScan(props: {
 }
 
 /** A QR code as SVG squares. */
-function QrCode({ text }: { text: string }): ReactNode {
+export function QrCode({ text }: { text: string }): ReactNode {
   const cells = useMemo(() => {
     const qr = qrcode(0, 'L')
     qr.addData(text)

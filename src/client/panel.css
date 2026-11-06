@@ -778,6 +778,9 @@ a.tgb-button { text-decoration: none; }
 .tgb-scan-text { display: grid; gap: 8px; flex: 1; min-width: 180px; font-size: 13px; justify-items: start; }
 .tgb-scan-text p { margin: 0; }
 .tgb-qr { flex: none; border-radius: 8px; }
+.tgb-claims { display: flex; flex-wrap: wrap; gap: 16px; }
+.tgb-claim { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
+.tgb-claim-code { user-select: all; font-size: 13px; }
 .tgb-scan-ok { margin: 0; font-size: 13px; color: var(--dsw-alias-state-success-primary); }
 .tgb-line-manual summary { cursor: pointer; font-size: 12px; color: var(--dsw-alias-label-secondary); }
 .tgb-line-manual[open] summary { margin-bottom: 8px; }
