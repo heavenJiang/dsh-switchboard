@@ -1007,6 +1007,67 @@ describe('harness commands', () => {
     expect(harness.prompts).toEqual([])
   })
 
+  describe('while a command runs', () => {
+    let finish: () => void
+    const notice = () => telegram.calls.find(call => call.method === 'sendMessage' && String(call.params['text']).startsWith('⏳ Running /compact'))
+    const button = (label: string) => (notice()!.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] })
+      .inline_keyboard.flat().find(item => item.text === label)!.callback_data
+
+    beforeEach(async () => {
+      await store.update(KEY, { sessionId: 's1' })
+      harness.commandGate = new Promise(resolve => { finish = resolve })
+    })
+
+    it('shows it working, and replaces that with the result', async () => {
+      telegram.push(text(USER, '/compact'))
+      await until(() => telegram.calls.some(call => call.method === 'sendChatAction'))
+      await until(() => notice() !== undefined, 3000)
+      finish()
+      await until(() => telegram.sent().includes('Compacted: 48k → 9k tokens'))
+      await until(() => telegram.calls.some(call => call.method === 'deleteMessage'))
+    })
+
+    it('leaves the bot free for other updates', async () => {
+      telegram.push(text(USER, '/compact'))
+      await until(() => notice() !== undefined, 3000)
+      telegram.push(text(USER, '/whoami'))
+      await until(() => telegram.sent().some(sent => sent.includes(String(USER.id))))
+      finish()
+    })
+
+    it('cancels from the button', async () => {
+      telegram.push(text(USER, '/compact'))
+      await until(() => notice() !== undefined, 3000)
+      telegram.push({ callback_query: { id: 'q', from: USER, data: button('✖️ Cancel') } })
+      await until(() => telegram.sent().includes('⏹ /compact cancelled'))
+      expect(telegram.sent()).not.toContain('⚠️ /compact: Compaction cancelled.')
+    })
+
+    it('cancels with /stop when no turn is running', async () => {
+      telegram.push(text(USER, '/compact'))
+      await until(() => notice() !== undefined, 3000)
+      telegram.push(text(USER, '/stop'))
+      await until(() => telegram.sent().includes('⏹ /compact cancelled'))
+    })
+
+    it('does not start the same command twice', async () => {
+      telegram.push(text(USER, '/compact'))
+      await until(() => notice() !== undefined, 3000)
+      telegram.push(text(USER, '/compact'))
+      await until(() => telegram.sent().includes('⏳ /compact is still running; the result will follow.'))
+      expect(harness.ran).toHaveLength(1)
+      finish()
+    })
+  })
+
+  it('answers a quick command without a progress message', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/compact'))
+    await until(() => telegram.sent().includes('Compacted: 48k → 9k tokens'))
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(telegram.sent().filter(sent => sent.startsWith('⏳'))).toEqual([])
+  })
+
   it('reports a command error plainly', async () => {
     await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/goal'))

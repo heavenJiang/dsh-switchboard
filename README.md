@@ -57,7 +57,7 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | Reply to a notice or reply | Goes to the Session that message belongs to, without `/use`; the chat's own Session stays, and that turn's replies come back here |
 | `/digest` | Roundup of followed Sessions over 24 hours: finished, failed, waiting for you, and running. Set **Daily digest of followed Sessions** to get it once a day instead of a notice per turn; failures, approvals, and questions still arrive at once |
 | `/whoami` | Your user and chat id (anyone) |
-| Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer; `/help` lists them |
+| Harness commands | `/compact`, `/plan`, `/goal`, `/permission`, `/export`, … run on the Host exactly as in the Web composer; a slow one shows its progress with a Cancel button; `/help` lists them |
 | other `/xxx` | Not a command: sent to the Agent as text |
 
 - **Rendering**: Markdown becomes Telegram HTML (with a plain-text fallback) or a Feishu card's Markdown, split safely.

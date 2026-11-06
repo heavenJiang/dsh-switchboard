@@ -191,9 +191,10 @@ export interface HarnessPort {
   /**
    * Run one slash-command line the way the Web composer does: on the Host,
    * outside the model conversation.
+   * @param signal - cancels the command, for those that can stop midway.
    * @returns the command's result, or undefined when no Harness command has that name.
    */
-  runCommand(sessionId: string, line: string): Promise<HarnessCommandResult | undefined>
+  runCommand(sessionId: string, line: string, signal: AbortSignal): Promise<HarnessCommandResult | undefined>
   /**
    * Branch a Session at its latest completed turn; the original stays as it is.
    * @returns the new Session.
@@ -341,6 +342,25 @@ interface Progress {
   readonly stopId: string
 }
 
+/** A Harness command in flight; its chat sees a message once it outlasts {@link COMMAND_NOTICE_MS}. */
+interface CommandRun {
+  /** Short id the cancel button carries. */
+  readonly id: string
+  readonly key: string
+  readonly sessionId: string
+  readonly name: string
+  readonly controller: AbortController
+  readonly startedAt: number
+  /** The progress message, once sent. */
+  messageId: string | undefined
+  /** Sends the first progress message. */
+  notice: ReturnType<typeof setTimeout> | undefined
+  /** Lets the inbound loop move on without waiting for the command. */
+  release: () => void
+  /** Keeps the typing indicator and the elapsed time fresh. */
+  ticker: ReturnType<typeof setInterval> | undefined
+}
+
 /** A person's message being worked on, marked with a reaction until its turn ends. */
 interface Receipt {
   readonly key: string
@@ -451,6 +471,8 @@ const PROGRESS_LINES = 6
 const PROGRESS_DELAY_MS = 4000
 /** How often a shown progress message repaints its elapsed time. */
 const PROGRESS_TICK_MS = 10_000
+/** How long a command may run before its chat gets a progress message; quicker ones just answer. */
+const COMMAND_NOTICE_MS = 1000
 /** Streamed text shows once there is this much of it. */
 const DRAFT_MIN_CHARS = 40
 /** Buttons and notices are remembered this long. */
@@ -490,6 +512,8 @@ export class Switchboard {
   private readonly live = new Map<string, LiveLine>()
   private readonly sendTails = new Map<string, Promise<void>>()
   private readonly typing = new Map<string, ReturnType<typeof setInterval>>()
+  /** Harness commands in flight, by the short id their cancel button carries. */
+  private readonly commandRuns = new Map<string, CommandRun>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly questions = new Map<string, PendingQuestions>()
   private readonly toolCalls = new Map<string, { name: string; arguments: string }>()
@@ -682,6 +706,7 @@ export class Switchboard {
       clearInterval(progress.ticker)
     }
     this.progress.clear()
+    for (const run of this.commandRuns.values()) this.quietCommand(run)
     await Promise.allSettled([...this.sendTails.values()])
     for (const id of [...this.live.keys()]) await this.stopLine(id)
   }
@@ -689,6 +714,7 @@ export class Switchboard {
   /** Stop for good: also abort in-flight transcriptions. */
   async dispose(): Promise<void> {
     this.lifetime.abort()
+    for (const run of this.commandRuns.values()) run.controller.abort()
     clearInterval(this.timer)
     this.timer = undefined
     await this.stop()
@@ -1183,8 +1209,10 @@ export class Switchboard {
       case 'stop': {
         if (binding.sessionId === undefined) return this.reply(key, t.noSession)
         const live = this.harness.live(binding.sessionId)
-        if (live?.running !== true || !this.harness.cancel(binding.sessionId)) return this.reply(key, t.notRunning)
-        return this.reply(key, t.stopped)
+        const runs = [...this.commandRuns.values()].filter(run => run.sessionId === binding.sessionId)
+        for (const run of runs) this.cancelCommand(run)
+        const stopped = live?.running === true && this.harness.cancel(binding.sessionId)
+        return this.reply(key, stopped || runs.length > 0 ? t.stopped : t.notRunning)
       }
       case 'steer': {
         if (args === '') return this.reply(key, t.steerUsage)
@@ -1253,16 +1281,100 @@ export class Switchboard {
           if (!mayRunCommand(actor, name) && (await this.harness.listCommands(binding.sessionId).catch(() => [])).some(command => command.name === name)) {
             return this.reply(key, t.adminOnly)
           }
-          const result = await this.harness.runCommand(binding.sessionId, line)
-          if (result !== undefined) {
-            return this.reply(key, result.kind === 'error'
-              ? t.commandFailed(name, result.text ?? '')
-              : result.text === undefined || result.text.trim() === '' ? t.commandDone(name) : result.text)
-          }
+          return this.startCommand(key, binding.sessionId, name, line, actor)
         }
         return this.promptFromChat(key, [{ type: 'text', text: line }], 'queue', actor)
       }
     }
+  }
+
+  /**
+   * Run a Harness command and show it working. Resolves with a quick command's
+   * answer, keeping later messages behind it, or at {@link COMMAND_NOTICE_MS},
+   * since inbound updates wait for this and `/stop` or an approval must still get through.
+   */
+  private async startCommand(key: string, sessionId: string, name: string, line: string, actor: Actor): Promise<void> {
+    if ([...this.commandRuns.values()].some(run => run.sessionId === sessionId && run.name === name)) {
+      return this.reply(key, this.t.commandRunning(name))
+    }
+    const { promise: released, resolve: release } = Promise.withResolvers<void>()
+    const run: CommandRun = {
+      id: randomUUID().slice(0, 8), key, sessionId, name, controller: new AbortController(), startedAt: Date.now(),
+      messageId: undefined, notice: undefined, release, ticker: undefined,
+    }
+    this.commandRuns.set(run.id, run)
+    const showTyping = (): void => {
+      void this.channelOf(key)?.typing(splitChatKey(key).chat).catch(() => {})
+    }
+    showTyping()
+    run.notice = setTimeout(() => {
+      run.notice = undefined
+      this.renderCommand(run)
+      run.ticker = setInterval(() => {
+        showTyping()
+        this.renderCommand(run)
+      }, TYPING_INTERVAL_MS)
+      release()
+    }, COMMAND_NOTICE_MS)
+    await Promise.race([released, this.finishCommand(run, line, actor)])
+  }
+
+  /** Wait for a command, then answer in its chat; never rejects, since nobody may be waiting. */
+  private async finishCommand(run: CommandRun, line: string, actor: Actor): Promise<void> {
+    const { key, name, controller: { signal } } = run
+    const t = this.t
+    let text: string | undefined
+    try {
+      const result = await this.harness.runCommand(run.sessionId, line, signal)
+      if (result?.kind === 'error') text = signal.aborted ? t.commandCancelled(name) : t.commandFailed(name, result.text ?? '')
+      else if (result !== undefined) text = result.text === undefined || result.text.trim() === '' ? t.commandDone(name) : result.text
+    } catch (error: unknown) {
+      text = signal.aborted ? t.commandCancelled(name) : t.failed(describe(error))
+    }
+    this.quietCommand(run)
+    this.commandRuns.delete(run.id)
+    // Stepping aside rather than editing, so the answer is the latest message and notifies.
+    const elapsed = duration((Date.now() - run.startedAt) / 1000, this.settings().language)
+    await this.enqueue(key, async (channel, chat) => {
+      if (run.messageId !== undefined) await channel.retire(chat, run.messageId, t.commandSummary(name, elapsed)).catch(() => {})
+    })
+    try {
+      // No Harness command has that name after all: it is text for the Agent.
+      await (text === undefined ? this.promptFromChat(key, [{ type: 'text', text: line }], 'queue', actor) : this.reply(key, text))
+    } catch (error: unknown) {
+      await this.reply(key, t.failed(describe(error)))
+    }
+  }
+
+  /** Paint a command's progress message. */
+  private renderCommand(run: CommandRun): void {
+    const t = this.t
+    const elapsed = duration((Date.now() - run.startedAt) / 1000, this.settings().language)
+    const cancelling = run.controller.signal.aborted
+    const text = cancelling ? t.commandCancelling(run.name) : t.commandProgress(run.name, elapsed)
+    const buttons = cancelling ? [] : [[{ text: t.cancelButton, data: `cc:${run.id}` }]]
+    void this.enqueue(run.key, async (channel, chat) => {
+      // A command that ended while this waited in the queue has nothing left to show.
+      if (!this.commandRuns.has(run.id)) return
+      if (run.messageId === undefined) run.messageId = await channel.send(chat, { text, buttons, editable: true })
+      else await channel.edit(chat, run.messageId, { text, buttons, editable: true }).catch(() => {})
+    })
+  }
+
+  /** Stop showing a command and stop holding the inbound loop for it; the command itself goes on. */
+  private quietCommand(run: CommandRun): void {
+    clearTimeout(run.notice)
+    clearInterval(run.ticker)
+    run.notice = undefined
+    run.ticker = undefined
+    run.release()
+  }
+
+  private cancelCommand(run: CommandRun): void {
+    if (run.controller.signal.aborted) return
+    run.controller.abort()
+    // Before the first paint there is nothing to update; that paint shows the cancelling state.
+    if (run.ticker !== undefined) this.renderCommand(run)
   }
 
   /** Branch a Session at its latest completed turn and move the chat to the branch; the original stays. */
@@ -2459,6 +2571,7 @@ export class Switchboard {
     const actor = this.actorOf(this.settingsOf(line), action.from)
     if (action.data.startsWith('pk:')) return this.handlePick(line, action, actor)
     if (action.data.startsWith('st:')) return this.handleStop(line, action)
+    if (action.data.startsWith('cc:')) return this.handleCommandCancel(line, action, actor)
     if (action.data.startsWith('qs:') || action.data.startsWith('qx:')) return this.handleQueued(line, action)
     if (action.data.startsWith('ab:')) return this.handleReplyAction(line, action, actor)
     if (action.data.startsWith('mn:')) return this.handleMenu(line, action, actor)
@@ -2518,6 +2631,20 @@ export class Switchboard {
       await line.channel.ack(action, this.t.notRunning)
       return
     }
+    await line.channel.ack(action, this.t.stopRequested)
+  }
+
+  private async handleCommandCancel(line: LiveLine, action: InboundAction, actor: Actor): Promise<void> {
+    const run = this.commandRuns.get(action.data.slice(3))
+    if (run === undefined) {
+      await line.channel.ack(action, this.t.notRunning)
+      return
+    }
+    if (!mayRunCommand(actor, run.name)) {
+      await line.channel.ack(action, this.t.adminOnly)
+      return
+    }
+    this.cancelCommand(run)
     await line.channel.ack(action, this.t.stopRequested)
   }
 

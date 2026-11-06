@@ -14,7 +14,7 @@
     "remote-control",
     "掌上指挥台"
   ],
-  "version": "0.5.20",
+  "version": "0.5.21",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",

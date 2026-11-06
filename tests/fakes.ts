@@ -62,10 +62,16 @@ export class FakeHarness implements HarnessPort {
   async listCommands(): Promise<{ name: string; description: string; hint?: string }[]> {
     return this.commands
   }
-  async runCommand(sessionId: string, line: string): Promise<{ kind: 'success' | 'error'; text?: string } | undefined> {
+  /** Holds commands until it settles; an abort ends one the way `/compact` reports it. */
+  commandGate: Promise<void> | undefined
+  async runCommand(sessionId: string, line: string, signal: AbortSignal): Promise<{ kind: 'success' | 'error'; text?: string } | undefined> {
     const name = line.slice(1).split(/\s/u)[0]
     if (!this.commands.some(command => command.name === name)) return undefined
     this.ran.push({ sessionId, line })
+    if (this.commandGate !== undefined) {
+      await Promise.race([this.commandGate, new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))])
+      if (signal.aborted) return { kind: 'error', text: 'Compaction cancelled.' }
+    }
     if (name === 'goal') return { kind: 'error', text: 'goal text required' }
     return { kind: 'success', text: 'Compacted: 48k → 9k tokens' }
   }

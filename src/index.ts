@@ -611,12 +611,12 @@ export function apply(ctx: Context, config: Config): void {
         ...(descriptor.input === undefined ? {} : { hint: descriptor.input.hint }),
       }))
     },
-    async runCommand(sessionId, line) {
+    async runCommand(sessionId, line, signal) {
       const commands = optional.commands
       if (commands === undefined) return undefined
       const agent = await resolveAgent(sessionId)
       if (agent === undefined) return undefined
-      const execution = await commands.execute(agent, line, [], new AbortController().signal)
+      const execution = await commands.execute(agent, line, [], signal)
       if (execution === undefined) return undefined
       const { result } = execution
       return { kind: result.kind, ...(result.text === undefined ? {} : { text: result.text }) }
