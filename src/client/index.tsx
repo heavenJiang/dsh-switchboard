@@ -89,6 +89,7 @@ interface BridgeValues {
   channelPrompt?: boolean
   channelPromptText?: string
   streamReplies?: boolean
+  telegramReplyButtons?: boolean
   turnSummary?: 'off' | 'long' | 'always'
   turnSummaryMinSec?: number
   scheduleChats?: string[]
@@ -116,7 +117,7 @@ type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approva
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
   | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'watchDigestTime' | 'longReplyChars'
 type ToggleField = 'enabled' | 'approvalViaTelegram' | 'approvalRiskHint' | 'agentNotify' | 'pluginPush' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
-  | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
+  | 'channelPrompt' | 'streamReplies' | 'telegramReplyButtons' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
 /** A comma- or space-separated list field. */
 const listField = (read: (v: BridgeValues) => string[] | undefined) => ({
@@ -186,6 +187,7 @@ const TOGGLES: Record<ToggleField, { field: keyof BridgeValues; read: (v: Bridge
   englishReplies: { field: 'language', read: v => v.language === 'en', write: on => on ? 'en' : 'zh' },
   channelPrompt: { field: 'channelPrompt', read: v => v.channelPrompt ?? true, write: on => on },
   streamReplies: { field: 'streamReplies', read: v => v.streamReplies ?? true, write: on => on },
+  telegramReplyButtons: { field: 'telegramReplyButtons', read: v => v.telegramReplyButtons ?? false, write: on => on },
   transcribeVoice: { field: 'transcribeVoice', read: v => v.transcribeVoice ?? true, write: on => on },
   showPanel: { field: 'showPanel', read: v => v.showPanel ?? true, write: on => on },
   showSessionTab: { field: 'showSessionTab', read: v => v.showSessionTab ?? true, write: on => on },
@@ -665,6 +667,7 @@ export function createSettings(form: ConfigForm<BridgeValues>, describe: Setting
 
         <h3 style={styles.section}>{t('groupMessages')}</h3>
         {toggle('streamReplies')}
+        {toggle('telegramReplyButtons')}
         {toggle('notifyToolCalls')}
         <ChoiceField label={t('turnSummary')} hint={t('turnSummaryHint')} disabled={disabled}
           value={textState('turnSummary').text}

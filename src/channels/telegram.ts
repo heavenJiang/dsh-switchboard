@@ -6,12 +6,12 @@
 import type { LineSettings } from '../lines.ts'
 import { chunkMarkdown, markdownToTelegramHtml } from '../markdown.ts'
 import { incomingAttachments } from '../media.ts'
-import { TelegramApiError, TelegramClient, type TgCallbackQuery, type TgChat, type TgInlineButton, type TgMessage, type TgUpdate, type TgUser } from '../telegram.ts'
+import { TelegramApiError, TelegramClient, type TgCallbackQuery, type TgChat, type TgCommand, type TgInlineButton, type TgMessage, type TgUpdate, type TgUser } from '../telegram.ts'
 import { chunkText } from '../text.ts'
 import {
   FileTooLargeError, sleep,
   type Button, type Channel, type ChannelChat, type ChannelSink, type ChannelUser, type InboundAction,
-  type InboundAttachment, type InboundMessage, type OutFile, type OutMessage, type SentMarkdown,
+  type InboundAttachment, type InboundMessage, type MenuSync, type OutFile, type OutMessage, type SentMarkdown,
 } from './types.ts'
 
 /** Where a Telegram line keeps its getUpdates position. */
@@ -259,15 +259,36 @@ export class TelegramChannel implements Channel {
     await this.client.sendTyping(Number(chatId))
   }
 
-  /** Set the menu; lists left in other scopes or languages would take precedence over it, so `clearOthers` removes them. */
-  async setMenu(commands: readonly { command: string; description: string }[], clearOthers = false): Promise<void> {
-    for (const scope of clearOthers ? MENU_SCOPES : []) {
+  /**
+   * Publish the menu. The narrowest scope and language with a list wins, so a list left behind
+   * for a group scope would hide this one; each existing list is merged with these commands
+   * instead, which keeps the commands other tools registered, and read back to confirm it.
+   */
+  async setMenu(commands: readonly { command: string; description: string }[]): Promise<MenuSync> {
+    const managed = new Set(commands.map(command => command.command))
+    let checked = 0
+    for (const scope of MENU_SCOPES) {
       for (const language of MENU_LANGUAGES) {
-        // Telegram has no call that lists them, and the default list must still go out if one fails.
-        if (scope !== 'default' || language !== undefined) await this.client.deleteMyCommands(scope, language).catch(() => {})
+        const before = await this.client.getMyCommands(scope, language)
+        // An empty narrower list inherits the default one; leaving it empty keeps that.
+        if (scope !== 'default' && before.length === 0) {
+          checked += 1
+          continue
+        }
+        const merged = [...commands, ...before.filter(command => !managed.has(command.command))]
+        if (merged.length > MAX_MENU) {
+          throw new Error(`the bot menu would hold ${merged.length} commands; kept the commands others registered and left the menu as it was`)
+        }
+        if (!sameCommands(before, merged)) {
+          await this.client.setMyCommands(merged, scope, language)
+          if (!sameCommands(await this.client.getMyCommands(scope, language), merged)) {
+            throw new Error('the bot menu read back differs from what was sent')
+          }
+        }
+        checked += 1
       }
     }
-    await this.client.setMyCommands(commands)
+    return { verifiedAt: Date.now(), checked }
   }
 
   async ack(action: InboundAction, notice?: string): Promise<void> {
@@ -279,6 +300,17 @@ export class TelegramChannel implements Channel {
 const MENU_SCOPES = ['default', 'all_private_chats', 'all_group_chats', 'all_chat_administrators']
 /** Languages cleared in each scope; the bot's replies come in these two. */
 const MENU_LANGUAGES = [undefined, 'zh', 'en']
+/** Telegram's own limit on the bot menu, after merging in commands others registered. */
+const MAX_MENU = 100
+
+/** Whether two command lists say the same, in whatever order the platform returned them. */
+function sameCommands(left: readonly TgCommand[], right: readonly TgCommand[]): boolean {
+  if (left.length !== right.length) return false
+  const key = (command: TgCommand): string => `${command.command}\u0000${command.description}`
+  const sortedLeft = left.map(key).sort()
+  const sortedRight = right.map(key).sort()
+  return sortedLeft.every((value, index) => value === sortedRight[index])
+}
 
 function keyboard(rows: readonly (readonly Button[])[]): TgInlineButton[][] {
   return rows.map(row => row.map(button => ({ text: button.text.slice(0, 60), callback_data: button.data })))

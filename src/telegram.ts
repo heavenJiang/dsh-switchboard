@@ -311,12 +311,27 @@ export class TelegramClient {
   }
 
   /** Register the bot's slash-command menu. */
-  setMyCommands(commands: readonly { command: string; description: string }[]): Promise<unknown> {
-    return this.call('setMyCommands', { commands })
+  setMyCommands(commands: readonly { command: string; description: string }[], scope?: string, language?: string): Promise<unknown> {
+    return this.call('setMyCommands', {
+      commands,
+      ...(scope === undefined ? {} : { scope: { type: scope } }),
+      ...(language === undefined ? {} : { language_code: language }),
+    })
   }
 
-  /** Remove the commands of one scope and language; a narrower list would otherwise hide the default one. */
+  /** The commands of one scope and language; empty when none was set, which inherits a broader list. */
+  getMyCommands(scope: string, language?: string): Promise<TgCommand[]> {
+    return this.call('getMyCommands', { scope: { type: scope }, ...(language === undefined ? {} : { language_code: language }) })
+  }
+
+  /** Remove the commands of one scope and language. */
   deleteMyCommands(scope: string, language?: string): Promise<unknown> {
     return this.call('deleteMyCommands', { scope: { type: scope }, ...(language === undefined ? {} : { language_code: language }) })
   }
+}
+
+/** One entry of the bot's command menu, as Telegram reports it. */
+export interface TgCommand {
+  command: string
+  description: string
 }

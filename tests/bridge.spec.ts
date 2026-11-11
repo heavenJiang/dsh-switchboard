@@ -28,6 +28,10 @@ class FakeTelegram {
   rejectHtml = 0
   /** Answer the next N calls of any method with 429. */
   rateLimit = 0
+  /** Fail the next N setMyCommands calls. */
+  menuFailures = 0
+  /** Command lists the bot has, by `scope/language`, as Telegram would report them. */
+  readonly menus = new Map<string, { command: string; description: string }[]>()
 
   push(update: Omit<TgUpdate, 'update_id'>): void {
     this.queue.push({ update_id: this.queue.length + this.calls.length + 1, ...update })
@@ -86,6 +90,23 @@ class FakeTelegram {
       return new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: can't parse entities" }))
     }
     if (method === 'sendMessage') return ok({ message_id: this.nextMessageId++, chat: { id: params['chat_id'] }, date: 0 })
+    if (method.endsWith('MyCommands')) {
+      const scope = (params['scope'] as { type: string } | undefined)?.type ?? 'default'
+      const key = `${scope}/${String(params['language_code'])}`
+      if (method === 'setMyCommands') {
+        if (this.menuFailures > 0) {
+          this.menuFailures--
+          return new Response(JSON.stringify({ ok: false, error_code: 400, description: 'Bad Request: BOT_COMMANDS_TOO_MUCH' }))
+        }
+        this.menus.set(key, params['commands'] as { command: string; description: string }[])
+        return ok(true)
+      }
+      if (method === 'deleteMyCommands') {
+        this.menus.delete(key)
+        return ok(true)
+      }
+      return ok(this.menus.get(key) ?? [])
+    }
     return ok(true)
   }
 }
@@ -131,6 +152,8 @@ beforeEach(async () => {
     lines: [TELEGRAM_LINE],
     questionsViaTelegram: true,
     streamReplies: true,
+    // Most tests read the buttons; the plain-chat default has its own tests.
+    telegramReplyButtons: true,
     turnSummary: 'long',
     turnSummaryMinSec: 60,
     transcribeVoice: true,
@@ -1089,7 +1112,7 @@ describe('harness commands', () => {
 
   it('lists Harness commands in /help and in the bot menu', async () => {
     const menu = telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands'] as { command: string }[]
-    expect(menu.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'model', 'mode', 'watch', 'get', 'status', 'digest', 'board', 'away', 'schedule', 'help', 'compact', 'goal'])
+    expect(menu.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'restart', 'model', 'effort', 'mode', 'watch', 'get', 'status', 'digest', 'board', 'away', 'schedule', 'help', 'compact', 'goal'])
     await store.update(KEY, { sessionId: 's1' })
     telegram.push(text(USER, '/help'))
     await until(() => telegram.sent().length === 1)
@@ -1231,41 +1254,143 @@ describe('/status details', () => {
   })
 })
 
-describe('menu', () => {
-  it('clears lists left in other scopes and languages, then sets its own', async () => {
-    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
-    const deleted = telegram.calls.filter(c => c.method === 'deleteMyCommands').map(c => `${(c.params['scope'] as { type: string }).type}/${String(c.params['language_code'])}`)
-    expect(deleted).toEqual(expect.arrayContaining(['all_private_chats/undefined', 'all_group_chats/zh', 'all_chat_administrators/en', 'default/zh']))
-    // The default list with no language is replaced, never deleted.
-    expect(deleted).not.toContain('default/undefined')
-    const methods = telegram.calls.map(c => c.method).filter(method => method.endsWith('MyCommands'))
-    expect(methods.at(-1)).toBe('setMyCommands')
+describe('reasoning effort', () => {
+  const keyboard = (call: { params: Record<string, unknown> }) =>
+    (call.params['reply_markup'] as { inline_keyboard: { text: string; callback_data: string }[][] }).inline_keyboard
+
+  it('lists the model efforts and switches from a press', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/effort'))
+    await until(() => telegram.calls.some(c => c.params['reply_markup'] !== undefined))
+    const picker = telegram.calls.find(c => c.params['reply_markup'] !== undefined)!
+    const shown = String(picker.params['text'])
+    expect(shown).toContain('test/model')
+    expect(shown).toContain('medium') // the current choice
+    expect(shown).toContain('low, medium, high') // what the model declares
+    const rows = keyboard(picker)
+    expect(rows.map(row => row[0]!.text)).toEqual(['Low', '✓ Medium', 'High'])
+    telegram.push({ callback_query: { id: 'q', from: USER, message: { message_id: 1, chat: CHAT, date: 0 }, data: rows[2]![0]!.callback_data } })
+    await until(() => harness.efforts.length === 1)
+    expect(harness.efforts[0]).toEqual({ sessionId: 's1', effort: 'high' })
+    await until(() => telegram.sent().some(t => t.includes('high')))
   })
 
-  it('clears them once per bot, across reconnects and restarts', async () => {
+  it('sets an exact value from the command and refuses anything else', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/effort HIGH'))
+    await until(() => harness.efforts.length === 1)
+    telegram.push(text(USER, '/effort ultra'))
+    await until(() => telegram.sent().length === 2)
+    expect(telegram.sent()[1]).toContain('Invalid effort')
+    expect(harness.efforts).toHaveLength(1)
+  })
+
+  it('says so when the model declares none, or the Session is gone', async () => {
+    harness.effort = undefined
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/effort'))
+    await until(() => telegram.sent().length === 1)
+    expect(telegram.sent()[0]).toContain('no selectable reasoning efforts')
+    await store.update(KEY, { sessionId: undefined })
+    telegram.push(text(USER, '/effort'))
+    await until(() => telegram.sent().length === 2)
+    expect(telegram.sent()[1]).toMatch(/no Session/iu)
+  })
+})
+
+describe('restarting the whole desktop', () => {
+  it('restarts from Telegram once, telling the chat first', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/restart now'))
+    await until(() => telegram.sent().length === 1)
+    expect(telegram.sent()[0]).toContain('/restart')
+    expect(harness.restarted).toEqual([])
+    telegram.push(text(USER, '/restart'))
+    await until(() => harness.restarted.length === 1)
+    await until(() => telegram.sent().length === 2)
+    expect(telegram.sent()[1]).toContain('Restarting the whole DSH desktop app')
+    expect(harness.restarted[0]!.committed()).toBe(true)
+    expect(harness.restarted[0]!.cancelled()).toBe(false)
+  })
+
+  it('leaves a deployment without the launcher alone', async () => {
+    ;(harness as unknown as { prepareDesktopRestart?: unknown }).prepareDesktopRestart = undefined
+    await store.update(KEY, { sessionId: 's1' })
+    telegram.push(text(USER, '/restart'))
+    await until(() => telegram.sent().length === 1)
+    expect(telegram.sent()[0]).toContain('Windows desktop app')
+    expect(harness.restarted).toEqual([])
+  })
+})
+
+describe('Telegram reply buttons', () => {
+  it('leaves the Stop button and reply shortcuts off when the switch is off', async () => {
+    settings = { ...settings, telegramReplyButtons: false }
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c1', name: 'bash', arguments: JSON.stringify({ command: 'ls' }) } })
+    await until(() => telegram.calls.some(c => String(c.params['text']).includes('Working')))
+    const progress = telegram.calls.find(c => String(c.params['text']).includes('Working'))!
+    expect(progress.params['reply_markup']).toBeUndefined()
+    bridge.onSessionEvent('s1', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'all done' }] } } })
+    bridge.onSessionEvent('s1', { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'completed' } } })
+    await until(() => telegram.sent().some(t => t.includes('all done')))
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(telegram.calls.filter(c => c.method === 'editMessageReplyMarkup')).toEqual([])
+  })
+
+  it('keeps Stop and reply shortcuts on Telegram when the switch is on', async () => {
+    await store.update(KEY, { sessionId: 's1' })
+    bridge.onSessionEvent('s1', { type: 'turn/start', time: Date.now() })
+    bridge.onSessionEvent('s1', { type: 'tool/call', data: { callId: 'c1', name: 'bash', arguments: JSON.stringify({ command: 'ls' }) } })
+    await until(() => telegram.calls.some(c => String(c.params['text']).includes('Working')))
+    const progress = telegram.calls.find(c => String(c.params['text']).includes('Working'))!
+    expect(progress.params['reply_markup']).toBeDefined()
+  })
+})
+
+describe('menu', () => {
+  it('merges its commands with the ones other tools registered, and deletes nothing', async () => {
+    await bridge.stop()
+    telegram.calls.length = 0
+    // A list in a narrower scope and language would hide the default one; it is kept and extended.
+    telegram.menus.set('all_group_chats/zh', [{ command: 'other', description: 'Another tool' }])
+    await bridge.reconcile()
     await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
-    await until(() => telegram.calls.filter(c => c.method === 'deleteMyCommands').length === 11)
+    expect(telegram.calls.filter(c => c.method === 'deleteMyCommands')).toEqual([])
+    const group = telegram.menus.get('all_group_chats/zh') ?? []
+    expect(group.map(c => c.command)).toEqual(['menu', 'new', 'stop', 'restart', 'model', 'effort', 'mode', 'watch', 'get', 'status', 'digest', 'board', 'away', 'schedule', 'help', 'compact', 'goal', 'other'])
+    // The default list, which no scope shadows, is written first.
+    expect(telegram.calls.find(c => c.method === 'setMyCommands')!.params['commands']).toBeDefined()
+  })
+
+  it('leaves a menu that already matches alone when the bot reconnects', async () => {
+    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
     await store.settled()
     await bridge.stop()
     telegram.calls.length = 0
     await store.load()
     await bridge.reconcile()
-    await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
-    expect(telegram.calls.filter(c => c.method === 'deleteMyCommands')).toEqual([])
+    await until(() => telegram.calls.some(c => c.method === 'getMyCommands'))
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(telegram.calls.filter(c => c.method === 'setMyCommands')).toEqual([])
   })
 
-  it('tries again next time when the menu could not be set', async () => {
+  it('tries again when the menu could not be written, and a failed write is not treated as done', async () => {
     await bridge.stop()
     const cleanStore = new BindingStore(join(dir, 'fresh.json'))
-    const refused: typeof fetch = async (input, init) => String(input).endsWith('/setMyCommands')
-      ? Response.json({ ok: false, error_code: 400, description: 'Bad Request' })
-      : telegram.fetch(input, init)
-    bridge = new Switchboard(() => settings, harness, cleanStore, quiet, { fetch: refused }, chatLog)
     telegram.calls.length = 0
+    // A bot whose menu was never written: nothing to merge yet, so the first write is the whole list.
+    telegram.menus.clear()
+    telegram.menuFailures = 1
+    bridge = new Switchboard(() => settings, harness, cleanStore, quiet, { fetch: telegram.fetch }, chatLog)
     await bridge.reconcile()
-    await until(() => telegram.calls.filter(c => c.method === 'deleteMyCommands').length === 11)
-    await new Promise(resolve => setTimeout(resolve, 30))
-    expect(cleanStore.menuCleared('telegram:testbot')).toBe(false)
+    await until(() => telegram.calls.filter(c => c.method === 'setMyCommands').length === 1)
+    expect(telegram.menus.get('default/undefined')).toBeUndefined()
+    // `/help` asks for the menu again, and this time it goes out.
+    telegram.push(text(USER, '/help'))
+    await until(() => telegram.calls.filter(c => c.method === 'setMyCommands').length > 1)
+    expect(telegram.menus.get('default/undefined')?.map(c => c.command)).toContain('menu')
     await bridge.stop()
     await cleanStore.settled()
   })
@@ -1275,16 +1400,20 @@ describe('menu', () => {
     const commands = harness.commands
     harness.commands = []
     telegram.calls.length = 0
+    telegram.menus.clear()
     await bridge.reconcile()
     await until(() => telegram.calls.some(c => c.method === 'setMyCommands'))
+    const withoutHarness = telegram.calls.filter(c => c.method === 'setMyCommands').length
+    expect(withoutHarness).toBeGreaterThan(0)
     harness.commands = commands
     bridge.onSessionEvent('s9', { type: 'turn/start', time: Date.now() })
-    await until(() => telegram.calls.filter(c => c.method === 'setMyCommands').length === 2)
+    await until(() => telegram.calls.filter(c => c.method === 'setMyCommands').length > withoutHarness)
     const menu = telegram.calls.filter(c => c.method === 'setMyCommands').at(-1)!.params['commands'] as { command: string }[]
     expect(menu.map(c => c.command)).toContain('compact')
+    const written = telegram.calls.filter(c => c.method === 'setMyCommands').length
     bridge.onSessionEvent('s9', { type: 'turn/start', time: Date.now() })
     await new Promise(resolve => setTimeout(resolve, 30))
-    expect(telegram.calls.filter(c => c.method === 'setMyCommands')).toHaveLength(2)
+    expect(telegram.calls.filter(c => c.method === 'setMyCommands')).toHaveLength(written)
   })
 })
 

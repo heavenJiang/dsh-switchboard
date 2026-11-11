@@ -84,6 +84,8 @@ export interface BridgeSettings {
   readonly watchDigestTime?: string
   /** Add the model's plain-language reading to approvals of commands. */
   readonly approvalRiskHint?: boolean
+  /** Show Stop on progress messages and quick actions under replies; off keeps Telegram chats clean. */
+  readonly telegramReplyButtons?: boolean
 }
 
 /** A provider route, model, and optional reasoning effort. */
@@ -98,6 +100,29 @@ export interface ModelGroup {
   readonly provider: string
   readonly name: string
   readonly models: readonly { readonly id: string; readonly name: string }[]
+}
+
+/** One reasoning effort a model declares, as `/effort` shows it. */
+export interface ReasoningEffort {
+  readonly id: string
+  /** The deployment's name for it; the id when it has none. */
+  readonly name: string
+}
+
+/** What `/effort` needs: the Session's model, the efforts it declares, and the one the metadata picks. */
+export interface EffortState {
+  readonly choice: ModelChoice
+  /** The model's own default effort; absent when its metadata declares none. */
+  readonly defaultEffort?: string
+  readonly efforts: readonly ReasoningEffort[]
+}
+
+/** A desktop restart arranged but not yet committed: either finish it or leave everything running. */
+export interface DesktopRestartRequest {
+  /** Tell the worker to go ahead; resolves once the request is accepted. */
+  commit(): Promise<void>
+  /** Withdraw the request; nothing is stopped. */
+  cancel(): void
 }
 
 /** One permission preset the deployment offers. */
@@ -168,6 +193,23 @@ export interface HarnessPort {
    * @returns false when the Session is not loaded.
    */
   selectPreset(sessionId: string, preset: string): boolean
+  /**
+   * The reasoning efforts a live Session's model declares; undefined when the Session is not
+   * loaded or the deployment cannot report them.
+   */
+  effortState?(sessionId: string): Promise<EffortState | undefined>
+  /**
+   * Validate an effort against the Session's route and select it for that Session only.
+   * @param expected - the model and effort the list was built from; a Session that moved on is left alone.
+   * @param stillBound - re-checked after the route resolves; false cancels the change.
+   * @returns false when the Session is not loaded or no longer matches.
+   */
+  selectEffort?(sessionId: string, expected: ModelChoice, effort: string, stillBound: () => boolean): Promise<boolean>
+  /**
+   * Arrange a restart of the Windows desktop app hosting this bridge, without committing it yet.
+   * Undefined when this deployment cannot restart itself.
+   */
+  prepareDesktopRestart?(): Promise<DesktopRestartRequest>
   /** Queue (or steer) one prompt into a Session, resuming it when cold. */
   prompt(sessionId: string, parts: readonly PromptPart[], mode: 'queue' | 'steer'): Promise<void>
   /**
@@ -323,6 +365,7 @@ type Picker =
   | { kind: 'model'; sessionId: string; choices: { choice: ModelChoice; name: string }[]; at: number }
   | { kind: 'mode'; sessionId: string; choices: PresetOption[]; at: number }
   | { kind: 'session'; choices: string[]; at: number }
+  | { kind: 'effort'; sessionId: string; choice: ModelChoice; efforts: string[]; at: number }
   | { kind: 'dir'; choices: string[]; at: number }
 
 /** How a bot message is labelled in the chat history. */
@@ -456,6 +499,14 @@ interface LiveLine {
   state: LineState
   /** Whether the line's menu already lists Harness commands (filled once a Session can list them). */
   menuHasHarness: boolean
+  /** Whether the whole menu was verified against what Telegram reports. */
+  menuReady: boolean
+  /** The bot language the menu was written in; a language switch rewrites it. */
+  menuLanguage?: BotLanguage
+  /** When the menu was last attempted, so a failed sync waits before costing more calls. */
+  menuAttemptAt?: number
+  /** Whether a menu sync is in flight, so two triggers do not interleave. */
+  menuSyncing: boolean
   /** Since when the line has not been running; undefined while it runs. */
   downSince: number | undefined
   /** Whether the alert chats were told that it is down. */
@@ -467,9 +518,11 @@ export type BridgeState = LineState
 
 /** The bridge's own commands; a Harness command of the same name is reached only from the Web. */
 const BRIDGE_COMMANDS = new Set([
-  'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'steer', 'queue', 'cancel',
-  'status', 'model', 'mode', 'get', 'whoami', 'digest', 'fork', 'board', 'away', 'schedule', 'link',
+  'start', 'help', 'menu', 'new', 'cwd', 'use', 'sessions', 'watch', 'unwatch', 'stop', 'restart', 'steer', 'queue', 'cancel',
+  'status', 'model', 'effort', 'mode', 'get', 'whoami', 'digest', 'fork', 'board', 'away', 'schedule', 'link',
 ])
+/** Minimum gap before a failed menu sync is retried, so a broken line does not spend calls every turn. */
+const MENU_RETRY_MS = 60_000
 /** Harness commands that only make sense in the Web composer (`/switchboard` links a Web Session to a chat). */
 const WEB_ONLY_COMMANDS = new Set(['switchboard'])
 /** Telegram's command-name rule for the bot menu. */
@@ -617,6 +670,8 @@ export class Switchboard {
   /** When the Agent last reached the phone, per Session. */
   private readonly agentNotices = new Map<string, number>()
   private lastPluginPush = 0
+  /** Whether a desktop restart was asked for and has not failed yet. */
+  private desktopRestartPending = false
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(
@@ -726,7 +781,7 @@ export class Switchboard {
     const controller = new AbortController()
     const entry: LiveLine = {
       line, channel, controller, done: Promise.resolve(), key: lineKey(line), state: { kind: 'connecting' },
-      menuHasHarness: false, downSince: Date.now(), alerted: false,
+      menuHasHarness: false, menuReady: false, menuSyncing: false, downSince: Date.now(), alerted: false,
     }
     const sink: ChannelSink = {
       state: (state) => {
@@ -936,6 +991,18 @@ export class Switchboard {
 
   /** The bot menu: the bridge's main commands, then the Harness commands Telegram can name. */
   private async registerCommands(entry: LiveLine, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
+    // One sync per line at a time: two triggers interleaving would write the list twice.
+    if (entry.menuSyncing) return
+    entry.menuSyncing = true
+    entry.menuAttemptAt = Date.now()
+    try {
+      await this.syncCommands(entry, harnessCommands)
+    } finally {
+      entry.menuSyncing = false
+    }
+  }
+
+  private async syncCommands(entry: LiveLine, harnessCommands?: readonly HarnessCommand[]): Promise<void> {
     const t = this.t
     const listed = harnessCommands ?? await this.harness.listCommands(undefined).catch((error: unknown) => {
       this.logger.warn(`switchboard [${entry.line.id}]: Harness commands left out of the menu: ${describe(error)}`)
@@ -945,37 +1012,48 @@ export class Switchboard {
       .filter(command => MENU_NAME.test(command.name) && !BRIDGE_COMMANDS.has(command.name) && !WEB_ONLY_COMMANDS.has(command.name))
       .slice(0, 20)
       .map(command => ({ command: command.name, description: truncate(command.description || command.name, 256) }))
-    // Set from the whole list: commands that all fail the filter need no further tries.
-    entry.menuHasHarness = listed.length > 0
-    // Old lists stay gone once cleared, so reconnecting need not ask again; another bot on the line starts over.
-    const bot = `${entry.line.id}:${entry.channel.username ?? ''}`
-    const clearOthers = !this.store.menuCleared(bot)
-    await entry.channel.setMenu([
-      { command: 'menu', description: t.cmdMenu },
-      { command: 'new', description: t.cmdNew },
-      { command: 'stop', description: t.cmdStop },
-      { command: 'model', description: t.cmdModel },
-      { command: 'mode', description: t.cmdMode },
-      { command: 'watch', description: t.cmdWatch },
-      { command: 'get', description: t.cmdGet },
-      { command: 'status', description: t.cmdStatus },
-      { command: 'digest', description: t.cmdDigest },
-      { command: 'board', description: t.cmdBoard },
-      { command: 'away', description: t.cmdAway },
-      { command: 'schedule', description: t.cmdSchedule },
-      { command: 'help', description: t.cmdHelp },
-      ...extra,
-    ], clearOthers).then(async () => {
-      if (clearOthers) await this.store.setMenuCleared(bot)
-    }).catch((error: unknown) => {
+    try {
+      const sync = await entry.channel.setMenu([
+        { command: 'menu', description: t.cmdMenu },
+        { command: 'new', description: t.cmdNew },
+        { command: 'stop', description: t.cmdStop },
+        ...(entry.line.type === 'telegram' ? [{ command: 'restart', description: t.cmdRestart }] : []),
+        { command: 'model', description: t.cmdModel },
+        { command: 'effort', description: t.cmdEffort },
+        { command: 'mode', description: t.cmdMode },
+        { command: 'watch', description: t.cmdWatch },
+        { command: 'get', description: t.cmdGet },
+        { command: 'status', description: t.cmdStatus },
+        { command: 'digest', description: t.cmdDigest },
+        { command: 'board', description: t.cmdBoard },
+        { command: 'away', description: t.cmdAway },
+        { command: 'schedule', description: t.cmdSchedule },
+        { command: 'help', description: t.cmdHelp },
+        ...extra,
+      ])
+      // Set from the whole list: commands that all fail the filter need no further tries.
+      entry.menuHasHarness = listed.length > 0
+      // A menu counts as done only once the platform read back exactly what was sent.
+      entry.menuReady = true
+      entry.menuLanguage = this.settings().language
+      this.logger.debug(`switchboard [${entry.line.id}]: menu verified over ${sync?.checked ?? 1} list(s)`)
+    } catch (error: unknown) {
+      entry.menuHasHarness = false
+      entry.menuReady = false
       this.logger.debug(`switchboard [${entry.line.id}]: menu update failed: ${describe(error)}`)
-    })
+    }
   }
 
   /** Add the Harness commands to menus registered before any Agent could name them. */
   private refreshMenus(): void {
+    const language = this.settings().language
     for (const entry of this.live.values()) {
-      if (entry.state.kind === 'running' && !entry.menuHasHarness) void this.registerCommands(entry)
+      if (entry.state.kind !== 'running') continue
+      // The Harness commands arrive later, and a language switch leaves the old wording behind.
+      if (entry.menuReady && entry.menuHasHarness && entry.menuLanguage === language) continue
+      // A failed sync is retried on a later turn, not once per turn.
+      if (!entry.menuReady && Date.now() - (entry.menuAttemptAt ?? 0) < MENU_RETRY_MS) continue
+      void this.registerCommands(entry)
     }
   }
 
@@ -1303,6 +1381,8 @@ export class Switchboard {
         const stopped = live?.running === true && this.harness.cancel(binding.sessionId)
         return this.reply(key, stopped || runs.length > 0 ? t.stopped : t.notRunning)
       }
+      case 'restart':
+        return this.restartCommand(key, args, actor)
       case 'steer': {
         if (args === '') return this.reply(key, t.steerUsage)
         return this.promptFromChat(key, [{ type: 'text', text: args }], 'steer', actor)
@@ -1356,6 +1436,9 @@ export class Switchboard {
       case 'fork':
         if (binding.sessionId === undefined) return this.reply(key, t.noSession)
         return this.forkSession(key, binding.sessionId, actor)
+      case 'effort':
+        if (actor.role === 'guest') return this.reply(key, t.adminOnly)
+        return this.effortCommand(key, binding.sessionId, args)
       case 'model':
         if (actor.role === 'guest') return this.reply(key, t.adminOnly)
         return this.modelCommand(key, binding.sessionId, args)
@@ -1619,6 +1702,73 @@ export class Switchboard {
       const applied = this.harness.selectPreset(sessionId, option.value)
       await this.store.setPending(sessionId, { preset: applied ? undefined : option.value })
       await this.reply(key, applied ? t.modeSwitched(option.name) : t.modePending(option.name))
+    } catch (error: unknown) {
+      await this.reply(key, t.failed(describe(error)))
+    }
+  }
+
+  /**
+   * `/restart`: stop everything and start the desktop app again. The worker is prepared and
+   * verified first, so an unsupported host or a half-ready worker stops nothing.
+   */
+  private async restartCommand(key: string, args: string, actor: Actor): Promise<void> {
+    const t = this.t
+    if (actor.role !== 'admin') return this.reply(key, t.adminOnly)
+    const entry = this.live.get(splitChatKey(key).line)
+    const prepare = this.harness.prepareDesktopRestart?.bind(this.harness)
+    if (entry?.line.type !== 'telegram' || prepare === undefined) return this.reply(key, t.restartUnavailable)
+    if (args.trim() !== '') return this.reply(key, t.restartUsage)
+    if (this.desktopRestartPending) return this.reply(key, t.restartPending)
+    this.desktopRestartPending = true
+    let request: DesktopRestartRequest | undefined
+    try {
+      request = await prepare()
+      // Everything queued for Telegram reaches the log before the process that owns it stops.
+      await this.store.settled()
+      await this.chatLog?.settled()
+      if (!this.currentLine(key, entry, entry.channel)) throw new Error('the Telegram line changed before the restart')
+      // Say it before stopping anything, so the chat learns why the bot went quiet.
+      await entry.channel.send(splitChatKey(key).chat, { text: t.restartStarting })
+      await request.commit()
+      for (const line of this.live.values()) line.controller.abort()
+    } catch (error: unknown) {
+      request?.cancel()
+      this.desktopRestartPending = false
+      throw error
+    }
+  }
+
+  /** `/effort` lists the model's reasoning efforts as buttons; `/effort <level>` applies one. */
+  private async effortCommand(key: string, sessionId: string | undefined, args: string): Promise<void> {
+    const t = this.t
+    if (sessionId === undefined) return this.reply(key, t.effortNoSession)
+    const state = await this.harness.effortState?.(sessionId).catch((error: unknown) => {
+      this.logger.debug(`switchboard: reasoning efforts unavailable: ${describe(error)}`)
+      return undefined
+    })
+    if (state === undefined) return this.reply(key, t.effortUnsupported)
+    const ids = state.efforts.map(effort => effort.id)
+    if (ids.length === 0) return this.reply(key, t.effortUnsupported)
+    const wanted = args.trim()
+    if (wanted === '') {
+      const labels = state.efforts.map(effort => `${effort.id === state.choice.reasoningEffort ? '✓ ' : ''}${effort.name}`)
+      return this.sendPicker(key, { kind: 'effort', sessionId, choice: state.choice, efforts: ids, at: Date.now() }, labels,
+        t.effortList(modelLabel(state.choice), state.choice.reasoningEffort, state.defaultEffort, ids))
+    }
+    const needle = wanted.toLowerCase()
+    const match = state.efforts.find(effort => effort.id === wanted)
+      ?? state.efforts.find(effort => effort.id.toLowerCase() === needle || effort.name.toLowerCase() === needle)
+    if (match === undefined) return this.reply(key, t.effortInvalid)
+    return this.switchEffort(key, sessionId, state.choice, match.id)
+  }
+
+  private async switchEffort(key: string, sessionId: string, expected: ModelChoice, effort: string): Promise<void> {
+    const t = this.t
+    try {
+      const stillBound = () => this.store.get(key).sessionId === sessionId
+      const applied = await this.harness.selectEffort?.(sessionId, expected, effort, stillBound)
+      if (applied === undefined) return this.reply(key, t.effortUnsupported)
+      await this.reply(key, applied ? t.effortSaved(effort) : t.effortPending(effort))
     } catch (error: unknown) {
       await this.reply(key, t.failed(describe(error)))
     }
@@ -2494,9 +2644,13 @@ export class Switchboard {
       ...progress.lines,
       ...(draft === undefined ? [] : ['', draft]),
     ].join('\n')
-    const buttons = [[{ text: t.stopButton, data: `st:${progress.stopId}` }]]
+    // Telegram chats can be kept free of the Stop and reply buttons; the menu, approvals, and
+    // question choices stay, and `/stop` still stops a task.
+    const stopRow = [[{ text: t.stopButton, data: `st:${progress.stopId}` }]]
     // Each chat's send queue is serial, so an edit runs after the send that created its message.
     const sends = this.outputChats(sessionId).map(key => this.enqueue(key, async (channel, chat) => {
+      // No Stop button at all: an empty keyboard would still leave a markup on the message.
+      const buttons = this.replyButtonsHidden(key) ? undefined : stopRow
       const messageId = progress.messages.get(key)
       if (messageId === undefined) {
         const sent = await channel.send(chat, { text, buttons, editable: true })
@@ -2600,6 +2754,8 @@ export class Switchboard {
     for (const [id, actions] of this.replyActions) if (now - actions.at > ACTION_TTL_MS) this.replyActions.delete(id)
     for (const [key, sent] of replies) {
       if (!this.store.chatsFor(sessionId).includes(key)) continue
+      // With the Telegram buttons off the reply stays plain; the menu still offers the actions.
+      if (this.replyButtonsHidden(key)) continue
       const id = randomUUID().slice(0, 8)
       const retry = this.lastPrompts.get(`${key}|${sessionId}`)
       const files = turn?.files ?? []
@@ -2735,6 +2891,17 @@ export class Switchboard {
   /** The connected adapter of a chat's line. */
   private channelOf(key: string): Channel | undefined {
     return this.live.get(splitChatKey(key).line)?.channel
+  }
+
+  /** Whether Telegram chats on this line should not show Stop and reply buttons. */
+  private replyButtonsHidden(key: string): boolean {
+    if (this.settings().telegramReplyButtons === true) return false
+    return this.live.get(splitChatKey(key).line)?.line.type === 'telegram'
+  }
+
+  /** Whether a line is still the one the request started on, and not stopping. */
+  private currentLine(key: string, entry: LiveLine, channel: Channel = entry.channel): boolean {
+    return this.live.get(splitChatKey(key).line) === entry && entry.channel === channel && entry.controller.signal.aborted !== true
   }
 
   /**
@@ -3254,6 +3421,8 @@ export class Switchboard {
     // Each press is checked against whoever pressed, not whoever asked for the list.
     if (picker.kind === 'mode' && actor.role !== 'admin') return this.reply(key, this.t.adminOnly)
     if (picker.kind === 'model' && actor.role === 'guest') return this.reply(key, this.t.adminOnly)
+    // An effort list is tied to the model and Session it listed; either may have changed since.
+    if (picker.kind === 'effort' && actor.role === 'guest') return this.reply(key, this.t.adminOnly)
     if (picker.kind === 'session') {
       const sessionId = picker.choices[Number(index)]
       if (sessionId === undefined) return
@@ -3276,6 +3445,11 @@ export class Switchboard {
     if (picker.kind === 'model') {
       const picked = picker.choices[Number(index)]
       if (picked !== undefined) await this.switchModel(key, picker.sessionId, picked.choice, picked.name)
+    } else if (picker.kind === 'effort') {
+      if (this.store.get(key).sessionId !== picker.sessionId || Date.now() - picker.at > PICKER_TTL_MS) return this.reply(key, this.t.effortStale)
+      const effort = picker.efforts[Number(index)]
+      if (effort === undefined) return
+      await this.switchEffort(key, picker.sessionId, picker.choice, effort)
     } else {
       const picked = picker.choices[Number(index)]
       if (picked !== undefined) await this.switchMode(key, picker.sessionId, picked)

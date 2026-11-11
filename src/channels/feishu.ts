@@ -324,7 +324,7 @@ export class FeishuChannel implements Channel {
   async typing(): Promise<void> {}
 
   /** Feishu bots have no command menu; `/help` lists the commands. */
-  async setMenu(): Promise<void> {}
+  async setMenu(): Promise<undefined> {}
 
   async ack(action: InboundAction, notice?: string): Promise<void> {
     this.pendingActions.get(action.id)?.(notice)
