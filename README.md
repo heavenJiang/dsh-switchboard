@@ -47,9 +47,11 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 | `/watch [n\|sessionId]` | Follow a Session's completions and approvals; no argument lists them |
 | `/unwatch <n\|sessionId\|all>` | Stop following |
 | `/stop` | Stop current work |
+| `/restart` | Restart the entire Windows desktop app, backend and all (Telegram admins only); running tasks stop and the bot goes offline for a moment |
 | `/steer <text>` | Steer the running turn |
 | `/queue`, `/cancel <n\|all>` | Show or drop queued messages |
 | `/model [name]` | Show or switch the Session's model (buttons, fuzzy match; the Web default is untouched) |
+| `/effort [level]` | Show or switch this Session's reasoning effort, from what the model declares (buttons or an exact value; the next model request on) |
 | `/mode [mode]` | Show or switch the Session's permission mode |
 | `/get <path>` | Fetch a file or list a directory inside the working directory (symlinks cannot escape it) |
 | `/fork` | Branch from the latest finished turn into a new Session; the original stays |
@@ -67,7 +69,7 @@ Feishu has no typing indicator or command menu; everything else matches Telegram
 - **Rendering**: Markdown becomes Telegram HTML (with a plain-text fallback) or a Feishu card's Markdown, split safely.
 - **One progress message**: while a turn runs, a single "⏳ Working · time · N tool calls" message shows the latest tool calls and the reply being written, with a **⏹ Stop** button, and steps aside when the reply arrives as a new message at the bottom (so it notifies): deleted on Telegram, shrunk to a one-line summary on Feishu; a stop or failure is told there too.
 - **Acknowledged at once**: your message gets 👀 (Feishu: OnIt) while it is worked on, cleared when done; a message sent during a running turn gets a "Queued" notice with **Steer now** and **Cancel**.
-- **Buttons under the reply**: **Continue**, **Retry**, **Show changes** (the turn's changes as a diff file, new files included), and **New session**; they move to the next reply.
+- **Buttons under the reply**: **Continue**, **Retry**, **Show changes** (the turn's changes as a diff file, new files included), and **New session**; they move to the next reply. On Telegram the **⏹ Stop** button and these shortcuts can be turned off with **Show buttons on Telegram replies**; menus, approvals, and question choices stay, and `/stop` still stops a turn.
 - **Turn summaries**: duration, tool calls, and changed files after long turns (configurable).
 - **Context and long content**: replying to (quoting) a message sends its text along. Replies over **Long reply as a file** (6000 characters) arrive as a preview plus a Markdown file; Feishu cards fold code blocks over 15 lines.
 - **Approvals and questions**: **Allow once / Reject** buttons, with a diff for file edits; the Agent's questions get option buttons, and plain text while a question waits becomes the answer. Unanswered ones go to the Web UI after the timeout.

@@ -1,6 +1,6 @@
 /** Test doubles shared by the bridge specs. */
 
-import type { HarnessPort, ModelChoice, PromptPart, SessionRow, StagedFileInput } from '../src/bridge.ts'
+import type { DesktopRestartRequest, EffortState, HarnessPort, ModelChoice, PromptPart, SessionRow, StagedFileInput } from '../src/bridge.ts'
 import type { NewSchedule, ScheduleHome, SchedulePort, ScheduleTask } from '../src/schedules.ts'
 
 /** In-memory Harness: records prompts, staged files, created Sessions, and command runs. */
@@ -131,6 +131,37 @@ export class FakeHarness implements HarnessPort {
   explainRisk?: HarnessPort['explainRisk']
   /** Set to give the deployment scheduled tasks. */
   schedules?: HarnessPort['schedules']
+  /** What the Session's model declares for reasoning effort; undefined means it declares none. */
+  effort: { defaultEffort?: string; efforts: { id: string; name: string }[] } | undefined = {
+    defaultEffort: 'medium',
+    efforts: [{ id: 'low', name: 'Low' }, { id: 'medium', name: 'Medium' }, { id: 'high', name: 'High' }],
+  }
+  /** Efforts switched, in order. */
+  readonly efforts: { sessionId: string; effort: string }[] = []
+  /** Whole-desktop restart requests, in order. */
+  readonly restarted: { committed: () => boolean; cancelled: () => boolean }[] = []
+
+  async effortState(): Promise<EffortState | undefined> {
+    if (this.effort === undefined) return undefined
+    return { choice: { provider: 'test', model: 'model', reasoningEffort: 'medium' }, ...this.effort }
+  }
+
+  async selectEffort(sessionId: string, _expected: ModelChoice, effort: string, stillBound: () => boolean): Promise<boolean> {
+    if (!stillBound()) return false
+    this.efforts.push({ sessionId, effort })
+    return true
+  }
+
+  async prepareDesktopRestart(): Promise<DesktopRestartRequest> {
+    let committed = false
+    let cancelled = false
+    const record = { committed: () => committed, cancelled: () => cancelled }
+    this.restarted.push(record)
+    return {
+      async commit() { committed = true },
+      cancel() { cancelled = true },
+    }
+  }
 }
 
 /** In-memory Host schedule service. */

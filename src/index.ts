@@ -25,7 +25,9 @@ import type { Context, Volatile } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -49,7 +51,8 @@ import type {} from '@deepseek-ai/dsh-workspace-changes'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { BindingStore, defaultStateFile, migrateLegacyStateDir } from './bindings.ts'
 import {
-  Switchboard, type BridgeSettings, type HarnessPort, type ModelChoice, type PhonePushReason, type SessionRow, type TurnSummaryMode,
+  Switchboard, type BridgeSettings, type DesktopRestartRequest, type EffortState, type HarnessPort, type ModelChoice,
+  type PhonePushReason, type SessionRow, type TurnSummaryMode,
 } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { Outbox } from './outbox.ts'
@@ -201,6 +204,8 @@ export interface Config {
   notifyToolCalls: Volatile<boolean>
   /** Show the reply in a draft message while it is written. */
   streamReplies: Volatile<boolean>
+  /** Show Stop on progress messages and quick actions under replies in Telegram. */
+  telegramReplyButtons: Volatile<boolean>
   /** Turn-end summary for bound chats: never, for long turns, or always. */
   turnSummary: Volatile<TurnSummaryMode>
   /** What counts as a long turn, in seconds. */
@@ -265,6 +270,7 @@ export const Config: Schema<Config> = Schema.object({
   approvalTimeoutSec: Schema.natural().min(10).max(3600).default(300).volatile(),
   notifyToolCalls: Schema.boolean().default(true).volatile(),
   streamReplies: Schema.boolean().default(true).volatile(),
+  telegramReplyButtons: Schema.boolean().default(false).volatile(),
   turnSummary: Schema.union(['off', 'long', 'always'] as const).default('long').volatile(),
   turnSummaryMinSec: Schema.natural().max(86400).default(60).volatile(),
   scheduleChats: Schema.array(Schema.string()).default([]).volatile(),
@@ -469,6 +475,104 @@ export function apply(ctx: Context, config: Config): void {
     return true
   }
 
+  /** The model metadata fields `/effort` reads; newer Hosts publish the selectable efforts there. */
+  const effortState = async (sessionId: string): Promise<EffortState | undefined> => {
+    const agent = await resolveAgent(sessionId)
+    if (agent === undefined) return undefined
+    const choice = { ...agent.model.current() }
+    const resolve = (llm as {
+      resolveModelInfo?: (provider: string, model: string) => Promise<{ reasoning?: { defaultEffort?: string; efforts?: readonly { id: string; name: string }[] } } | undefined>
+    }).resolveModelInfo
+    const reasoning = (await resolve?.call(llm, choice.provider, choice.model))?.reasoning
+    if (reasoning === undefined || (reasoning.efforts?.length ?? 0) === 0) return undefined
+    return {
+      choice,
+      efforts: reasoning.efforts ?? [],
+      ...(reasoning.defaultEffort === undefined ? {} : { defaultEffort: reasoning.defaultEffort }),
+    }
+  }
+
+  /**
+   * Change the reasoning effort of a Session whose model did not change meanwhile: the choice is
+   * recorded on the live Agent, which keeps it for the Session and applies it from the next request.
+   */
+  const selectEffort = async (sessionId: string, expected: ModelChoice, effort: string, stillBound: () => boolean): Promise<boolean> => {
+    const agent = agents.get(sessionId as SessionId)
+    if (agent === undefined) return false
+    const choice = { ...expected, reasoningEffort: effort }
+    await llm.resolveCallConfig({
+      provider: choice.provider,
+      model: choice.model,
+      reasoningEffort: effort,
+    } as Parameters<typeof llm.resolveCallConfig>[0])
+    if (!stillBound() || agents.get(sessionId as SessionId) !== agent) return false
+    const current = agent.model.current()
+    if (current.provider !== expected.provider || current.model !== expected.model || current.reasoningEffort !== expected.reasoningEffort) return false
+    agent.model.select(choice as Parameters<typeof agent.model.select>[0])
+    return true
+  }
+
+  /**
+   * Arrange a restart of the whole Windows desktop app. A detached PowerShell checks that this
+   * backend runs under the desktop, waits for the request, then stops the desktop and the
+   * processes it owns and starts the desktop again. Other deployments are refused rather than
+   * left half-restarted.
+   */
+  const prepareDesktopRestart = async (): Promise<DesktopRestartRequest> => {
+    const desktop = process.platform === 'win32' && process.versions.electron !== undefined
+      && process.connected && process.argv.some((arg) => /dsh-desktop-host[\\/]lib[\\/]index\.js$/iu.test(arg))
+    if (!desktop) throw new Error('the whole-desktop restart is only available in the Windows desktop app')
+    const dir = dirname(defaultStateFile())
+    await mkdir(dir, { recursive: true })
+    const id = randomUUID()
+    const readyPath = join(dir, `desktop-restart-${id}.ready`)
+    const controlPath = join(dir, `desktop-restart-${id}.control`)
+    const logPath = join(dir, 'desktop-restart.json')
+    const script = join(dirname(fileURLToPath(import.meta.url)), 'desktop-restart.ps1')
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    for (const key of ['ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID']) delete env[key]
+    const launcher = spawn('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-DesktopPid', String(process.ppid), '-BackendPid', String(process.pid), '-Executable', process.execPath,
+      '-LogPath', logPath, '-ReadyPath', readyPath, '-ControlPath', controlPath, '-RequestId', id,
+    ], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env })
+    // The launcher starts the hidden worker and exits; the worker writes the ready file.
+    const worker = await new Promise<string>((resolve, reject) => {
+      let output = ''
+      launcher.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+      launcher.once('error', reject)
+      launcher.once('exit', (code) => {
+        const pid = output.trim()
+        if (code === 0 && /^[1-9][0-9]*$/u.test(pid)) resolve(pid)
+        else reject(new Error(`the restart launcher exited with ${code ?? 'no code'}`))
+      })
+    }).catch((error: unknown) => {
+      throw new Error(`the desktop restart launcher failed: ${describe(error)}`)
+    })
+    if (!await waitForFile(readyPath, id, RESTART_READY_MS)) {
+      const status = await readRestartStatus(logPath)
+      throw new Error(status === 'failed'
+        ? 'the desktop restart preflight failed; see switchboard/desktop-restart.json'
+        : 'the desktop restart worker did not become ready')
+    }
+    let done = false
+    return {
+      async commit() {
+        if (done) return
+        if (!await matchesFile(readyPath, id)) throw new Error('the desktop restart request is no longer ready')
+        done = true
+        await writeFile(`${controlPath}.tmp`, 'restart', 'utf8')
+        await rename(`${controlPath}.tmp`, controlPath)
+      },
+      cancel() {
+        if (done) return
+        done = true
+        try { process.kill(Number(worker)) } catch {}
+        void unlink(readyPath).catch(() => {})
+      },
+    }
+  }
+
   const settings = (): BridgeSettings => {
     const model = configuredModel()
     return {
@@ -483,6 +587,7 @@ export function apply(ctx: Context, config: Config): void {
       approvalTimeoutSec: config.approvalTimeoutSec.get(),
       notifyToolCalls: config.notifyToolCalls.get(),
       streamReplies: config.streamReplies.get(),
+      telegramReplyButtons: config.telegramReplyButtons.get(),
       turnSummary: config.turnSummary.get(),
       turnSummaryMinSec: config.turnSummaryMinSec.get(),
       transcribeVoice: config.transcribeVoice.get(),
@@ -534,6 +639,9 @@ export function apply(ctx: Context, config: Config): void {
 
   const harness: HarnessPort = {
     schedules: schedulePort,
+    effortState,
+    selectEffort,
+    prepareDesktopRestart,
     async explainRisk(sessionId, tool, args, language, signal) {
       const current = agents.get(sessionId as SessionId)?.model.current()
       if (current === undefined) return undefined
@@ -957,4 +1065,35 @@ export function apply(ctx: Context, config: Config): void {
       await chatLog.settled()
     }
   }, 'switchboard: polling')
+}
+
+/** How long the restart worker gets to arm itself before the request is abandoned. */
+const RESTART_READY_MS = 15_000
+
+/** @returns whether the file holds exactly `value`, within `timeoutMs`. */
+async function waitForFile(path: string, value: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await matchesFile(path, value)) return true
+    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+  }
+  return matchesFile(path, value)
+}
+
+async function matchesFile(path: string, value: string): Promise<boolean> {
+  return await readFile(path, 'utf8').then(text => text.trim() === value, () => false)
+}
+
+/** The status the restart worker last reported, if it got far enough to report one. */
+async function readRestartStatus(path: string): Promise<string | undefined> {
+  const text = await readFile(path, 'utf8').catch(() => undefined)
+  if (text === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return typeof parsed === 'object' && parsed !== null && typeof (parsed as { status?: unknown }).status === 'string'
+      ? (parsed as { status: string }).status
+      : undefined
+  } catch {
+    return undefined
+  }
 }

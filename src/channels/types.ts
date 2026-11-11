@@ -141,14 +141,24 @@ export interface Channel {
   /** Show that the bot is working, where the platform can. */
   typing(chat: string): Promise<void>
   /**
-   * Publish the command menu, where the platform has one.
-   * @param clearOthers - also remove lists set for other scopes or languages.
+   * Publish the command menu, where the platform has one. Lists the bot already set for other
+   * scopes or languages are merged with these commands rather than dropped, and what the
+   * platform reads back is compared with what was sent.
+   * @returns what was verified, or undefined when the platform has no menu.
    */
-  setMenu(commands: readonly { command: string; description: string }[], clearOthers?: boolean): Promise<void>
+  setMenu(commands: readonly { command: string; description: string }[]): Promise<MenuSync | undefined>
   /** Keep a message in view at the top of the chat, where the platform can, without notifying anyone. */
   pin?(chat: string, messageId: string): Promise<void>
   /** Acknowledge a button press, optionally with a short notice. */
   ack(action: InboundAction, notice?: string): Promise<void>
+}
+
+/** What {@link Channel.setMenu} verified. */
+export interface MenuSync {
+  /** When the lists were checked. */
+  verifiedAt: number
+  /** How many scope and language lists were read. */
+  checked: number
 }
 
 /** Builds the adapter for a line. */

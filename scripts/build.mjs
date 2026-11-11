@@ -8,14 +8,18 @@
 //                   react and @deepseek-ai/* resolve through the injected require
 //                   against the Web shell's platform module table.
 
-import { readFile } from 'node:fs/promises'
+import { copyFile, readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 
 const root = new URL('..', import.meta.url)
+// `URL.pathname` keeps the leading slash of a Windows drive (`/C:/...`), which
+// esbuild rejects as a non-absolute path; fileURLToPath gives the native form.
+const rootPath = fileURLToPath(root)
 const pkg = JSON.parse(await readFile(new URL('package.json', root), 'utf8'))
 
 await build({
-  absWorkingDir: root.pathname,
+  absWorkingDir: rootPath,
   entryPoints: ['src/index.ts'],
   outfile: 'lib/index.js',
   bundle: true,
@@ -31,9 +35,8 @@ await build({
 })
 
 await build({
-  absWorkingDir: root.pathname,
-  entryPoints: ['src/client/index.tsx'],
-  outfile: 'lib/client.js',
+  absWorkingDir: rootPath,
+  entryPoints: ['src/client/index.tsx'],  outfile: 'lib/client.js',
   bundle: true,
   platform: 'browser',
   format: 'cjs',
@@ -46,3 +49,6 @@ await build({
   footer: { js: 'return module.exports; } });' },
   logLevel: 'info',
 })
+
+// The restart helper is launched from next to the built host bundle, and `lib` is generated.
+await copyFile(new URL('../resources/desktop-restart.ps1', import.meta.url), new URL('../lib/desktop-restart.ps1', import.meta.url))

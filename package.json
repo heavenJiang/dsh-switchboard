@@ -43,6 +43,7 @@
     "README.zh.md",
     "lib/index.js",
     "lib/client.js",
+    "lib/desktop-restart.ps1",
     "CHANGELOG.md"
   ],
   "license": "MIT",
