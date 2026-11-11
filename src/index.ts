@@ -49,7 +49,7 @@ import type {} from '@deepseek-ai/dsh-workspace-changes'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { BindingStore, defaultStateFile, migrateLegacyStateDir } from './bindings.ts'
 import {
-  Switchboard, type BridgeSettings, type HarnessPort, type ModelChoice, type SessionRow, type TurnSummaryMode,
+  Switchboard, type BridgeSettings, type HarnessPort, type ModelChoice, type PhonePushReason, type SessionRow, type TurnSummaryMode,
 } from './bridge.ts'
 import { ChatLog } from './chatlog.ts'
 import { Outbox } from './outbox.ts'
@@ -64,7 +64,24 @@ import type { SchedulePort, ScheduleTask } from './schedules.ts'
 import { UpdateChecker } from './updates.ts'
 
 export { Switchboard } from './bridge.ts'
-export type { BridgeSettings, HarnessPort } from './bridge.ts'
+export type { BridgeSettings, HarnessPort, PhonePushReason } from './bridge.ts'
+
+/**
+ * The `phonePush` service: other plugins post Markdown to the phone through
+ * it, to the chats that get scheduled runs' results, without a Session or a
+ * model in between. It is optional on both sides: a plugin injects it when it
+ * exists and keeps its own way of reaching the user otherwise, and the bridge
+ * runs the same whether anyone uses it.
+ */
+export interface PhonePush {
+  /** Whether a post would reach a chat now: the bridge is on, posting is allowed, and schedule chats are set. */
+  available(): boolean
+  /**
+   * Post Markdown to the schedule chats; queued while a line is down. At most one post every 10 seconds.
+   * @param options.source - the posting plugin's name, for the bridge's log.
+   */
+  send(text: string, options?: { source?: string }): Promise<{ delivered: number; reason?: PhonePushReason }>
+}
 
 export const name = 'switchboard'
 /** The Web host's Session controller drives Sessions exactly as the Web UI does. */
@@ -174,6 +191,8 @@ export interface Config {
   approvalRiskHint: Volatile<boolean>
   /** Offer linked Sessions the tool that messages the phone mid-turn. */
   agentNotify: Volatile<boolean>
+  /** Other plugins may post to the schedule chats through the `phonePush` service. */
+  pluginPush: Volatile<boolean>
   /** Ask the Agent's questions in Telegram too. */
   questionsViaTelegram: Volatile<boolean>
   /** Seconds to wait for a Telegram answer before handing the approval to the next answerer. */
@@ -241,6 +260,7 @@ export const Config: Schema<Config> = Schema.object({
   approvalViaTelegram: Schema.boolean().default(true).volatile(),
   approvalRiskHint: Schema.boolean().default(true).volatile(),
   agentNotify: Schema.boolean().default(true).volatile(),
+  pluginPush: Schema.boolean().default(true).volatile(),
   questionsViaTelegram: Schema.boolean().default(true).volatile(),
   approvalTimeoutSec: Schema.natural().min(10).max(3600).default(300).volatile(),
   notifyToolCalls: Schema.boolean().default(true).volatile(),
@@ -757,6 +777,20 @@ export function apply(ctx: Context, config: Config): void {
   const outbox = new Outbox(join(dirname(stateFile), 'outbox.json'))
   const bridge = new Switchboard(settings, harness, store, logger, {}, chatLog, outbox)
   const updates = new UpdateChecker()
+
+  // Other plugins reach the phone through this service; nothing here depends on them.
+  const phonePush: PhonePush = {
+    available: () => config.pluginPush.get() && bridge.canPushToPhone(),
+    async send(text, options) {
+      if (typeof text !== 'string') return { delivered: 0, reason: 'empty' }
+      if (!config.pluginPush.get()) return { delivered: 0, reason: 'disabled' }
+      const result = bridge.pushToPhone(text)
+      const source = typeof options?.source === 'string' && options.source.trim() !== '' ? options.source.trim().slice(0, 60) : 'a plugin'
+      logger.debug(`switchboard: post from ${source}: ${result.delivered > 0 ? `${result.delivered} chat(s)` : result.reason ?? 'not sent'}`)
+      return result
+    },
+  }
+  ctx.provide('phonePush', phonePush)
 
   const restart = (): void => {
     void refreshToken().then(() => bridge.reconcile()).catch((error: unknown) => {

@@ -550,6 +550,13 @@ const SCHEDULE_PROMPT_LENGTH = 800
 const AGENT_NOTICE_INTERVAL_MS = 30_000
 /** Characters of one message from the Agent. */
 const AGENT_NOTICE_LENGTH = 2000
+/** Another plugin may post to the phone at most this often, so a loop in it cannot flood the chats. */
+const PLUGIN_PUSH_INTERVAL_MS = 10_000
+/** Characters of one post from another plugin; longer text is cut, and replies over `longReplyChars` still go as a file. */
+const PLUGIN_PUSH_LENGTH = 60_000
+
+/** Why a post from another plugin did not go out. */
+export type PhonePushReason = 'disabled' | 'no-chat' | 'empty' | 'too-soon'
 
 /** The bridge core. One instance lives for the plugin's lifetime; lines restart when their settings change. */
 export class Switchboard {
@@ -609,6 +616,7 @@ export class Switchboard {
   private readonly claims = new Map<string, { sessionId: string; expiresAt: number }>()
   /** When the Agent last reached the phone, per Session. */
   private readonly agentNotices = new Map<string, number>()
+  private lastPluginPush = 0
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(
@@ -2357,6 +2365,33 @@ export class Switchboard {
     while (this.agentNotices.size > TODO_SESSIONS) this.agentNotices.delete(this.agentNotices.keys().next().value as string)
     const message = this.t.agentNotice(truncate(text.trim(), AGENT_NOTICE_LENGTH))
     for (const key of chats) void this.durable(key, { kind: 'text', text: message }, sessionId)
+    return { delivered: chats.length }
+  }
+
+  /** Whether a post from another plugin would reach a chat: the bridge is on and schedule chats are set. */
+  canPushToPhone(): boolean {
+    const s = this.settings()
+    return s.enabled && s.scheduleChats.some(id => id.trim() !== '')
+  }
+
+  /**
+   * Post Markdown from another plugin to the schedule chats, the chats that
+   * get scheduled runs' results. It goes out like a reply: rendered, as a file
+   * when long, and queued in the outbox while a line is down. No Session is
+   * involved, so a reply to it starts nothing.
+   * @returns how many chats it went to, or why it did not go out.
+   */
+  pushToPhone(text: string, now: number = Date.now()): { delivered: number; reason?: PhonePushReason } {
+    const s = this.settings()
+    if (!s.enabled) return { delivered: 0, reason: 'disabled' }
+    const body = text.trim()
+    if (body === '') return { delivered: 0, reason: 'empty' }
+    const chats = [...new Set(s.scheduleChats.map(id => id.trim()).filter(id => id !== ''))]
+    if (chats.length === 0) return { delivered: 0, reason: 'no-chat' }
+    if (now - this.lastPluginPush < PLUGIN_PUSH_INTERVAL_MS) return { delivered: 0, reason: 'too-soon' }
+    this.lastPluginPush = now
+    const message = truncate(body, PLUGIN_PUSH_LENGTH)
+    for (const key of chats) void this.durable(key, { kind: 'markdown', text: message })
     return { delivered: chats.length }
   }
 

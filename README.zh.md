@@ -129,6 +129,10 @@
 
 关联了聊天的会话多一个 `notify_phone` 工具，Agent 可以在任务中途发里程碑或紧急消息，不用等这一轮结束。消息发到绑定和订阅的聊天，线路断开时进发件箱；直接回复这条消息就回到这个会话。每个会话 30 秒内最多一条，防止循环刷屏。没有关联聊天的会话看不到这个工具。子 Agent 受自身工具过滤规则限制。
 
+**其他插件发消息到手机**
+
+本插件提供一个可选服务 `phonePush`，其他插件（例如新闻推送）可以直接把 Markdown 消息发到接收定时任务结果的聊天（`scheduleChats`），不经过会话和模型，所以不会被模型改写或漏发。消息和回复一样渲染，太长时作为文件发送，线路断开时进发件箱。10 秒内最多一条。用法：`ctx.inject(['phonePush'], …)` 后调用 `phonePush.available()` 和 `phonePush.send(text, { source })`，返回 `{ delivered, reason? }`。两边互不依赖：没装本插件时对方照常走自己的路；没人用这个服务时本插件也不受影响。用 `pluginPush` 关闭。
+
 **订阅汇总**
 
 - `/digest` 随时查看订阅会话的汇总。
@@ -268,6 +272,7 @@
 | | `approvalRiskHint` | `true` | 在命令类审批里附上模型解读 |
 | | `questionsViaTelegram` | `true` | 在聊天中回答 Agent 的提问 |
 | | `agentNotify` | `true` | 关联了聊天的会话可以用 `notify_phone` |
+| | `pluginPush` | `true` | 其他插件可以通过 `phonePush` 服务发消息到 `scheduleChats` |
 | | `approvalTimeoutSec` | `300` | 审批与提问的超时（10–3600 秒） |
 | 文件与语音 | `sendDeliverables` | `true` | 把 `present` 交付的文件发回聊天 |
 | | `maxDownloadMb` | `20` | 接收文件大小上限（1–2000 MB） |

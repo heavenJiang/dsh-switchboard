@@ -72,6 +72,7 @@ interface BridgeValues {
   approvalViaTelegram?: boolean
   approvalRiskHint?: boolean
   agentNotify?: boolean
+  pluginPush?: boolean
   approvalTimeoutSec?: number
   notifyToolCalls?: boolean
   language?: 'zh' | 'en'
@@ -114,7 +115,7 @@ interface ModelDraft { provider?: string; model?: string; effort?: string }
 type TextField = 'workspacePath' | 'agentPreset' | 'permissionPreset' | 'approvalTimeoutSec'
   | 'maxDownloadMb' | 'historyLimit' | 'channelPromptText' | 'turnSummary' | 'turnSummaryMinSec'
   | 'scheduleChats' | 'ffmpegPath' | 'alertChats' | 'alertAfterMin' | 'watchDigestTime' | 'longReplyChars'
-type ToggleField = 'enabled' | 'approvalViaTelegram' | 'approvalRiskHint' | 'agentNotify' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
+type ToggleField = 'enabled' | 'approvalViaTelegram' | 'approvalRiskHint' | 'agentNotify' | 'pluginPush' | 'notifyToolCalls' | 'sendDeliverables' | 'englishReplies'
   | 'channelPrompt' | 'streamReplies' | 'transcribeVoice' | 'showPanel' | 'showSessionTab' | 'questionsViaTelegram'
 
 /** A comma- or space-separated list field. */
@@ -179,6 +180,7 @@ const TOGGLES: Record<ToggleField, { field: keyof BridgeValues; read: (v: Bridge
   approvalViaTelegram: { field: 'approvalViaTelegram', read: v => v.approvalViaTelegram ?? true, write: on => on },
   approvalRiskHint: { field: 'approvalRiskHint', read: v => v.approvalRiskHint ?? true, write: on => on },
   agentNotify: { field: 'agentNotify', read: v => v.agentNotify ?? true, write: on => on },
+  pluginPush: { field: 'pluginPush', read: v => v.pluginPush ?? true, write: on => on },
   notifyToolCalls: { field: 'notifyToolCalls', read: v => v.notifyToolCalls ?? true, write: on => on },
   sendDeliverables: { field: 'sendDeliverables', read: v => v.sendDeliverables ?? true, write: on => on },
   englishReplies: { field: 'language', read: v => v.language === 'en', write: on => on ? 'en' : 'zh' },
@@ -679,6 +681,7 @@ export function createSettings(form: ConfigForm<BridgeValues>, describe: Setting
         {toggleOn('approvalViaTelegram') && toggle('approvalRiskHint')}
         {toggle('questionsViaTelegram')}
         {toggle('agentNotify')}
+        {toggle('pluginPush')}
         {(toggleOn('approvalViaTelegram') || toggleOn('questionsViaTelegram')) && valueField('approvalTimeoutSec', 'approval-timeout', { numeric: true })}
 
         <details className="tgb-more tgb-advanced">

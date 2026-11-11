@@ -2279,3 +2279,30 @@ describe('the Agent reaching the phone', () => {
     expect(bridge.notifyFromAgent('s1', 'three', 131_000).delivered).toBe(1)
   })
 })
+
+describe('other plugins reaching the phone', () => {
+  it('posts Markdown to the schedule chats with no Session involved', async () => {
+    settings = { ...settings, scheduleChats: [KEY, ' ', KEY] }
+    expect(bridge.canPushToPhone()).toBe(true)
+    expect(bridge.pushToPhone('  **要闻** · 08:00  ', 100_000)).toEqual({ delivered: 1 })
+    await until(() => telegram.sent().some(t => t.includes('要闻') && t.includes('08:00')))
+  })
+
+  it('says why nothing went out', () => {
+    expect(bridge.canPushToPhone()).toBe(false)
+    expect(bridge.pushToPhone('news', 100_000)).toEqual({ delivered: 0, reason: 'no-chat' })
+    settings = { ...settings, scheduleChats: [KEY] }
+    expect(bridge.pushToPhone('   ', 100_000)).toEqual({ delivered: 0, reason: 'empty' })
+    settings = { ...settings, enabled: false }
+    expect(bridge.canPushToPhone()).toBe(false)
+    expect(bridge.pushToPhone('news', 100_000)).toEqual({ delivered: 0, reason: 'disabled' })
+    expect(telegram.sent()).toEqual([])
+  })
+
+  it('holds a loop back', () => {
+    settings = { ...settings, scheduleChats: [KEY] }
+    expect(bridge.pushToPhone('one', 100_000).delivered).toBe(1)
+    expect(bridge.pushToPhone('two', 105_000)).toEqual({ delivered: 0, reason: 'too-soon' })
+    expect(bridge.pushToPhone('three', 111_000).delivered).toBe(1)
+  })
+})
