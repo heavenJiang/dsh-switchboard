@@ -18,7 +18,7 @@ import {
 /** `im.message.receive_v1`, the fields read here. */
 export interface FeishuMessageEvent {
   readonly sender: {
-    readonly sender_id?: { readonly open_id?: string; readonly user_id?: string; readonly union_id?: string }
+    readonly sender_id?: { readonly open_id?: string; readonly user_id?: string | null; readonly union_id?: string | null }
     readonly sender_type: string
   }
   readonly message: {
@@ -190,7 +190,7 @@ export class FeishuChannel implements Channel {
         return found === undefined ? undefined : found.type === 'interactive' ? cardPlainText(found.content) : parseContent(found.type, found.content, parent).text
       }),
     ])
-    const aliases = [sender.sender_id?.user_id, sender.sender_id?.union_id].filter((id): id is string => id !== undefined && id !== '')
+    const aliases = [sender.sender_id?.user_id, sender.sender_id?.union_id].filter((id): id is string => typeof id === 'string' && id !== '')
     const userName = name ?? openId
     const inbound: InboundMessage = {
       chat: { id: message.chat_id, type, title: type === 'private' ? userName : (title ?? message.chat_id) },
@@ -222,7 +222,7 @@ export class FeishuChannel implements Channel {
       reply.resolve(notice === undefined ? undefined : { toast: { type: 'info', content: notice } })
     }
     this.pendingActions.set(id, settle)
-    const aliases = [event.operator?.user_id, event.operator?.union_id].filter((alias): alias is string => alias !== undefined && alias !== '')
+    const aliases = [event.operator?.user_id, event.operator?.union_id].filter((alias): alias is string => typeof alias === 'string' && alias !== '')
     void this.lookup(`u:${openId}`, () => this.options.api.userName(openId)).then(name => sink.action({
       id,
       from: { id: openId, name: name ?? openId, ...(aliases.length === 0 ? {} : { aliases }) },
