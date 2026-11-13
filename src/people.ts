@@ -50,7 +50,7 @@ const ADMIN_COMMANDS = /permission|sandbox|approv|trust|mode|yolo/iu
 export function actorFor(
   people: readonly PersonSettings[] | undefined, line: string, ids: readonly string[], viaChat: boolean, fallbackDir: string | undefined,
 ): Actor {
-  const wanted = new Set(ids.map(id => id.trim().toLowerCase()).filter(id => id !== ''))
+  const wanted = new Set(ids.filter((id): id is string => typeof id === 'string' && id !== '').map(id => id.trim().toLowerCase()))
   const record = people?.find(person => person.line === line && wanted.has(person.id.trim().toLowerCase()))
   const role: Role = record?.role ?? (viaChat ? 'member' : 'admin')
   if (role === 'admin') return ADMIN

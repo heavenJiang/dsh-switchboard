@@ -19,6 +19,11 @@ describe('people', () => {
     expect(actorFor(people, 'telegram', ['9', '@Eve'], false, '/home')).toEqual({ role: 'guest', preset: 'read-only', dirs: ['/home'] })
   })
 
+  it('ignores ids that are not strings, as Feishu sends a null user_id', () => {
+    expect(actorFor(people, 'telegram', ['7', null as unknown as string], false, '/home')).toEqual({ role: 'admin' })
+    expect(actorFor(people, 'telegram', ['42', null as unknown as string], false, '/home')).toEqual({ role: 'member', preset: 'workspace-write', dirs: ['/work/app'] })
+  })
+
   it('keeps members to their directories, without prefix tricks', () => {
     const member = { role: 'member' as const, dirs: ['/work/app'] }
     expect(mayUse(member, '/work/app')).toBe(true)

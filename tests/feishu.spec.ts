@@ -191,6 +191,16 @@ describe('Feishu line', () => {
     await until(() => harness.prompts.length === 1)
   })
 
+  it('admits a sender whose user_id is null, as Feishu sends without the contact scope', async () => {
+    const event = {
+      sender: { sender_id: { open_id: ANN, union_id: 'on_ann', user_id: null }, sender_type: 'user' },
+      message: { message_id: 'om_null_user_id', chat_id: DM, chat_type: 'p2p', message_type: 'text', content: '{"text":"hi"}' },
+    } as unknown as FeishuMessageEvent
+    feishu.deliver(event)
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: 'hi' }])
+  })
+
   it('in groups answers only @mentions of the bot, with the mention removed', async () => {
     feishu.deliver(message(GROUP, 'text', { text: 'just chatting' }))
     feishu.deliver(message(GROUP, 'text', { text: '@_user_1 hi @_user_2' }, {
