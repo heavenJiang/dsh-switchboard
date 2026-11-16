@@ -18,7 +18,7 @@ import {
 /** `im.message.receive_v1`, the fields read here. */
 export interface FeishuMessageEvent {
   readonly sender: {
-    readonly sender_id?: { readonly open_id?: string; readonly user_id?: string; readonly union_id?: string }
+    readonly sender_id?: { readonly open_id?: string; readonly user_id?: string | null; readonly union_id?: string | null }
     readonly sender_type: string
   }
   readonly message: {
@@ -35,7 +35,7 @@ export interface FeishuMessageEvent {
 
 /** `card.action.trigger`, the fields read here. */
 export interface FeishuCardActionEvent {
-  readonly operator?: { readonly open_id?: string; readonly user_id?: string; readonly union_id?: string }
+  readonly operator?: { readonly open_id?: string; readonly user_id?: string | null; readonly union_id?: string | null }
   readonly action?: { readonly value?: { readonly d?: string } | string }
   readonly context?: { readonly open_message_id?: string; readonly open_chat_id?: string }
   /** Older callbacks carry these at the top level. */
@@ -190,7 +190,7 @@ export class FeishuChannel implements Channel {
         return found === undefined ? undefined : found.type === 'interactive' ? cardPlainText(found.content) : parseContent(found.type, found.content, parent).text
       }),
     ])
-    const aliases = [sender.sender_id?.user_id, sender.sender_id?.union_id].filter((id): id is string => id !== undefined && id !== '')
+    const aliases = feishuAliases(sender.sender_id)
     const userName = name ?? openId
     const inbound: InboundMessage = {
       chat: { id: message.chat_id, type, title: type === 'private' ? userName : (title ?? message.chat_id) },
@@ -222,7 +222,7 @@ export class FeishuChannel implements Channel {
       reply.resolve(notice === undefined ? undefined : { toast: { type: 'info', content: notice } })
     }
     this.pendingActions.set(id, settle)
-    const aliases = [event.operator?.user_id, event.operator?.union_id].filter((alias): alias is string => alias !== undefined && alias !== '')
+    const aliases = feishuAliases(event.operator)
     void this.lookup(`u:${openId}`, () => this.options.api.userName(openId)).then(name => sink.action({
       id,
       from: { id: openId, name: name ?? openId, ...(aliases.length === 0 ? {} : { aliases }) },
@@ -476,4 +476,17 @@ export function card(body: { plain: string } | { markdown: string }, buttons?: r
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * The ids a person is also known by, from a Feishu `sender_id`/`operator`.
+ *
+ * Feishu types these as optional, but sends `null` for the ids the app cannot
+ * see (an ordinary published app gets `user_id: null`; only `open_id` and
+ * `union_id` are filled in). `undefined`, `null` and `''` all mean "no id", so
+ * all three are dropped — passing `null` on would break the id matching that
+ * happens downstream.
+ */
+function feishuAliases(ids: { readonly user_id?: string | null; readonly union_id?: string | null } | undefined): string[] {
+  return [ids?.user_id, ids?.union_id].filter((id): id is string => typeof id === 'string' && id !== '')
 }
