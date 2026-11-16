@@ -191,6 +191,17 @@ describe('Feishu line', () => {
     await until(() => harness.prompts.length === 1)
   })
 
+  it('admitted by open_id alone when the app cannot see user_id', async () => {
+    // A published app gets `user_id: null` (not undefined) for senders it has no
+    // directory access to; the null must not reach the id matching.
+    feishu.deliver({
+      sender: { sender_id: { open_id: ANN, user_id: null, union_id: 'on_ann' }, sender_type: 'user' },
+      message: { message_id: `om_in_${++n}`, chat_id: DM, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: 'null ids' }) },
+    })
+    await until(() => harness.prompts.length === 1)
+    expect(harness.prompts[0]?.parts).toEqual([{ type: 'text', text: 'null ids' }])
+  })
+
   it('in groups answers only @mentions of the bot, with the mention removed', async () => {
     feishu.deliver(message(GROUP, 'text', { text: 'just chatting' }))
     feishu.deliver(message(GROUP, 'text', { text: '@_user_1 hi @_user_2' }, {
